@@ -50,7 +50,10 @@ now keeps CUDA and Vulkan compute tensors in those registered allocations.
 Qwen3-8B TP=2 and a direct GPU KV handoff passed without interhost GPU-payload
 staging. The [native validation report](docs/validation-2026-09-28-native-inference.md)
 separates NIC completion latency, actual tensor-copy calls and model request
-timing. At 8,192 input tokens and 128 output tokens, native TP=2 took 18.78 s
+timing. The [GPU end-to-end report](docs/validation-2026-09-28-gpu-e2e.md) also
+verifies GPU production, RDMA and GPU consumption in both directions; its
+measured medians were 58 to 98 microseconds with an already-ready receiver,
+and the 10-microsecond gate failed. At 8,192 input tokens and 128 output tokens, native TP=2 took 18.78 s
 versus 39.65 s in the earlier staged campaign; launch settings differed, and
 this does not establish a speedup over a single GPU.
 

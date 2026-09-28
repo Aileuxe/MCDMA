@@ -961,5 +961,6 @@
     "No below-10-microsecond end-to-end GPU graph or inference collective claim.",
     "Model continuations are functional checks on one prompt set, not a general quality evaluation.",
     "No fresh matched native-allocator single-GPU baselines in this report."
-  ]
+  ],
+  "gpu_producer_consumer_validation": "validation-2026-09-28-gpu-e2e-results.json"
 }

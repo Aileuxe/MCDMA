@@ -1,0 +1,1347 @@
+{
+  "schema": 1,
+  "date": "2026-09-28",
+  "claim": "GPU-produced data transferred through registered native tensor storage and consumed on the other GPU, verified in both directions without CPU payload staging.",
+  "runtime": {
+    "llama_cpp_base_commit": "4da6337767f973e2b4d0797e5b323d77d8565e4a",
+    "backend_abi": 3,
+    "selection": "persistent-registration native overlay, baseline scheduling",
+    "overlay_manifest": "../integrations/llamacpp/native/overlay.json",
+    "cuda_storage": "cudaHostAllocMapped",
+    "vulkan_storage": "coherent exported DMA_BUF",
+    "gpu_initiated_nic": false,
+    "arbitrary_cudaMalloc_gpudirect_supported": false
+  },
+  "measurement_source": {
+    "tested_baseline_harness_sha256": "6f2775f6becf1cf0f59e3fde36da8e6e7924d76375bb75e6e81ce682e0ed7319",
+    "shipped_harness_sha256": "d6768b229e135a9baa34c38fc8ac2692f22c3420e4030a52c8d41f1882267001",
+    "difference": "Only JSON metadata labels changed: persistent payload allocations/MRs and client graph objects are distinguished, with RPC graph reuse false and graph UID zero made explicit; executable timing and correctness logic are unchanged."
+  },
+  "clock": {
+    "host": "single Vulkan coordinator",
+    "type": "std::chrono::steady_clock",
+    "main_field": "producer_to_consumer_ready_receiver_us",
+    "start": "immediately before producer graph submission",
+    "stop": "after consumer GPU completion is observed",
+    "includes": [
+      "producer submission and GPU completion",
+      "native RDMA tensor copy completion",
+      "consumer submission and GPU completion",
+      "required producer release and consumer acquire",
+      "RPC and completion-reporting overhead"
+    ],
+    "excludes": [
+      "fixture allocation and cold registration",
+      "producer-side CPU planning",
+      "GPU verification and reduced-scalar readback",
+      "receiver rearming before the next producer starts",
+      "final teardown"
+    ],
+    "receiver_already_ready": true,
+    "cross_host_clock_subtraction": false,
+    "round_trip_division": false,
+    "full_cycle_field": "full_iteration_cycle_us",
+    "full_cycle_includes": "producer planning plus main interval plus GPU verification, reduced-scalar readback and receiver rearming",
+    "percentiles": "median midpoint for even count; p95 and p99 nearest rank"
+  },
+  "workload": {
+    "bytes": [
+      1024,
+      4096
+    ],
+    "directions": [
+      "Vulkan producer to CUDA consumer",
+      "CUDA producer to Vulkan consumer"
+    ],
+    "producer": "in-place increment of changing GPU-generated F32 payload",
+    "consumer": "in-place GPU scale and bias of received payload",
+    "gpu_checks": "independent advancing reference and prefix/suffix guards after every warmup and measured exchange",
+    "cpu_payload_access": false,
+    "payload_offset_bytes": 320,
+    "guard_bytes_per_endpoint": 704,
+    "persistent_payload_allocations_and_mrs": true,
+    "persistent_client_graph_objects": true,
+    "rpc_graph_reuse": false,
+    "graph_uid": 0,
+    "verification_can_change_graph_cache_state": true
+  },
+  "baseline": {
+    "warmup_per_case": 100,
+    "samples_per_case": 1000,
+    "case_count": 4,
+    "correctness_passed": true,
+    "local_cleanup_completed": true,
+    "remote_cleanup_acknowledged": false,
+    "process_exit_code": 2,
+    "latency_gate": {
+      "threshold_us": 10,
+      "statistic": "maximum of every case",
+      "comparison": "strictly less than",
+      "passed": false
+    },
+    "vulkan_ownership_counters": {
+      "planned_acquires": 4400,
+      "cold_acquires": 0,
+      "consumer_barriers": 4400,
+      "host_barriers": 2
+    },
+    "vulkan_validation_errors_reported": false,
+    "cases": [
+      {
+        "direction": "Vulkan_producer_to_CUDA_consumer",
+        "bytes": 1024,
+        "payload_offset_bytes": 320,
+        "guard_bytes_per_endpoint": 704,
+        "correctness_passed": true,
+        "scalar_ranges_disjoint_assertion_reported": true,
+        "statistics": {
+          "producer_submit_us": {
+            "count": 1000,
+            "min_us": 6.46,
+            "median_us": 6.98,
+            "p95_us": 7.4,
+            "p99_us": 7.63,
+            "max_us": 16.189
+          },
+          "producer_completion_wait_us": {
+            "count": 1000,
+            "min_us": 40.549,
+            "median_us": 66.478,
+            "p95_us": 92.327,
+            "p99_us": 105.246,
+            "max_us": 208.382
+          },
+          "native_tensor_copy_complete_us": {
+            "count": 1000,
+            "min_us": 4.869,
+            "median_us": 9.539,
+            "p95_us": 9.64,
+            "p99_us": 10.08,
+            "max_us": 15.479
+          },
+          "consumer_submit_us": {
+            "count": 1000,
+            "min_us": 0.67,
+            "median_us": 0.89,
+            "p95_us": 0.95,
+            "p99_us": 1.07,
+            "max_us": 1.8
+          },
+          "consumer_completion_wait_us": {
+            "count": 1000,
+            "min_us": 12,
+            "median_us": 13.309,
+            "p95_us": 13.86,
+            "p99_us": 14.32,
+            "max_us": 114.576
+          },
+          "producer_to_consumer_ready_receiver_us": {
+            "count": 1000,
+            "min_us": 66.228,
+            "median_us": 97.2765,
+            "p95_us": 123.956,
+            "p99_us": 136.385,
+            "max_us": 239.121
+          },
+          "producer_planning_us": {
+            "count": 1000,
+            "min_us": 0.05,
+            "median_us": 0.06,
+            "p95_us": 0.26,
+            "p99_us": 0.27,
+            "max_us": 0.3
+          },
+          "gpu_verification_and_receiver_rearm_us": {
+            "count": 1000,
+            "min_us": 207.243,
+            "median_us": 270.1755,
+            "p95_us": 284.65,
+            "p99_us": 309.979,
+            "max_us": 348.017
+          },
+          "full_iteration_cycle_us": {
+            "count": 1000,
+            "min_us": 299.98,
+            "median_us": 368.107,
+            "p95_us": 401.096,
+            "p99_us": 417.515,
+            "max_us": 509.452
+          },
+          "producer_total_us": {
+            "count": 1000,
+            "min_us": 47.248,
+            "median_us": 73.498,
+            "p95_us": 99.557,
+            "p99_us": 112.296,
+            "max_us": 215.282
+          },
+          "consumer_total_us": {
+            "count": 1000,
+            "min_us": 12.88,
+            "median_us": 14.189499999999999,
+            "p95_us": 14.779,
+            "p99_us": 15.33,
+            "max_us": 115.51599999999999
+          }
+        }
+      },
+      {
+        "direction": "CUDA_producer_to_Vulkan_consumer",
+        "bytes": 1024,
+        "payload_offset_bytes": 320,
+        "guard_bytes_per_endpoint": 704,
+        "correctness_passed": true,
+        "scalar_ranges_disjoint_assertion_reported": true,
+        "statistics": {
+          "producer_submit_us": {
+            "count": 1000,
+            "min_us": 0.99,
+            "median_us": 1.25,
+            "p95_us": 1.29,
+            "p99_us": 1.36,
+            "max_us": 1.96
+          },
+          "producer_completion_wait_us": {
+            "count": 1000,
+            "min_us": 12.92,
+            "median_us": 17.82,
+            "p95_us": 18.48,
+            "p99_us": 20.449,
+            "max_us": 35.789
+          },
+          "native_tensor_copy_complete_us": {
+            "count": 1000,
+            "min_us": 4.2,
+            "median_us": 4.26,
+            "p95_us": 4.38,
+            "p99_us": 4.6,
+            "max_us": 10.33
+          },
+          "consumer_submit_us": {
+            "count": 1000,
+            "min_us": 4.849,
+            "median_us": 7.03,
+            "p95_us": 7.56,
+            "p99_us": 7.76,
+            "max_us": 15.729
+          },
+          "consumer_completion_wait_us": {
+            "count": 1000,
+            "min_us": 26.919,
+            "median_us": 27.319,
+            "p95_us": 29.269,
+            "p99_us": 53.258,
+            "max_us": 53.338
+          },
+          "producer_to_consumer_ready_receiver_us": {
+            "count": 1000,
+            "min_us": 50.758,
+            "median_us": 57.758,
+            "p95_us": 67.357,
+            "p99_us": 83.997,
+            "max_us": 101.557
+          },
+          "producer_planning_us": {
+            "count": 1000,
+            "min_us": 0.01,
+            "median_us": 0.02,
+            "p95_us": 0.02,
+            "p99_us": 0.02,
+            "max_us": 0.02
+          },
+          "gpu_verification_and_receiver_rearm_us": {
+            "count": 1000,
+            "min_us": 251.601,
+            "median_us": 284.9405,
+            "p95_us": 312.199,
+            "p99_us": 324.579,
+            "max_us": 420.686
+          },
+          "full_iteration_cycle_us": {
+            "count": 1000,
+            "min_us": 307.619,
+            "median_us": 343.01800000000003,
+            "p95_us": 372.107,
+            "p99_us": 397.346,
+            "max_us": 478.733
+          },
+          "producer_total_us": {
+            "count": 1000,
+            "min_us": 14.09,
+            "median_us": 19.06,
+            "p95_us": 19.718999999999998,
+            "p99_us": 21.699,
+            "max_us": 36.959
+          },
+          "consumer_total_us": {
+            "count": 1000,
+            "min_us": 31.818,
+            "median_us": 34.399,
+            "p95_us": 43.548,
+            "p99_us": 60.518,
+            "max_us": 60.888000000000005
+          }
+        }
+      },
+      {
+        "direction": "Vulkan_producer_to_CUDA_consumer",
+        "bytes": 4096,
+        "payload_offset_bytes": 320,
+        "guard_bytes_per_endpoint": 704,
+        "correctness_passed": true,
+        "scalar_ranges_disjoint_assertion_reported": true,
+        "statistics": {
+          "producer_submit_us": {
+            "count": 1000,
+            "min_us": 4.87,
+            "median_us": 6.81,
+            "p95_us": 7.359,
+            "p99_us": 7.589,
+            "max_us": 25.899
+          },
+          "producer_completion_wait_us": {
+            "count": 1000,
+            "min_us": 40.068,
+            "median_us": 66.468,
+            "p95_us": 92.287,
+            "p99_us": 105.277,
+            "max_us": 118.096
+          },
+          "native_tensor_copy_complete_us": {
+            "count": 1000,
+            "min_us": 5.969,
+            "median_us": 10.639,
+            "p95_us": 10.74,
+            "p99_us": 10.78,
+            "max_us": 17.399
+          },
+          "consumer_submit_us": {
+            "count": 1000,
+            "min_us": 0.75,
+            "median_us": 0.93,
+            "p95_us": 1,
+            "p99_us": 1.11,
+            "max_us": 1.38
+          },
+          "consumer_completion_wait_us": {
+            "count": 1000,
+            "min_us": 12.19,
+            "median_us": 13.399,
+            "p95_us": 13.909,
+            "p99_us": 14.26,
+            "max_us": 28.079
+          },
+          "producer_to_consumer_ready_receiver_us": {
+            "count": 1000,
+            "min_us": 65.397,
+            "median_us": 98.307,
+            "p95_us": 124.345,
+            "p99_us": 137.345,
+            "max_us": 149.825
+          },
+          "producer_planning_us": {
+            "count": 1000,
+            "min_us": 0.049,
+            "median_us": 0.05,
+            "p95_us": 0.06,
+            "p99_us": 0.06,
+            "max_us": 0.25
+          },
+          "gpu_verification_and_receiver_rearm_us": {
+            "count": 1000,
+            "min_us": 227.662,
+            "median_us": 266.936,
+            "p95_us": 275.62,
+            "p99_us": 297.569,
+            "max_us": 306.56
+          },
+          "full_iteration_cycle_us": {
+            "count": 1000,
+            "min_us": 316.739,
+            "median_us": 363.872,
+            "p95_us": 389.266,
+            "p99_us": 404.426,
+            "max_us": 408.906
+          },
+          "producer_total_us": {
+            "count": 1000,
+            "min_us": 45.048,
+            "median_us": 73.39699999999999,
+            "p95_us": 99.417,
+            "p99_us": 112.31599999999999,
+            "max_us": 125.066
+          },
+          "consumer_total_us": {
+            "count": 1000,
+            "min_us": 13.12,
+            "median_us": 14.32,
+            "p95_us": 14.848999999999998,
+            "p99_us": 15.179,
+            "max_us": 28.949
+          }
+        }
+      },
+      {
+        "direction": "CUDA_producer_to_Vulkan_consumer",
+        "bytes": 4096,
+        "payload_offset_bytes": 320,
+        "guard_bytes_per_endpoint": 704,
+        "correctness_passed": true,
+        "scalar_ranges_disjoint_assertion_reported": true,
+        "statistics": {
+          "producer_submit_us": {
+            "count": 1000,
+            "min_us": 0.9,
+            "median_us": 1.2,
+            "p95_us": 2.26,
+            "p99_us": 2.38,
+            "max_us": 9.88
+          },
+          "producer_completion_wait_us": {
+            "count": 1000,
+            "min_us": 12.939,
+            "median_us": 18.15,
+            "p95_us": 19.749,
+            "p99_us": 20.339,
+            "max_us": 33.339
+          },
+          "native_tensor_copy_complete_us": {
+            "count": 1000,
+            "min_us": 5.48,
+            "median_us": 5.66,
+            "p95_us": 6.28,
+            "p99_us": 6.43,
+            "max_us": 9.509
+          },
+          "consumer_submit_us": {
+            "count": 1000,
+            "min_us": 6.37,
+            "median_us": 7.16,
+            "p95_us": 7.77,
+            "p99_us": 8.23,
+            "max_us": 21.069
+          },
+          "consumer_completion_wait_us": {
+            "count": 1000,
+            "min_us": 27.169,
+            "median_us": 27.299,
+            "p95_us": 40.208,
+            "p99_us": 53.228,
+            "max_us": 72.218
+          },
+          "producer_to_consumer_ready_receiver_us": {
+            "count": 1000,
+            "min_us": 54.428,
+            "median_us": 59.528,
+            "p95_us": 71.748,
+            "p99_us": 88.707,
+            "max_us": 127.246
+          },
+          "producer_planning_us": {
+            "count": 1000,
+            "min_us": 0.01,
+            "median_us": 0.02,
+            "p95_us": 0.02,
+            "p99_us": 0.02,
+            "max_us": 0.04
+          },
+          "gpu_verification_and_receiver_rearm_us": {
+            "count": 1000,
+            "min_us": 267.671,
+            "median_us": 288.645,
+            "p95_us": 329.138,
+            "p99_us": 349.588,
+            "max_us": 440.464
+          },
+          "full_iteration_cycle_us": {
+            "count": 1000,
+            "min_us": 326.949,
+            "median_us": 348.373,
+            "p95_us": 398.596,
+            "p99_us": 433.045,
+            "max_us": 567.75
+          },
+          "producer_total_us": {
+            "count": 1000,
+            "min_us": 14.129,
+            "median_us": 19.309,
+            "p95_us": 21.949,
+            "p99_us": 22.488999999999997,
+            "max_us": 35.458999999999996
+          },
+          "consumer_total_us": {
+            "count": 1000,
+            "min_us": 33.729,
+            "median_us": 34.509,
+            "p95_us": 47.228,
+            "p99_us": 60.588,
+            "max_us": 93.287
+          }
+        }
+      }
+    ]
+  },
+  "validation_run": {
+    "warmup_per_case": 20,
+    "samples_per_case": 100,
+    "case_count": 4,
+    "correctness_passed": true,
+    "local_cleanup_completed": true,
+    "remote_cleanup_acknowledged": false,
+    "process_exit_code": 2,
+    "latency_gate": {
+      "threshold_us": 10,
+      "statistic": "maximum of every case",
+      "comparison": "strictly less than",
+      "passed": false
+    },
+    "vulkan_ownership_counters": {
+      "planned_acquires": 480,
+      "cold_acquires": 0,
+      "consumer_barriers": 480,
+      "host_barriers": 2
+    },
+    "vulkan_validation_errors_reported": false,
+    "cases": [
+      {
+        "direction": "Vulkan_producer_to_CUDA_consumer",
+        "bytes": 1024,
+        "payload_offset_bytes": 320,
+        "guard_bytes_per_endpoint": 704,
+        "correctness_passed": true,
+        "scalar_ranges_disjoint_assertion_reported": null,
+        "statistics": {
+          "producer_submit_us": {
+            "count": 100,
+            "min_us": 13.139,
+            "median_us": 15.8895,
+            "p95_us": 17.659,
+            "p99_us": 44.489,
+            "max_us": 97.087
+          },
+          "producer_completion_wait_us": {
+            "count": 100,
+            "min_us": 54.628,
+            "median_us": 80.3925,
+            "p95_us": 107.216,
+            "p99_us": 159.195,
+            "max_us": 172.414
+          },
+          "native_tensor_copy_complete_us": {
+            "count": 100,
+            "min_us": 5.6,
+            "median_us": 10.18,
+            "p95_us": 10.83,
+            "p99_us": 12.52,
+            "max_us": 14.57
+          },
+          "consumer_submit_us": {
+            "count": 100,
+            "min_us": 0.98,
+            "median_us": 1.525,
+            "p95_us": 1.99,
+            "p99_us": 2.83,
+            "max_us": 5.429
+          },
+          "consumer_completion_wait_us": {
+            "count": 100,
+            "min_us": 12.98,
+            "median_us": 13.815000000000001,
+            "p95_us": 17.269,
+            "p99_us": 21.409,
+            "max_us": 21.449
+          },
+          "producer_to_consumer_ready_receiver_us": {
+            "count": 100,
+            "min_us": 96.196,
+            "median_us": 123.021,
+            "p95_us": 157.724,
+            "p99_us": 214.693,
+            "max_us": 218.112
+          },
+          "producer_planning_us": {
+            "count": 100,
+            "min_us": 0.05,
+            "median_us": 0.06,
+            "p95_us": 0.41,
+            "p99_us": 0.43,
+            "max_us": 0.81
+          },
+          "gpu_verification_and_receiver_rearm_us": {
+            "count": 100,
+            "min_us": 395.547,
+            "median_us": 432.42,
+            "p95_us": 554.541,
+            "p99_us": 635.858,
+            "max_us": 717.686
+          },
+          "full_iteration_cycle_us": {
+            "count": 100,
+            "min_us": 496.773,
+            "median_us": 559.155,
+            "p95_us": 680.726,
+            "p99_us": 843.941,
+            "max_us": 851.361
+          },
+          "producer_total_us": {
+            "count": 100,
+            "min_us": 70.907,
+            "median_us": 96.65700000000001,
+            "p95_us": 132.145,
+            "p99_us": 177.284,
+            "max_us": 188.44299999999998
+          },
+          "consumer_total_us": {
+            "count": 100,
+            "min_us": 14.23,
+            "median_us": 15.344999999999999,
+            "p95_us": 19.189,
+            "p99_us": 22.839,
+            "max_us": 23.059
+          }
+        }
+      },
+      {
+        "direction": "CUDA_producer_to_Vulkan_consumer",
+        "bytes": 1024,
+        "payload_offset_bytes": 320,
+        "guard_bytes_per_endpoint": 704,
+        "correctness_passed": true,
+        "scalar_ranges_disjoint_assertion_reported": null,
+        "statistics": {
+          "producer_submit_us": {
+            "count": 100,
+            "min_us": 1.15,
+            "median_us": 1.66,
+            "p95_us": 2.05,
+            "p99_us": 2.13,
+            "max_us": 2.179
+          },
+          "producer_completion_wait_us": {
+            "count": 100,
+            "min_us": 17.439,
+            "median_us": 18.1095,
+            "p95_us": 18.82,
+            "p99_us": 19.169,
+            "max_us": 31.979
+          },
+          "native_tensor_copy_complete_us": {
+            "count": 100,
+            "min_us": 5.56,
+            "median_us": 5.8495,
+            "p95_us": 6.24,
+            "p99_us": 8.2,
+            "max_us": 11.32
+          },
+          "consumer_submit_us": {
+            "count": 100,
+            "min_us": 12.7,
+            "median_us": 13.7145,
+            "p95_us": 14.58,
+            "p99_us": 15.669,
+            "max_us": 28.339
+          },
+          "consumer_completion_wait_us": {
+            "count": 100,
+            "min_us": 40.118,
+            "median_us": 66.408,
+            "p95_us": 93.187,
+            "p99_us": 105.377,
+            "max_us": 118.396
+          },
+          "producer_to_consumer_ready_receiver_us": {
+            "count": 100,
+            "min_us": 77.947,
+            "median_us": 105.716,
+            "p95_us": 132.866,
+            "p99_us": 145.025,
+            "max_us": 157.484
+          },
+          "producer_planning_us": {
+            "count": 100,
+            "min_us": 0.01,
+            "median_us": 0.02,
+            "p95_us": 0.02,
+            "p99_us": 0.02,
+            "max_us": 0.02
+          },
+          "gpu_verification_and_receiver_rearm_us": {
+            "count": 100,
+            "min_us": 388.727,
+            "median_us": 404.711,
+            "p95_us": 484.613,
+            "p99_us": 544.621,
+            "max_us": 549.811
+          },
+          "full_iteration_cycle_us": {
+            "count": 100,
+            "min_us": 478.713,
+            "median_us": 511.5125,
+            "p95_us": 591.04,
+            "p99_us": 642.717,
+            "max_us": 677.026
+          },
+          "producer_total_us": {
+            "count": 100,
+            "min_us": 18.669,
+            "median_us": 19.7545,
+            "p95_us": 20.68,
+            "p99_us": 21.079,
+            "max_us": 33.599
+          },
+          "consumer_total_us": {
+            "count": 100,
+            "min_us": 53.348,
+            "median_us": 80.1625,
+            "p95_us": 106.587,
+            "p99_us": 119.276,
+            "max_us": 132.085
+          }
+        }
+      },
+      {
+        "direction": "Vulkan_producer_to_CUDA_consumer",
+        "bytes": 4096,
+        "payload_offset_bytes": 320,
+        "guard_bytes_per_endpoint": 704,
+        "correctness_passed": true,
+        "scalar_ranges_disjoint_assertion_reported": null,
+        "statistics": {
+          "producer_submit_us": {
+            "count": 100,
+            "min_us": 13.11,
+            "median_us": 14.0745,
+            "p95_us": 14.849,
+            "p99_us": 15.15,
+            "max_us": 16.429
+          },
+          "producer_completion_wait_us": {
+            "count": 100,
+            "min_us": 52.958,
+            "median_us": 79.657,
+            "p95_us": 105.616,
+            "p99_us": 119.016,
+            "max_us": 157.775
+          },
+          "native_tensor_copy_complete_us": {
+            "count": 100,
+            "min_us": 11.109,
+            "median_us": 11.29,
+            "p95_us": 11.439,
+            "p99_us": 11.47,
+            "max_us": 11.53
+          },
+          "consumer_submit_us": {
+            "count": 100,
+            "min_us": 0.86,
+            "median_us": 1.27,
+            "p95_us": 1.84,
+            "p99_us": 1.89,
+            "max_us": 1.92
+          },
+          "consumer_completion_wait_us": {
+            "count": 100,
+            "min_us": 12.619,
+            "median_us": 13.4245,
+            "p95_us": 13.809,
+            "p99_us": 14.46,
+            "max_us": 17.679
+          },
+          "producer_to_consumer_ready_receiver_us": {
+            "count": 100,
+            "min_us": 93.597,
+            "median_us": 119.851,
+            "p95_us": 146.085,
+            "p99_us": 159.365,
+            "max_us": 198.153
+          },
+          "producer_planning_us": {
+            "count": 100,
+            "min_us": 0.05,
+            "median_us": 0.05,
+            "p95_us": 0.06,
+            "p99_us": 0.06,
+            "max_us": 0.07
+          },
+          "gpu_verification_and_receiver_rearm_us": {
+            "count": 100,
+            "min_us": 379.386,
+            "median_us": 410.001,
+            "p95_us": 470.704,
+            "p99_us": 528.681,
+            "max_us": 536.651
+          },
+          "full_iteration_cycle_us": {
+            "count": 100,
+            "min_us": 498.632,
+            "median_us": 530.337,
+            "p95_us": 603.659,
+            "p99_us": 682.476,
+            "max_us": 687.706
+          },
+          "producer_total_us": {
+            "count": 100,
+            "min_us": 67.418,
+            "median_us": 93.70649999999999,
+            "p95_us": 119.786,
+            "p99_us": 133.24599999999998,
+            "max_us": 172.214
+          },
+          "consumer_total_us": {
+            "count": 100,
+            "min_us": 13.709,
+            "median_us": 14.7245,
+            "p95_us": 15.459999999999999,
+            "p99_us": 16.380000000000003,
+            "max_us": 18.759
+          }
+        }
+      },
+      {
+        "direction": "CUDA_producer_to_Vulkan_consumer",
+        "bytes": 4096,
+        "payload_offset_bytes": 320,
+        "guard_bytes_per_endpoint": 704,
+        "correctness_passed": true,
+        "scalar_ranges_disjoint_assertion_reported": null,
+        "statistics": {
+          "producer_submit_us": {
+            "count": 100,
+            "min_us": 1.22,
+            "median_us": 1.62,
+            "p95_us": 2,
+            "p99_us": 2.64,
+            "max_us": 2.65
+          },
+          "producer_completion_wait_us": {
+            "count": 100,
+            "min_us": 14.609,
+            "median_us": 18.419,
+            "p95_us": 19.16,
+            "p99_us": 20.389,
+            "max_us": 20.909
+          },
+          "native_tensor_copy_complete_us": {
+            "count": 100,
+            "min_us": 6.909,
+            "median_us": 7.575,
+            "p95_us": 8.06,
+            "p99_us": 8.18,
+            "max_us": 8.71
+          },
+          "consumer_submit_us": {
+            "count": 100,
+            "min_us": 13.09,
+            "median_us": 14.004999999999999,
+            "p95_us": 14.74,
+            "p99_us": 20.689,
+            "max_us": 21.919
+          },
+          "consumer_completion_wait_us": {
+            "count": 100,
+            "min_us": 45.699,
+            "median_us": 53.623000000000005,
+            "p95_us": 80.417,
+            "p99_us": 92.397,
+            "max_us": 94.147
+          },
+          "producer_to_consumer_ready_receiver_us": {
+            "count": 100,
+            "min_us": 88.727,
+            "median_us": 95.452,
+            "p95_us": 122.026,
+            "p99_us": 135.505,
+            "max_us": 145.865
+          },
+          "producer_planning_us": {
+            "count": 100,
+            "min_us": 0.01,
+            "median_us": 0.02,
+            "p95_us": 0.02,
+            "p99_us": 0.02,
+            "max_us": 0.03
+          },
+          "gpu_verification_and_receiver_rearm_us": {
+            "count": 100,
+            "min_us": 392.846,
+            "median_us": 409.496,
+            "p95_us": 442.654,
+            "p99_us": 478.974,
+            "max_us": 481.793
+          },
+          "full_iteration_cycle_us": {
+            "count": 100,
+            "min_us": 487.573,
+            "median_us": 509.2875,
+            "p95_us": 541.261,
+            "p99_us": 574.57,
+            "max_us": 617.328
+          },
+          "producer_total_us": {
+            "count": 100,
+            "min_us": 16.149,
+            "median_us": 20.014499999999998,
+            "p95_us": 20.869,
+            "p99_us": 22.319,
+            "max_us": 23.558999999999997
+          },
+          "consumer_total_us": {
+            "count": 100,
+            "min_us": 60.028,
+            "median_us": 67.737,
+            "p95_us": 94.81700000000001,
+            "p99_us": 106.88600000000001,
+            "max_us": 114.83600000000001
+          }
+        }
+      }
+    ],
+    "provenance_note": "Earlier supplementary harness run; scalar-layout assertion field was not reported and is not inferred."
+  },
+  "final_validation_run": {
+    "warmup_per_case": 100,
+    "samples_per_case": 1000,
+    "case_count": 4,
+    "correctness_passed": true,
+    "local_cleanup_completed": true,
+    "remote_cleanup_acknowledged": false,
+    "process_exit_code": 2,
+    "latency_gate": {
+      "threshold_us": 10,
+      "statistic": "maximum of every case",
+      "comparison": "strictly less than",
+      "passed": false
+    },
+    "vulkan_ownership_counters": {
+      "planned_acquires": 4400,
+      "cold_acquires": 0,
+      "consumer_barriers": 4400,
+      "host_barriers": 2
+    },
+    "vulkan_validation_errors_reported": false,
+    "cases": [
+      {
+        "direction": "Vulkan_producer_to_CUDA_consumer",
+        "bytes": 1024,
+        "payload_offset_bytes": 320,
+        "guard_bytes_per_endpoint": 704,
+        "correctness_passed": true,
+        "scalar_ranges_disjoint_assertion_reported": true,
+        "statistics": {
+          "producer_submit_us": {
+            "count": 1000,
+            "min_us": 11.969,
+            "median_us": 13.5195,
+            "p95_us": 15.099,
+            "p99_us": 19.139,
+            "max_us": 38.799
+          },
+          "producer_completion_wait_us": {
+            "count": 1000,
+            "min_us": 68.038,
+            "median_us": 73.868,
+            "p95_us": 87.707,
+            "p99_us": 111.686,
+            "max_us": 114.236
+          },
+          "native_tensor_copy_complete_us": {
+            "count": 1000,
+            "min_us": 5.5,
+            "median_us": 10.14,
+            "p95_us": 10.299,
+            "p99_us": 10.73,
+            "max_us": 16.299
+          },
+          "consumer_submit_us": {
+            "count": 1000,
+            "min_us": 0.71,
+            "median_us": 0.94,
+            "p95_us": 1.08,
+            "p99_us": 1.48,
+            "max_us": 4.149
+          },
+          "consumer_completion_wait_us": {
+            "count": 1000,
+            "min_us": 12.33,
+            "median_us": 13.519,
+            "p95_us": 14.309,
+            "p99_us": 15.4,
+            "max_us": 31.179
+          },
+          "producer_to_consumer_ready_receiver_us": {
+            "count": 1000,
+            "min_us": 104.956,
+            "median_us": 112.731,
+            "p95_us": 127.026,
+            "p99_us": 148.745,
+            "max_us": 155.474
+          },
+          "producer_planning_us": {
+            "count": 1000,
+            "min_us": 0.05,
+            "median_us": 0.06,
+            "p95_us": 0.15,
+            "p99_us": 0.19,
+            "max_us": 0.49
+          },
+          "gpu_verification_and_receiver_rearm_us": {
+            "count": 1000,
+            "min_us": 336.538,
+            "median_us": 389.276,
+            "p95_us": 421.616,
+            "p99_us": 442.805,
+            "max_us": 544.311
+          },
+          "full_iteration_cycle_us": {
+            "count": 1000,
+            "min_us": 446.244,
+            "median_us": 502.027,
+            "p95_us": 535.561,
+            "p99_us": 556.531,
+            "max_us": 667.117
+          },
+          "producer_total_us": {
+            "count": 1000,
+            "min_us": 80.667,
+            "median_us": 88.097,
+            "p95_us": 102.517,
+            "p99_us": 124.16600000000001,
+            "max_us": 130.095
+          },
+          "consumer_total_us": {
+            "count": 1000,
+            "min_us": 13.27,
+            "median_us": 14.469999999999999,
+            "p95_us": 15.318999999999999,
+            "p99_us": 16.929000000000002,
+            "max_us": 32.079
+          }
+        }
+      },
+      {
+        "direction": "CUDA_producer_to_Vulkan_consumer",
+        "bytes": 1024,
+        "payload_offset_bytes": 320,
+        "guard_bytes_per_endpoint": 704,
+        "correctness_passed": true,
+        "scalar_ranges_disjoint_assertion_reported": true,
+        "statistics": {
+          "producer_submit_us": {
+            "count": 1000,
+            "min_us": 0.829,
+            "median_us": 1.03,
+            "p95_us": 1.23,
+            "p99_us": 1.48,
+            "max_us": 10.91
+          },
+          "producer_completion_wait_us": {
+            "count": 1000,
+            "min_us": 12.949,
+            "median_us": 17.909,
+            "p95_us": 18.59,
+            "p99_us": 19.57,
+            "max_us": 56.408
+          },
+          "native_tensor_copy_complete_us": {
+            "count": 1000,
+            "min_us": 5.4,
+            "median_us": 5.66,
+            "p95_us": 5.799,
+            "p99_us": 6.089,
+            "max_us": 10.389
+          },
+          "consumer_submit_us": {
+            "count": 1000,
+            "min_us": 11.84,
+            "median_us": 14.44,
+            "p95_us": 15.26,
+            "p99_us": 17.9,
+            "max_us": 50.948
+          },
+          "consumer_completion_wait_us": {
+            "count": 1000,
+            "min_us": 32.989,
+            "median_us": 60.408,
+            "p95_us": 61.468,
+            "p99_us": 85.847,
+            "max_us": 102.176
+          },
+          "producer_to_consumer_ready_receiver_us": {
+            "count": 1000,
+            "min_us": 70.037,
+            "median_us": 98.8715,
+            "p95_us": 101.606,
+            "p99_us": 134.786,
+            "max_us": 167.854
+          },
+          "producer_planning_us": {
+            "count": 1000,
+            "min_us": 0.01,
+            "median_us": 0.02,
+            "p95_us": 0.02,
+            "p99_us": 0.02,
+            "max_us": 0.04
+          },
+          "gpu_verification_and_receiver_rearm_us": {
+            "count": 1000,
+            "min_us": 364.648,
+            "median_us": 381.712,
+            "p95_us": 419.696,
+            "p99_us": 438.075,
+            "max_us": 612.849
+          },
+          "full_iteration_cycle_us": {
+            "count": 1000,
+            "min_us": 434.705,
+            "median_us": 480.6085,
+            "p95_us": 521.342,
+            "p99_us": 564.841,
+            "max_us": 727.495
+          },
+          "producer_total_us": {
+            "count": 1000,
+            "min_us": 13.88,
+            "median_us": 18.95,
+            "p95_us": 19.809,
+            "p99_us": 21.04,
+            "max_us": 57.378
+          },
+          "consumer_total_us": {
+            "count": 1000,
+            "min_us": 45.448,
+            "median_us": 74.2475,
+            "p95_us": 76.458,
+            "p99_us": 100.90700000000001,
+            "max_us": 136.795
+          }
+        }
+      },
+      {
+        "direction": "Vulkan_producer_to_CUDA_consumer",
+        "bytes": 4096,
+        "payload_offset_bytes": 320,
+        "guard_bytes_per_endpoint": 704,
+        "correctness_passed": true,
+        "scalar_ranges_disjoint_assertion_reported": true,
+        "statistics": {
+          "producer_submit_us": {
+            "count": 1000,
+            "min_us": 11.87,
+            "median_us": 12.714500000000001,
+            "p95_us": 13.309,
+            "p99_us": 15.689,
+            "max_us": 27.119
+          },
+          "producer_completion_wait_us": {
+            "count": 1000,
+            "min_us": 62.358,
+            "median_us": 73.518,
+            "p95_us": 98.366,
+            "p99_us": 111.586,
+            "max_us": 113.196
+          },
+          "native_tensor_copy_complete_us": {
+            "count": 1000,
+            "min_us": 6.619,
+            "median_us": 11.259,
+            "p95_us": 11.389,
+            "p99_us": 12.209,
+            "max_us": 17.95
+          },
+          "consumer_submit_us": {
+            "count": 1000,
+            "min_us": 0.68,
+            "median_us": 1.0,
+            "p95_us": 1.13,
+            "p99_us": 1.26,
+            "max_us": 4.68
+          },
+          "consumer_completion_wait_us": {
+            "count": 1000,
+            "min_us": 12.26,
+            "median_us": 13.299,
+            "p95_us": 13.71,
+            "p99_us": 14.5,
+            "max_us": 96.786
+          },
+          "producer_to_consumer_ready_receiver_us": {
+            "count": 1000,
+            "min_us": 100.627,
+            "median_us": 111.6265,
+            "p95_us": 136.375,
+            "p99_us": 150.045,
+            "max_us": 196.193
+          },
+          "producer_planning_us": {
+            "count": 1000,
+            "min_us": 0.05,
+            "median_us": 0.06,
+            "p95_us": 0.07,
+            "p99_us": 0.11,
+            "max_us": 0.42
+          },
+          "gpu_verification_and_receiver_rearm_us": {
+            "count": 1000,
+            "min_us": 330.009,
+            "median_us": 346.283,
+            "p95_us": 408.446,
+            "p99_us": 428.455,
+            "max_us": 661.037
+          },
+          "full_iteration_cycle_us": {
+            "count": 1000,
+            "min_us": 440.534,
+            "median_us": 459.1795,
+            "p95_us": 520.962,
+            "p99_us": 546.001,
+            "max_us": 815.371
+          },
+          "producer_total_us": {
+            "count": 1000,
+            "min_us": 75.018,
+            "median_us": 86.087,
+            "p95_us": 110.686,
+            "p99_us": 124.226,
+            "max_us": 125.765
+          },
+          "consumer_total_us": {
+            "count": 1000,
+            "min_us": 13.219000000000001,
+            "median_us": 14.3,
+            "p95_us": 14.81,
+            "p99_us": 15.849,
+            "max_us": 97.856
+          }
+        }
+      },
+      {
+        "direction": "CUDA_producer_to_Vulkan_consumer",
+        "bytes": 4096,
+        "payload_offset_bytes": 320,
+        "guard_bytes_per_endpoint": 704,
+        "correctness_passed": true,
+        "scalar_ranges_disjoint_assertion_reported": true,
+        "statistics": {
+          "producer_submit_us": {
+            "count": 1000,
+            "min_us": 0.82,
+            "median_us": 1.13,
+            "p95_us": 2.16,
+            "p99_us": 3.36,
+            "max_us": 8.47
+          },
+          "producer_completion_wait_us": {
+            "count": 1000,
+            "min_us": 13.16,
+            "median_us": 18.019,
+            "p95_us": 19.71,
+            "p99_us": 21.26,
+            "max_us": 844.891
+          },
+          "native_tensor_copy_complete_us": {
+            "count": 1000,
+            "min_us": 6.709,
+            "median_us": 7.0495,
+            "p95_us": 8.29,
+            "p99_us": 11.909,
+            "max_us": 28.759
+          },
+          "consumer_submit_us": {
+            "count": 1000,
+            "min_us": 11.84,
+            "median_us": 14.09,
+            "p95_us": 22.459,
+            "p99_us": 38.009,
+            "max_us": 106.656
+          },
+          "consumer_completion_wait_us": {
+            "count": 1000,
+            "min_us": 33.719,
+            "median_us": 60.567499999999995,
+            "p95_us": 85.907,
+            "p99_us": 102.986,
+            "max_us": 179.964
+          },
+          "producer_to_consumer_ready_receiver_us": {
+            "count": 1000,
+            "min_us": 72.037,
+            "median_us": 99.946,
+            "p95_us": 136.955,
+            "p99_us": 167.775,
+            "max_us": 986.896
+          },
+          "producer_planning_us": {
+            "count": 1000,
+            "min_us": 0.01,
+            "median_us": 0.02,
+            "p95_us": 0.02,
+            "p99_us": 0.03,
+            "max_us": 0.05
+          },
+          "gpu_verification_and_receiver_rearm_us": {
+            "count": 1000,
+            "min_us": 357.998,
+            "median_us": 402.566,
+            "p95_us": 447.335,
+            "p99_us": 537.991,
+            "max_us": 2638.868
+          },
+          "full_iteration_cycle_us": {
+            "count": 1000,
+            "min_us": 440.665,
+            "median_us": 498.3275,
+            "p95_us": 578.74,
+            "p99_us": 700.396,
+            "max_us": 2769.634
+          },
+          "producer_total_us": {
+            "count": 1000,
+            "min_us": 14.21,
+            "median_us": 19.1395,
+            "p95_us": 21.78,
+            "p99_us": 23.599,
+            "max_us": 845.971
+          },
+          "consumer_total_us": {
+            "count": 1000,
+            "min_us": 46.318,
+            "median_us": 73.6125,
+            "p95_us": 108.65599999999999,
+            "p99_us": 129.505,
+            "max_us": 194.083
+          }
+        }
+      }
+    ],
+    "provenance_note": "Final shipped harness and restored selected runtime, with Vulkan validation enabled; supplementary correctness acceptance, not the unlayered performance baseline."
+  },
+  "negative_control": {
+    "kind": "wrong GPU-generated receiver reference",
+    "bytes": 1024,
+    "phase": "warmup",
+    "iteration": 0,
+    "producer_reductions": [
+      0,
+      0,
+      0
+    ],
+    "consumer_reductions": [
+      256,
+      0,
+      0
+    ],
+    "correctness_passed": false,
+    "local_cleanup_completed": true,
+    "process_exit_code": 3,
+    "latency_gate_evaluated": false
+  },
+  "limitations": [
+    "Functional result for the measured allocated-memory path, not arbitrary existing GPU allocations.",
+    "CPU scheduling, RPC metadata and NIC submission/completion remain.",
+    "The primary clock assumes an already-ready receiver; the full verification/rearm cycle is separately measured.",
+    "The 10 microsecond acceptance gate failed; observed percentiles and maxima are not hard latency guarantees.",
+    "This small-kernel benchmark is not a model collective or inference throughput measurement.",
+    "No remote teardown acknowledgement exists in this RPC protocol; endpoint logs must be preserved separately."
+  ],
+  "selection_note": "Scheduling and dispatch experiments were not selected because they did not establish a material improvement; the baseline overlay is retained."
+}

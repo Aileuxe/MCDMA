@@ -172,6 +172,9 @@ The [native validation report](validation-2026-09-28-native-inference.md) record
 engine tensor-copy verification, both-initiator NIC latency, Qwen3-8B TP=2 and
 direct KV handoff. This is a pinned experimental runtime patch with backend
 ABI 3, so follow its apply/verify and matching-build instructions on both hosts.
+The [GPU end-to-end report](validation-2026-09-28-gpu-e2e.md) additionally verifies
+changing GPU-produced payloads through RDMA and consumption on the peer GPU,
+with both directions measured from one coordinator clock.
 It does not make arbitrary existing GPU allocations RDMA-capable or remove CPU
 scheduling, metadata and sampling work.
 

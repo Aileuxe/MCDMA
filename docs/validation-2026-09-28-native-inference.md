@@ -5,6 +5,9 @@ Vulkan computation directly through RDMA. Qwen3-8B tensor parallelism and a
 separate direct KV handoff passed with no interhost GPU-payload staging copy.
 This closes the allocator gap in the earlier
 [host-staged inference report](validation-2026-09-28-cuda-vulkan.md).
+The subsequent [GPU producer-to-consumer report](validation-2026-09-28-gpu-e2e.md)
+verifies the complete GPU production, RDMA transfer and GPU consumption path in
+both directions, with separately defined full-path and verification-cycle times.
 
 The CPU still submits GPU work, posts and completes RDMA operations, handles
 graph/cache metadata and samples tokens. These results do not establish
@@ -36,8 +39,9 @@ link negotiates 100 Gb/s, while the enclosure's observed USB4 host link is
 The [curated results](validation-2026-09-28-native-inference-results.json)
 preserve timings, counts and comparison definitions without endpoint addresses,
 memory-region keys, prompts or generated token sequences. Raw samples, build
-artifacts and model files are retained privately. The three clocks below
-measure different operations and must not be substituted for one another.
+artifacts and model files are retained privately. The clocks below measure
+different operations and must not be substituted for one another or for the
+full GPU producer-to-consumer interval in the linked report.
 
 ## NIC completion latency
 
@@ -67,6 +71,8 @@ All medians and p99 values through 4 KiB were below 6 microseconds. This is not
 a hard latency bound: for example, one CUDA-initiated 4 KiB READ took
 77.104 microseconds. It also does not establish a below-10-microsecond complete
 GPU producer/consumer exchange or inference collective.
+The complete GPU path's functionality and measured latency are established
+separately in the [end-to-end report](validation-2026-09-28-gpu-e2e.md).
 
 ## Inference tensor-copy correctness and timing
 

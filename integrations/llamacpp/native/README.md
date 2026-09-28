@@ -174,6 +174,117 @@ RPC exchanges. Producer graph execution and the consumer graph are outside these
 copy-call intervals. There are only two samples per size, so these output
 lines are a correctness diagnostic rather than a latency distribution.
 
+## GPU producer-to-consumer timing
+
+`mcdma-native-e2e` measures a GPU producer, the native tensor transfer and the
+receiving GPU's consumer graph in one interval. Run it on the Vulkan host with
+the selected CUDA RPC server already running and the same allocator, RDMA and
+backend-library environment described above. The runner covers both directions
+at 1 KiB and 4 KiB; all timestamps come from the Vulkan coordinator's
+`steady_clock`. It never subtracts timestamps from different hosts or divides a
+round trip by two.
+
+The [GPU end-to-end validation report](../../../docs/validation-2026-09-28-gpu-e2e.md)
+records successful GPU-produced, RDMA-transferred and GPU-consumed payloads in
+both directions, including warmed repetitions and a wrong-reference control.
+Its complete producer-to-consumer latency did not meet the 10-microsecond gate;
+the report keeps that performance verdict separate from functional success.
+
+Build the runner against the matching patched libraries:
+
+```sh
+cmake -S integrations/llamacpp/native -B build/native-inference \
+  -DLLAMA_SOURCE_DIR="$LLAMA_SOURCE_DIR" \
+  -DLLAMA_BUILD_DIR="$LLAMA_BUILD_DIR"
+cmake --build build/native-inference --target mcdma-native-e2e -j 8
+
+build/native-inference/mcdma-native-e2e --rpc "$CUDA_RPC_ENDPOINT" \
+  --warmup 100 --iterations 1000 --timeout-seconds 300 \
+  --require-e2e-us 10 --output "$NEW_E2E_JSON"
+```
+
+The output path must be new; the runner creates it with mode `0600` and refuses
+to overwrite an existing file. Keep the JSON, program exit status, local log,
+RPC server log and exact source/library hashes together. The iteration counts
+and deadline are bounded. The deadline is checked between iterations; existing
+backend timeouts still govern calls already in progress.
+
+The primary JSON metric, `producer_to_consumer_ready_receiver_us`, starts
+immediately before producer graph submission and ends only after consumer GPU
+completion has been observed. Its consecutive stage measurements are:
+
+| JSON field | Included work |
+|---|---|
+| `producer_submit_us` | Submit the producer graph through its normal backend API |
+| `producer_completion_wait_us` | Wait for producer GPU completion, including remote readiness reporting when applicable |
+| `native_tensor_copy_complete_us` | Execute the native tensor copy and wait for completion |
+| `consumer_submit_us` | Submit the receiving GPU's consumer graph |
+| `consumer_completion_wait_us` | Wait for consumer GPU completion |
+
+These are coordinator wall times, so RPC submission and completion-reporting
+overhead remain inside the relevant stages. In the forward direction the
+producer is Vulkan and the consumer is CUDA; in reverse they are CUDA and
+Vulkan. Required producer release and consumer acquire barriers execute with
+their GPU graphs inside the interval.
+
+The receiver is already ready before each producer starts. For reverse
+transfers, the Vulkan receive range is released during initial GPU setup and
+then rearmed by the preceding iteration's verification graph. GPU verification,
+reduced-scalar readback and receiver rearming are outside the primary interval
+and are measured as `gpu_verification_and_receiver_rearm_us`; producer-side CPU
+planning is recorded as `producer_planning_us`. `full_iteration_cycle_us` spans
+that planning, the producer-to-consumer interval and verification/rearming.
+Use it when assessing repeated exchange cost rather than treating the primary
+metric as the complete cycle. Fixture setup and final resource teardown are
+outside both per-iteration clocks.
+
+Payload allocations, their registrations and client graph objects persist
+through warmup and measurement. The current harness uses graph UID zero, so
+the selected runtime does not reuse the remote RPC graph; the JSON records
+`rpc_graph_reuse: false`. Verification graphs also run between samples and can
+change backend graph-cache state. These conditions belong with the results.
+
+All initial payloads, guards and independent reference values are generated on
+the GPUs. The producer changes its payload on every iteration, the consumer
+transforms the received values, and GPU reductions check the payload and both
+guards after every warmup and measured iteration. Transfers use a nonzero
+320-byte tensor offset and 704 guard bytes per endpoint. The CPU reads only
+four-byte verification reductions after the timed consumer completes; cold
+layout checks require those scalar ranges to be disjoint from the payload.
+
+The JSON retains every stage sample and reports median, p95, p99 and maximum.
+The median averages the middle pair for an even sample count; p95 and p99 use
+nearest rank. `--require-e2e-us 10` requires the observed maximum of the primary
+interval in every size/direction case to be strictly below 10 microseconds.
+This is a requested acceptance threshold, not a claim that the target passes.
+The runner saves correctness and latency verdicts separately before returning:
+
+| Exit code | Meaning |
+|---:|---|
+| 0 | Correctness passed, and any requested latency gate passed |
+| 1 | Configuration, runtime or output failure |
+| 2 | Correctness passed but the latency gate failed |
+| 3 | GPU payload or guard verification failed |
+
+Omitting the threshold leaves the latency gate unevaluated. A correctness
+failure or incomplete run is not accepted as a latency result. JSON written
+after normal teardown confirms local cleanup, but the selected RPC protocol
+does not provide a remote teardown acknowledgement; verify the server log
+separately.
+
+Run the wrong-reference negative control with another new output path:
+
+```sh
+build/native-inference/mcdma-native-e2e --rpc "$CUDA_RPC_ENDPOINT" \
+  --warmup 0 --iterations 1 --negative --output "$NEW_NEGATIVE_JSON"
+```
+
+This changes the independently GPU-generated expected consumer value and must
+return exit code 3 with `correctness_passed: false` and a nonzero GPU payload
+reduction. A connection error or other runtime failure does not count as a
+passing negative control. The negative run retains its verification failure
+and does not claim a latency-gate result.
+
 ## Persistent-MR NIC completion timing
 
 `mcdma-native-latency` is a separate two-process benchmark using the patched
