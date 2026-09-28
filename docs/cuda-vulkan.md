@@ -157,18 +157,33 @@ the protocol's RDMA completion before launching a GPU consumer. Vulkan needs
 the documented host/compute memory dependencies even with coherent memory.
 Follow the [API ownership rules](../rpc/gpu/README.md) before teardown.
 
-## Inference is a separate integration
+## Inference integrations
 
-The [llama.cpp adapter](../integrations/llamacpp/README.md) carries that runtime's
-RPC frames through MCDMA mailboxes for model experiments. It explicitly stages
-those serialized frames in host memory; it is not the no-staging GPU allocator
-path verified above. Its counters distinguish MCDMA payload movement from
-loopback socket traffic, and it disables native RPC transport upgrades.
+The [native llama.cpp overlay](../integrations/llamacpp/native/README.md) now
+allocates compute tensors in CUDA mapped pinned memory and Vulkan coherent
+exported DMA-BUF storage. The NIC transfers those same allocations, with
+registrations retained through their lifetime. Prepared Vulkan barriers run
+with producer and consumer graphs; the tensor-copy path adds no registration
+or per-copy RPC handshake. Graph/control messages also use RDMA after bootstrap.
+The separate native KV runner sends metadata over TCP and moves its GPU KV
+payload directly with RDMA.
 
-Use the exact pinned runtime revision and identical model hashes on both hosts.
+The [native validation report](validation-2026-09-28-native-inference.md) records
+engine tensor-copy verification, both-initiator NIC latency, Qwen3-8B TP=2 and
+direct KV handoff. This is a pinned experimental runtime patch with backend
+ABI 3, so follow its apply/verify and matching-build instructions on both hosts.
+It does not make arbitrary existing GPU allocations RDMA-capable or remove CPU
+scheduling, metadata and sampling work.
+
+The older [Python mailbox adapter](../integrations/llamacpp/README.md) remains
+available and explicitly host-staged: it serializes RPC frames through daemon
+mailboxes and disables native RPC transport upgrades. The file-based KV tool
+is also host-staged. Their measurements remain in the
+[earlier report](validation-2026-09-28-cuda-vulkan.md).
+
+Use identical model hashes and the exact pinned runtime on both hosts.
 `--split-mode tensor` selects tensor parallelism; splitting layers or setting
-split proportions alone does not. A saved KV cache transferred through RDMA is
-a host-staged prefill/decode handoff unless the inference allocator itself uses
-registered GPU-accessible communication buffers. Report those boundaries with
-the model measurements rather than transferring the GPU microtest's claim to
-an unmodified inference engine.
+split proportions alone does not. Keep NIC completion, actual tensor-copy
+calls and model request clocks separate. Native model results must be compared
+against matching allocator, prompt, batch and sampling configurations before
+attributing a speedup to the transport alone.

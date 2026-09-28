@@ -1,0 +1,83 @@
+{
+  "base_commit": "4da6337767f973e2b4d0797e5b323d77d8565e4a",
+  "backend_abi": 3,
+  "patch_sha256": "9f6abde1f4780aa7f4bfa9399084fee1bd08558a054400f800ba39819d0d857f",
+  "files": [
+    {
+      "path": "ggml/src/ggml-backend-impl.h",
+      "before_sha256": "683e0583268e91e1f50b4ffc416b6523e0cec2dfdb3984c89792bda29e32566b",
+      "after_sha256": "99cfb40a8c3c69d19a2c3756fa25c66c7c9529abdc6777d6f5630251bb99cfee"
+    },
+    {
+      "path": "ggml/src/ggml-backend-meta.cpp",
+      "before_sha256": "46454efd6467cc5cca7583266acfd0484b42a09692ca3b815f4bf24de8d98519",
+      "after_sha256": "cbe05c877f0b9a3627b30b1e30d4b37426ad681f2f58ebf36d444aa029836d5c"
+    },
+    {
+      "path": "ggml/src/ggml-backend.cpp",
+      "before_sha256": "2dd6a572f087a1fddaa52dbf2378b777cd21752f4b2a1292c8da3bcb05fbcfd9",
+      "after_sha256": "29965ad74ede3d2b676e964fbe8c773eb90ce7628d5dc59dcb4953d42e20a408"
+    },
+    {
+      "path": "ggml/src/ggml-cuda/CMakeLists.txt",
+      "before_sha256": "8810366d36247b5e4f923f58f92a340ba6071ad5700ef4e5af7eb0cb7f7bc67a",
+      "after_sha256": "669c35fff23390099a7d078d034a30726c0117e03a1f190091905305c8fcef9e"
+    },
+    {
+      "path": "ggml/src/ggml-cuda/ggml-cuda.cu",
+      "before_sha256": "3743393c56dfc30a2b43cd18859187acebb407e61e1ef97a1ea5190762b24273",
+      "after_sha256": "f515626f2d10387d86a539071f9935e66529aed785ac027f8081bef999584a3a"
+    },
+    {
+      "path": "ggml/src/ggml-rpc/CMakeLists.txt",
+      "before_sha256": "b73578280c4f23fe42dc92afbabe6597d3f09726290e8aec097d1e739e435197",
+      "after_sha256": "83490ec60c8b0f9f2650792ddd5766c833330bb4cad84e36781afdc1534b47b9"
+    },
+    {
+      "path": "ggml/src/ggml-rpc/ggml-rpc.cpp",
+      "before_sha256": "812494f207b78e6af7454bd8042ce582850b1c91733db4144e6297ba940b66bd",
+      "after_sha256": "d821ccef6cff0059673d2503dafc75de4a12475ec0597b3ba5db028be0ad4fb7"
+    },
+    {
+      "path": "ggml/src/ggml-rpc/mcdma-rdma.cpp",
+      "before_sha256": null,
+      "after_sha256": "817fd75f948150815a41ff54cb123c6765c017a53d7732de02dc68ce9108c466"
+    },
+    {
+      "path": "ggml/src/ggml-rpc/mcdma-rdma.h",
+      "before_sha256": null,
+      "after_sha256": "34707ce6d9a956467b6ded612f7e26a86d6f8b4329b35cfa77d272c6bb9fa913"
+    },
+    {
+      "path": "ggml/src/ggml-rpc/transport.cpp",
+      "before_sha256": "8177d6106723a7c504ae12f03bdb8edd73ff56aee9347e9a77ac15669ad57f7e",
+      "after_sha256": "58e2cf4a491a72f595879d3943f273f558449e65967158d40ebd144a2b815ab6"
+    },
+    {
+      "path": "ggml/src/ggml-rpc/transport.h",
+      "before_sha256": "fec7abf4e6cebec0d20e3350c01f2f47d495f90a79c6d829870e09d8a7ef2219",
+      "after_sha256": "2481030e60e3c91ac171b82fb690862980955982bd98b04d9660f40a6c8f2e5d"
+    },
+    {
+      "path": "ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp",
+      "before_sha256": "d821d92595086242e762c4bb4aa981203f4787740bc0862de87f03ec13599c4e",
+      "after_sha256": "682a30e89bb282ac01e576f3605ba563389dd2192077cdb534fd849ed151f137"
+    },
+    {
+      "path": "ggml/src/ggml-vulkan/ggml-vulkan-common.h",
+      "before_sha256": "6ee618834ccff51a9d7ee71e26e776016dc8e408366a6d3335feeb685abef619",
+      "after_sha256": "a6fd9fd25222f2a745b04183aead87edb997efd076d4bae818cae424fa9aebed"
+    },
+    {
+      "path": "ggml/src/ggml-vulkan/ggml-vulkan-types.h",
+      "before_sha256": "b35959f1c4f761e2526ca934e01f5f690f099f0f5105fcdb49a9a8ee6cc9f1d6",
+      "after_sha256": "174513719b2b5e20533b5eee983a7a0f0a1c90c93c06b8a42f44a7124ced1e35"
+    },
+    {
+      "path": "ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+      "before_sha256": "9db78aa3fe75dc1de2037f3a7990d6fdb95eb20fbdb8109153fd1d4c46697926",
+      "after_sha256": "248e910e9f4e1f768f826b2ed934c765f9a9805f3114bb01460b6c2d950c442a"
+    }
+  ],
+  "scope": "Linux two-peer CUDA RPC server and local Vulkan client; GPU tensor payload uses registered compute storage"
+}

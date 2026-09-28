@@ -45,12 +45,20 @@ and [public GPU APIs](rpc/gpu/README.md). This path uses GPU-accessible host
 allocations and does not enable GPUDirect access to existing GB10 `cudaMalloc`
 storage.
 
-The [28 September report](docs/validation-2026-09-28-cuda-vulkan.md) records
-GPU-only payload checks through separate daemon/application processes, plus
-Qwen3-8B prefill/decode handoff and actual CUDA/Vulkan TP=2 measurements through
-the explicitly host-staged model adapter.
+The experimental [native llama.cpp integration](integrations/llamacpp/native/README.md)
+now keeps CUDA and Vulkan compute tensors in those registered allocations.
+Qwen3-8B TP=2 and a direct GPU KV handoff passed without interhost GPU-payload
+staging. The [native validation report](docs/validation-2026-09-28-native-inference.md)
+separates NIC completion latency, actual tensor-copy calls and model request
+timing. At 8,192 input tokens and 128 output tokens, native TP=2 took 18.78 s
+versus 39.65 s in the earlier staged campaign; launch settings differed, and
+this does not establish a speedup over a single GPU.
 
-MCDMA provides the RDMA driver and verbs transport. Using that transport without payload staging in inference requires further integration in engines and frameworks such as **oMLX, MLX-LM and llama.cpp**, through their memory allocators and communication backends. The runtime needs to allocate transferred tensors in GPU-accessible memory that can also be registered for RDMA, retain those allocations and registrations until transfers finish, and synchronize GPU execution with transfer completion.
+The [earlier report](docs/validation-2026-09-28-cuda-vulkan.md) preserves the
+separate daemon/application GPU checks and explicitly host-staged model results.
+The Python mailbox adapter remains available for that path. Other engines such
+as oMLX and MLX-LM still need their own allocator and communication integration
+to use shared GPU/RDMA storage without payload copies.
 
 Separate functional tests have verified RDMA WRITE and READ in both initiation directions using Metal shared buffers and CUDA mapped host allocations. GPU kernels produced and checked the payload in the same allocations registered with RDMA, without a payload staging copy. These tests establish GPU access to the transferred memory; the latency table above measures ordinary host buffers and is not an inference or GPU-buffer benchmark. The CPU still schedules GPU work and manages RDMA operations.
 
@@ -231,7 +239,7 @@ I also have around **25 experiments planned for heterogeneous AI workloads**: pi
 
 The repository contains the native driver, userspace provider, build/setup tools and tests needed to validate CX5 RDMA. Runtime installation requires only the kernel extension, provider and provider configuration; the optional Metal keepalive runs separately. Historical benchmark archives, model-serving experiments, vendor firmware, SDK/KDK files, private installers and generated binaries are excluded.
 
-The portable setup has offline checks, but a fresh-machine installation following this recipe has not yet been completed. Foreign-QPN isolation and hot removal with mapped pages remain open; 12 client terminations during sustained traffic passed recovery checks on 0.1.18, but did not exercise the driver's fallback orphan reclaim because Apple's RDMA core cleaned up the resources itself. The provider is RC-only with 31 requests per queue; immediate data, fence and solicited flags, two-entry scatter lists and small inline sends have offline tests but remain unvalidated on hardware, while 4 MiB registrations have passed hardware checks and larger or heavily fragmented mappings remain unvalidated. The shared GPU-accessible buffer checks described above do not establish direct access to existing CUDA device allocations or Metal private buffers, no-staging integration into an inference allocator, universal ConnectX support or zero-CPU operation. Read [removal and recovery](docs/install.md#removal-and-recovery) before installation.
+The portable setup has offline checks, but a fresh-machine installation following this recipe has not yet been completed. Foreign-QPN isolation and hot removal with mapped pages remain open; 12 client terminations during sustained traffic passed recovery checks on 0.1.18, but did not exercise the driver's fallback orphan reclaim because Apple's RDMA core cleaned up the resources itself. The provider is RC-only with 31 requests per queue; immediate data, fence and solicited flags, two-entry scatter lists and small inline sends have offline tests but remain unvalidated on hardware, while 4 MiB registrations have passed hardware checks and larger or heavily fragmented mappings remain unvalidated. The shared GPU-accessible buffer and pinned Linux inference checks described above do not establish direct access to existing CUDA device allocations or Metal private buffers, integration into unmodified inference engines, universal ConnectX support or zero-CPU operation. Read [removal and recovery](docs/install.md#removal-and-recovery) before installation.
 
 A sourced [comparison with MelonDMA](docs/comparison.md), checked 2026-09-15, lists what each project supports and what each has measured, including the verbs MCDMA does not yet implement.
 

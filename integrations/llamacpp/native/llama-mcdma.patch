@@ -1,0 +1,2219 @@
+diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
+index ef05905cf..6d4bd446a 100644
+--- a/ggml/src/ggml-backend-impl.h
++++ b/ggml/src/ggml-backend-impl.h
+@@ -8,7 +8,7 @@
+ extern "C" {
+ #endif
+ 
+-    #define GGML_BACKEND_API_VERSION 2
++    #define GGML_BACKEND_API_VERSION 3
+ 
+     //
+     // Backend buffer type
+@@ -43,6 +43,14 @@ extern "C" {
+     // Backend buffer
+     //
+ 
++    struct ggml_backend_dma_span {
++        void * host_ptr;
++        uint64_t size;
++        uint64_t fd_offset;
++        int fd;
++        void * opaque;
++    };
++
+     struct ggml_backend_buffer_i {
+         // (optional) free the buffer
+         void         (*free_buffer)  (ggml_backend_buffer_t buffer);
+@@ -64,6 +72,11 @@ extern "C" {
+         void         (*clear)        (ggml_backend_buffer_t buffer, uint8_t value);
+         // (optional) reset any internal state due to tensor initialization, such as tensor extras
+         void         (*reset)        (ggml_backend_buffer_t buffer);
++        bool (*dma_acquire)(ggml_backend_buffer_t buffer, size_t offset, size_t size, bool write, struct ggml_backend_dma_span * span);
++        bool (*dma_release)(ggml_backend_buffer_t buffer, struct ggml_backend_dma_span * span);
++        bool (*cpy_tensor_from)(ggml_backend_buffer_t buffer, const struct ggml_tensor * src, struct ggml_tensor * dst);
++        bool (*dma_export)(ggml_backend_buffer_t buffer, struct ggml_backend_dma_span * span);
++        bool (*dma_plan)(ggml_backend_buffer_t buffer, size_t offset, size_t size);
+     };
+ 
+     struct ggml_backend_buffer {
+@@ -72,8 +85,12 @@ extern "C" {
+         void * context;
+         size_t size;
+         enum ggml_backend_buffer_usage usage;
++        void * dma_owner;
++        void (*dma_cleanup)(void * owner);
+     };
+ 
++    GGML_API void ggml_backend_buffer_set_dma_observer(void (*observer)(ggml_backend_buffer_t buffer));
++
+     GGML_API ggml_backend_buffer_t ggml_backend_buffer_init(
+                    ggml_backend_buffer_type_t buft,
+             struct ggml_backend_buffer_i      iface,
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 7c1c0b864..ff4f8fb21 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -10,6 +10,7 @@
+ #include <cmath>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstdlib>
+ #include <cstring>
+ #include <map>
+ #include <memory>
+@@ -1807,6 +1808,7 @@ struct ggml_backend_meta_context {
+     size_t                      max_subgraphs = 0;
+     size_t                      n_subgraphs   = 0;
+     uint64_t                    uid           = 0;
++    size_t                      dma_plans     = 0;
+ 
+     void *                               comm_ctx       = nullptr;
+     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+@@ -1845,6 +1847,9 @@ struct ggml_backend_meta_context {
+     }
+ 
+     ~ggml_backend_meta_context() {
++        if (dma_plans) {
++            GGML_LOG_INFO("MCDMA TP2 producer plans=%zu\n", dma_plans);
++        }
+         if (comm_ctx != nullptr) {
+             ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
+                 ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
+@@ -2320,6 +2325,48 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+         return ret;
+     };
+ 
++    // TP2 exchanges this partial and receives its peer into reduction scratch.
++    auto plan_rpc_exchange = [&](const size_t j, ggml_tensor * node) -> bool {
++        const char * enabled = std::getenv("GGML_MCDMA");
++        if (n_backends != 2 || backend_ctx->comm_ctx || !enabled || std::strcmp(enabled, "1") != 0) {
++            return true;
++        }
++        auto local_device = ggml_backend_get_device(backend_ctx->backend_configs[j].backend);
++        auto peer_device = ggml_backend_get_device(backend_ctx->backend_configs[j ^ 1].backend);
++        if (!local_device || !peer_device ||
++            std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(local_device)), "Vulkan") != 0 ||
++            std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(peer_device)), "RPC") != 0) {
++            return true;
++        }
++        ggml_backend_buffer_t buffer = node->buffer;
++        GGML_ASSERT(buffer && buffer->iface.dma_plan && ggml_is_contiguous(node));
++        const size_t size = ggml_nbytes(node);
++        if (size == 0) {
++            return true;
++        }
++        const uintptr_t base = (uintptr_t) ggml_backend_buffer_get_base(buffer);
++        const uintptr_t data = (uintptr_t) node->data;
++        GGML_ASSERT(data >= base && data - base <= buffer->size && size <= buffer->size - (data - base));
++        auto & bcj = backend_ctx->backend_configs[j];
++        auto & temporary = bcj.bufs[0];
++        if (!temporary || ggml_backend_buffer_get_size(temporary.get()) < backend_ctx->max_tmp_size) {
++            temporary.reset(ggml_backend_alloc_buffer(bcj.backend, backend_ctx->max_tmp_size));
++        }
++        GGML_ASSERT(temporary && temporary.get() != buffer && temporary->iface.dma_plan && size <= temporary->size);
++        if (!buffer->iface.dma_plan(buffer, data - base, size)) {
++            GGML_LOG_ERROR("MCDMA TP2 producer planning failed\n");
++            return false;
++        }
++        if (!temporary->iface.dma_plan(temporary.get(), 0, size)) {
++            GGML_LOG_ERROR("MCDMA TP2 receive planning failed\n");
++            return false;
++        }
++        if (backend_ctx->dma_plans++ == 0) {
++            GGML_LOG_INFO("MCDMA TP2 Vulkan producer release planning enabled\n");
++        }
++        return true;
++    };
++
+     // Preferentially use backend-specific allreduce_tensor_async (e.g. NCCL for CUDA), use a generic fallback if unavailable:
+     auto allreduce_fallback = [&](size_t i) -> ggml_status {
+         std::vector<ggml_cgraph *> step_cgraphs(n_backends, nullptr);
+@@ -2342,6 +2389,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+             step_cgraphs[j] = get_cgraph_aux();
+             step_cgraphs[j]->nodes[0] = node_zero;
+             step_cgraphs[j]->n_nodes = 1;
++            if (!plan_rpc_exchange(j, node)) {
++                return GGML_STATUS_FAILED;
++            }
+             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[j]);
+             if (status != GGML_STATUS_SUCCESS) {
+                 return status;
+@@ -2440,6 +2490,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+         for (size_t j = 0; j < n_backends; j++) {
+             auto & bcj = backend_ctx->backend_configs[j];
++            auto * graph = bcj.cgraphs[i].cgraph_main;
++            if (i + 1 < backend_ctx->n_subgraphs && graph->n_nodes > 0) {
++                auto * output = graph->nodes[graph->n_nodes - 1];
++                if ((output->flags & GGML_TENSOR_FLAG_COMPUTE) && !plan_rpc_exchange(j, output)) {
++                    return GGML_STATUS_FAILED;
++                }
++            }
+             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+             if (status != GGML_STATUS_SUCCESS) {
+                 return status;
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 20bf96501..df470680e 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -20,6 +20,8 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <algorithm>
++#include <atomic>
++#include <mutex>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -93,6 +95,15 @@ ggml_backend_dev_t ggml_backend_buft_get_device(ggml_backend_buffer_type_t buft)
+ 
+ // backend buffer
+ 
++static std::atomic<void (*)(ggml_backend_buffer_t)> dma_observer{nullptr};
++static std::mutex dma_buffers_mutex;
++static std::vector<ggml_backend_buffer_t> dma_buffers;
++void ggml_backend_buffer_set_dma_observer(void (*observer)(ggml_backend_buffer_t)) {
++    std::lock_guard<std::mutex> lock(dma_buffers_mutex);
++    dma_observer.store(observer, std::memory_order_release);
++    if (observer) for (auto buffer : dma_buffers) if (!buffer->dma_owner) observer(buffer);
++}
++
+ ggml_backend_buffer_t ggml_backend_buffer_init(
+                ggml_backend_buffer_type_t buft,
+         struct ggml_backend_buffer_i      iface,
+@@ -103,9 +114,17 @@ ggml_backend_buffer_t ggml_backend_buffer_init(
+         /* .buft      = */ buft,
+         /* .context   = */ context,
+         /* .size      = */ size,
+-        /* .usage     = */ GGML_BACKEND_BUFFER_USAGE_ANY
++        /* .usage     = */ GGML_BACKEND_BUFFER_USAGE_ANY,
++        /* .dma_owner = */ nullptr,
++        /* .dma_cleanup = */ nullptr
+     };
+ 
++    if (buffer->size && buffer->iface.dma_export) {
++        std::lock_guard<std::mutex> lock(dma_buffers_mutex);
++        dma_buffers.push_back(buffer);
++        auto observer = dma_observer.load(std::memory_order_acquire);
++        if (observer) observer(buffer);
++    }
+     return buffer;
+ }
+ 
+@@ -118,6 +137,15 @@ void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
+         return;
+     }
+ 
++    if (buffer->size && buffer->iface.dma_export) {
++        std::lock_guard<std::mutex> lock(dma_buffers_mutex);
++        dma_buffers.erase(std::remove(dma_buffers.begin(), dma_buffers.end(), buffer), dma_buffers.end());
++    }
++    if (buffer->dma_cleanup) {
++        buffer->dma_cleanup(buffer->dma_owner);
++        buffer->dma_owner = nullptr;
++        buffer->dma_cleanup = nullptr;
++    }
+     if (buffer->iface.free_buffer != NULL) {
+         buffer->iface.free_buffer(buffer);
+     }
+@@ -214,6 +242,10 @@ void ggml_backend_buffer_reset(ggml_backend_buffer_t buffer) {
+ }
+ 
+ bool ggml_backend_buffer_copy_tensor(const struct ggml_tensor * src, struct ggml_tensor * dst) {
++    ggml_backend_buffer_t src_buf = src->view_src ? src->view_src->buffer : src->buffer;
++    if (src_buf->iface.cpy_tensor_from && src_buf->iface.cpy_tensor_from(src_buf, src, dst)) {
++        return true;
++    }
+     ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
+     if (dst_buf->iface.cpy_tensor) {
+         return dst_buf->iface.cpy_tensor(dst_buf, src, dst);
+diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
+index 2254090cb..4e6217770 100644
+--- a/ggml/src/ggml-cuda/CMakeLists.txt
++++ b/ggml/src/ggml-cuda/CMakeLists.txt
+@@ -165,11 +165,7 @@ if (CUDAToolkit_FOUND)
+         target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas)
+     endif()
+ 
+-    if (GGML_CUDA_NO_VMM)
+-        # No VMM requested, no need to link directly with the cuda driver lib (libcuda.so)
+-    else()
+-        target_link_libraries(ggml-cuda PRIVATE CUDA::cuda_driver)
+-    endif()
++    target_link_libraries(ggml-cuda PRIVATE CUDA::cuda_driver)
+ 
+     if (GGML_CUDA_NCCL)
+         find_package(NCCL)
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index b50d05d5f..1a2326fcc 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -718,9 +718,50 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+ 
+ // cuda buffer
+ 
++static bool ggml_cuda_mcdma_enabled() {
++    const char * value = getenv("GGML_MCDMA");
++    return value != nullptr && strcmp(value, "1") == 0;
++}
++
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++struct ggml_cuda_mcdma_context_scope {
++    CUcontext context;
++    bool active = false;
++
++    ggml_cuda_mcdma_context_scope(CUcontext context, int device) : context(context) {
++        if (context == nullptr || cuCtxPushCurrent(context) != CUDA_SUCCESS) {
++            GGML_LOG_ERROR("MCDMA CUDA: cannot enter the allocation context\n");
++            return;
++        }
++        active = true;
++        CUdevice selected = -1;
++        if (cuCtxGetDevice(&selected) != CUDA_SUCCESS || selected != ggml_cuda_get_physical_device(device)) {
++            GGML_ABORT("MCDMA CUDA: allocation context has the wrong device");
++        }
++    }
++
++    ~ggml_cuda_mcdma_context_scope() {
++        if (active) {
++            CUcontext popped = nullptr;
++            if (cuCtxPopCurrent(&popped) != CUDA_SUCCESS || popped != context) {
++                GGML_ABORT("MCDMA CUDA: cannot restore the caller context");
++            }
++        }
++    }
++};
++#endif
++
+ struct ggml_backend_cuda_buffer_context {
+     int device;
+     void * dev_ptr = nullptr;
++    void * host_ptr = nullptr;
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    CUcontext allocation_context = nullptr;
++#endif
++    std::mutex dma_mutex;
++    bool dma_active = false;
++    size_t dma_offset = 0;
++    size_t dma_size = 0;
+     std::string name;
+ 
+     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
+@@ -729,10 +770,99 @@ struct ggml_backend_cuda_buffer_context {
+     }
+ 
+     ~ggml_backend_cuda_buffer_context() {
++        if (host_ptr != nullptr) {
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++            GGML_ASSERT(!dma_active && "MCDMA CUDA buffer still belongs to the NIC");
++            ggml_cuda_mcdma_context_scope scope(allocation_context, device);
++            GGML_ASSERT(scope.active);
++            CUDA_CHECK(cudaDeviceSynchronize());
++            CUDA_CHECK(cudaFreeHost(host_ptr));
++            return;
++#else
++            GGML_ABORT("MCDMA mapped buffers require CUDA");
++#endif
++        }
+         CUDA_CHECK(cudaFree(dev_ptr));
+     }
+ };
+ 
++static bool ggml_backend_cuda_buffer_dma_acquire(ggml_backend_buffer_t buffer, size_t offset, size_t size,
++        bool write, ggml_backend_dma_span * span) {
++    GGML_UNUSED(write);
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
++    if (span == nullptr || ctx->host_ptr == nullptr || size == 0 || offset > buffer->size || size > buffer->size - offset) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(ctx->dma_mutex);
++    if (ctx->dma_active) {
++        return false;
++    }
++    ggml_cuda_mcdma_context_scope scope(ctx->allocation_context, ctx->device);
++    if (!scope.active) {
++        return false;
++    }
++    cudaError_t err = cudaDeviceSynchronize();
++    if (err != cudaSuccess) {
++        GGML_LOG_ERROR("MCDMA CUDA: producer synchronization failed: %s\n", cudaGetErrorString(err));
++        return false;
++    }
++    std::atomic_thread_fence(std::memory_order_seq_cst);
++    ctx->dma_active = true;
++    ctx->dma_offset = offset;
++    ctx->dma_size = size;
++    *span = { (char *) ctx->host_ptr + offset, size, 0, -1, ctx };
++    return true;
++#else
++    GGML_UNUSED(buffer);
++    GGML_UNUSED(offset);
++    GGML_UNUSED(size);
++    GGML_UNUSED(span);
++    return false;
++#endif
++}
++
++static bool ggml_backend_cuda_buffer_dma_release(ggml_backend_buffer_t buffer, ggml_backend_dma_span * span) {
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
++    if (span == nullptr || ctx->host_ptr == nullptr) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(ctx->dma_mutex);
++    if (!ctx->dma_active || span->opaque != ctx || span->host_ptr != (char *) ctx->host_ptr + ctx->dma_offset ||
++            span->size != ctx->dma_size || span->fd != -1 || span->fd_offset != 0) {
++        return false;
++    }
++    ggml_cuda_mcdma_context_scope scope(ctx->allocation_context, ctx->device);
++    if (!scope.active) {
++        return false;
++    }
++    std::atomic_thread_fence(std::memory_order_seq_cst);
++    cudaError_t err = cudaDeviceSynchronize();
++    if (err != cudaSuccess) {
++        GGML_LOG_ERROR("MCDMA CUDA: consumer synchronization failed: %s\n", cudaGetErrorString(err));
++        return false;
++    }
++    ctx->dma_active = false;
++    *span = { nullptr, 0, 0, -1, nullptr };
++    return true;
++#else
++    GGML_UNUSED(buffer);
++    GGML_UNUSED(span);
++    return false;
++#endif
++}
++
++static bool ggml_backend_cuda_buffer_dma_export(ggml_backend_buffer_t buffer, ggml_backend_dma_span * span) {
++    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
++    if (span == nullptr || ctx->host_ptr == nullptr || buffer->size == 0) {
++        return false;
++    }
++    // Registration does not order GPU/NIC accesses or extend the buffer lifetime.
++    *span = { ctx->host_ptr, buffer->size, 0, -1, nullptr };
++    return true;
++}
++
+ static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+     delete ctx;
+@@ -763,6 +893,9 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
+         if (padded_size > original_size) {
+             ggml_cuda_set_device(ctx->device);
+             CUDA_CHECK(cudaMemset((char *)tensor->data + original_size, 0, padded_size - original_size));
++            if (ctx->host_ptr != nullptr) {
++                CUDA_CHECK(cudaDeviceSynchronize());
++            }
+         }
+     }
+     return GGML_STATUS_SUCCESS;
+@@ -857,6 +990,10 @@ static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
+     /* .cpy_tensor      = */ ggml_backend_cuda_buffer_cpy_tensor,
+     /* .clear           = */ ggml_backend_cuda_buffer_clear,
+     /* .reset           = */ NULL,
++    /* .dma_acquire     = */ ggml_backend_cuda_buffer_dma_acquire,
++    /* .dma_release     = */ ggml_backend_cuda_buffer_dma_release,
++    /* .cpy_tensor_from = */ NULL,
++    /* .dma_export      = */ ggml_backend_cuda_buffer_dma_export,
+ };
+ 
+ // cuda buffer type
+@@ -880,16 +1017,43 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
+ 
+     ggml_cuda_set_device(buft_ctx->device);
+ 
+-    void * dev_ptr;
+-    cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
++    void * dev_ptr = nullptr;
++    void * host_ptr = nullptr;
++    const bool mapped = ggml_cuda_mcdma_enabled();
++    cudaError_t err;
++    if (mapped) {
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++        err = cudaHostAlloc(&host_ptr, std::max(size, size_t(1)), cudaHostAllocMapped);
++        if (err == cudaSuccess) {
++            err = cudaHostGetDevicePointer(&dev_ptr, host_ptr, 0);
++            if (err != cudaSuccess) {
++                CUDA_CHECK(cudaFreeHost(host_ptr));
++            }
++        }
++#else
++        GGML_LOG_ERROR("%s: GGML_MCDMA=1 mapped tensor buffers require CUDA\n", __func__);
++        return nullptr;
++#endif
++    } else {
++        err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
++    }
+     if (err != cudaSuccess) {
+         // clear the error
+         (void)cudaGetLastError();
+-        GGML_LOG_ERROR("%s: allocating %.2f MiB on device %d: cudaMalloc failed: %s\n", __func__, size / 1024.0 / 1024.0, buft_ctx->device, cudaGetErrorString(err));
++        GGML_LOG_ERROR("%s: allocating %.2f MiB on device %d: %s failed: %s\n", __func__, size / 1024.0 / 1024.0, buft_ctx->device, mapped ? "CUDA mapped allocation" : "cudaMalloc", cudaGetErrorString(err));
+         return nullptr;
+     }
+ 
+     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
++    ctx->host_ptr = host_ptr;
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    if (mapped) {
++        if (cuCtxGetCurrent(&ctx->allocation_context) != CUDA_SUCCESS || ctx->allocation_context == nullptr) {
++            GGML_ABORT("MCDMA CUDA: cannot capture the mapped allocation context");
++        }
++        GGML_LOG_INFO("MCDMA CUDA: allocated %zu bytes of mapped tensor storage on device %d\n", size, buft_ctx->device);
++    }
++#endif
+ 
+     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+ }
+diff --git a/ggml/src/ggml-rpc/CMakeLists.txt b/ggml/src/ggml-rpc/CMakeLists.txt
+index e3d0c9b4c..d1b6bab3a 100644
+--- a/ggml/src/ggml-rpc/CMakeLists.txt
++++ b/ggml/src/ggml-rpc/CMakeLists.txt
+@@ -49,3 +49,14 @@ if (GGML_RPC_RDMA)
+ else()
+     message(STATUS "  RDMA transport disabled")
+ endif()
++
++option(GGML_MCDMA "Direct GPU tensor RDMA for the pinned MCDMA integration" OFF)
++if (GGML_MCDMA)
++    if (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
++        message(FATAL_ERROR "GGML_MCDMA requires Linux verbs")
++    endif()
++    find_library(MCDMA_VERBS ibverbs REQUIRED)
++    target_sources(ggml-rpc PRIVATE mcdma-rdma.cpp)
++    target_compile_definitions(ggml-rpc PRIVATE GGML_MCDMA)
++    target_link_libraries(ggml-rpc PRIVATE ${MCDMA_VERBS})
++endif()
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 353b79b07..5ef609127 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -3,6 +3,11 @@
+ #include "ggml-backend-impl.h"
+ #include "ggml-cpp.h"
+ #include "transport.h"
++#ifdef GGML_MCDMA
++#include "mcdma-rdma.h"
++#include <unistd.h>
++#endif
++#include <functional>
+ 
+ #include <array>
+ #include <cinttypes>
+@@ -77,6 +82,8 @@ enum rpc_cmd {
+     RPC_CMD_DEVICE_COUNT,
+     RPC_CMD_GRAPH_RECOMPUTE,
+     RPC_CMD_MEMSET_TENSOR,
++    RPC_CMD_MCDMA_PING,
++    RPC_CMD_MCDMA_CONNECT,
+     RPC_CMD_NONE,
+     RPC_CMD_COUNT,
+ };
+@@ -124,6 +131,7 @@ struct rpc_msg_alloc_buffer_req {
+ struct rpc_msg_alloc_buffer_rsp {
+     uint64_t remote_ptr;
+     uint64_t remote_size;
++    uint64_t native_base, native_address, native_rkey;
+ };
+ 
+ struct rpc_msg_get_alignment_req {
+@@ -240,8 +248,13 @@ struct ggml_backend_rpc_buffer_context {
+     std::shared_ptr<rpc_dispatcher>   dispatcher;
+     void                            * base_ptr;
+     uint64_t                          remote_ptr;
++    uint64_t                          native_address = 0, native_rkey = 0;
+ };
+ 
++#ifdef GGML_MCDMA
++static bool mcdma_enabled();
++#endif
++
+ // RPC helper functions
+ 
+ // Computes FNV-1a hash of the data
+@@ -256,6 +269,16 @@ static uint64_t fnv_hash(const uint8_t * data, size_t len, uint64_t hash = 0xcbf
+ }
+ 
+ static bool send_msg(socket_ptr sock, const void * msg, size_t msg_size) {
++#ifdef GGML_MCDMA
++    if (mcdma_enabled()) {
++        if (msg_size > SIZE_MAX - sizeof(uint64_t)) return false;
++        std::vector<uint8_t> frame(sizeof(uint64_t) + msg_size);
++        uint64_t length = msg_size;
++        memcpy(frame.data(), &length, sizeof(length));
++        if (msg_size) memcpy(frame.data() + sizeof(length), msg, msg_size);
++        return sock->send_data(frame.data(), frame.size()) && sock->flush();
++    }
++#endif
+     if (!sock->send_data(&msg_size, sizeof(msg_size))) {
+         return false;
+     }
+@@ -307,6 +330,17 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
+ // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
+ // No response
+ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
++#ifdef GGML_MCDMA
++    if (mcdma_enabled()) {
++        if (input_size > SIZE_MAX - 9) return false;
++        std::vector<uint8_t> frame(9 + input_size);
++        frame[0] = cmd;
++        uint64_t length = input_size;
++        memcpy(frame.data() + 1, &length, sizeof(length));
++        if (input_size) memcpy(frame.data() + 9, input, input_size);
++        return sock->send_data(frame.data(), frame.size()) && sock->flush();
++    }
++#endif
+     uint8_t cmd_byte = cmd;
+     if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
+         return false;
+@@ -339,6 +373,15 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
+     return true;
+ }
+ 
++#ifdef GGML_MCDMA
++static bool mcdma_enabled() {
++    const char * value = std::getenv("GGML_MCDMA");
++    return value && !std::strcmp(value, "1");
++}
++static constexpr uint64_t mcdma_magic = UINT64_C(0x4d43444d41544532);
++
++#endif
++
+ // RPC client-side implementation
+ 
+ // Performs HELLO handshake with transport auto-negotiation.
+@@ -403,7 +446,7 @@ private:
+     std::condition_variable cvar;
+ };
+ 
+-class rpc_dispatcher {
++class rpc_dispatcher : public std::enable_shared_from_this<rpc_dispatcher> {
+ public:
+     rpc_dispatcher() {
+     }
+@@ -421,6 +464,10 @@ public:
+ 
+     void start(const std::string & endpoint);
+     void work();
++#ifdef GGML_MCDMA
++    void dma_transfer(uint64_t address, uint32_t rkey, const ggml_backend_dma_span & span, bool write, mcdma_region * cached = nullptr, size_t local_offset = 0);
++    void register_buffer(ggml_backend_buffer_t buffer);
++#endif
+ 
+     ~rpc_dispatcher();
+ 
+@@ -432,6 +479,8 @@ private:
+         void                        * output;
+         size_t                        output_size;
+         std::promise<void>            completion;
++        std::function<void()>          native_transfer;
++        uint64_t                      sequence = 0;
+     };
+     using rpc_msg_ptr   = std::shared_ptr<rpc_msg>;
+     using rpc_msg_queue = message_queue<rpc_msg_ptr>;
+@@ -439,17 +488,75 @@ private:
+         rpc_msg_ptr              msg;
+         std::shared_future<void> sf;
+     };
++    void enqueue(const rpc_msg_ptr & msg);
++    std::mutex submit_mutex;
++    std::atomic<uint64_t> issued_sequence{0}, completed_sequence{0};
+     rpc_msg_queue    queue;
+     socket_ptr       sock;
+     std::atomic_bool running;
+     std::thread      thread;
++#ifdef GGML_MCDMA
++    std::unique_ptr<mcdma_channel> dma_channel;
++#endif
+ };
+ 
++void rpc_dispatcher::enqueue(const rpc_msg_ptr & msg) {
++    std::lock_guard<std::mutex> lock(submit_mutex);
++    msg->sequence = ++issued_sequence;
++    GGML_ASSERT(queue.push(msg));
++}
++
+ static void rpc_dispatcher_trampoline(rpc_dispatcher * dispatcher)
+ {
+     dispatcher->work();
+ }
+ 
++#ifdef GGML_MCDMA
++struct local_dma_cache {
++    std::shared_ptr<rpc_dispatcher> owner;
++    std::unique_ptr<mcdma_region> region;
++};
++static std::weak_ptr<rpc_dispatcher> active_native_dispatcher;
++static void cleanup_dma_cache(void * cache) { delete static_cast<local_dma_cache *>(cache); }
++static void observe_dma_buffer(ggml_backend_buffer_t buffer) {
++    auto dispatcher = active_native_dispatcher.lock();
++    if (dispatcher) dispatcher->register_buffer(buffer);
++}
++void rpc_dispatcher::register_buffer(ggml_backend_buffer_t buffer) {
++    if (buffer->dma_owner) return;
++    ggml_backend_dma_span span = {};
++    GGML_ASSERT(dma_channel && buffer->iface.dma_export && buffer->iface.dma_export(buffer, &span));
++    GGML_ASSERT(span.size == buffer->size);
++    auto cache = std::unique_ptr<local_dma_cache>(new local_dma_cache);
++    cache->owner = shared_from_this();
++    cache->region = dma_channel->register_span(span, true);
++    if (span.fd >= 0) GGML_ASSERT(close(span.fd) == 0);
++    buffer->dma_owner = cache.release();
++    buffer->dma_cleanup = cleanup_dma_cache;
++}
++void rpc_dispatcher::dma_transfer(uint64_t address, uint32_t rkey, const ggml_backend_dma_span & span, bool write, mcdma_region * cached, size_t local_offset) {
++    if (span.size == 0) return;
++    if (cached) {
++        std::lock_guard<std::mutex> submission_guard(submit_mutex);
++        synchronize();
++        dma_channel->transfer_at(*cached, local_offset, address, rkey, span.size, write);
++        return;
++    }
++    auto msg = std::make_shared<rpc_msg>();
++    msg->cmd = RPC_CMD_NONE;
++    msg->native_transfer = [this, address, rkey, span, write, cached, local_offset]() {
++        GGML_ASSERT(dma_channel);
++        std::unique_ptr<mcdma_region> local;
++        if (!cached) local = write ? dma_channel->register_read_only_span(span) : dma_channel->register_span(span, false);
++        dma_channel->transfer_at(cached ? *cached : *local, local_offset, address, rkey, span.size, write);
++    };
++    auto future = msg->completion.get_future();
++    enqueue(msg);
++    future.wait();
++}
++
++#endif
++
+ void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size) {
+     auto msg = std::make_shared<rpc_msg>();
+     msg->cmd = cmd;
+@@ -457,7 +564,7 @@ void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
+     msg->input_size = input_size;
+     msg->output = nullptr;
+     msg->output_size = 0;
+-    GGML_ASSERT(queue.push(msg));
++    enqueue(msg);
+     auto future = msg->completion.get_future();
+     future.wait();
+ }
+@@ -469,7 +576,7 @@ void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> in
+     msg->input_size = input_size;
+     msg->output = nullptr;
+     msg->output_size = 0;
+-    GGML_ASSERT(queue.push(msg));
++    enqueue(msg);
+ }
+ 
+ void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size) {
+@@ -479,7 +586,7 @@ void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
+     msg->input_size = input_size;
+     msg->output = output;
+     msg->output_size = output_size;
+-    GGML_ASSERT(queue.push(msg));
++    enqueue(msg);
+     auto future = msg->completion.get_future();
+     future.wait();
+ }
+@@ -491,7 +598,7 @@ void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> in
+     msg->input_size = input_size;
+     msg->output = output;
+     msg->output_size = output_size;
+-    GGML_ASSERT(queue.push(msg));
++    enqueue(msg);
+ }
+ 
+ ggml_backend_event_t rpc_dispatcher::event_new(ggml_backend_dev_t dev) {
+@@ -499,7 +606,7 @@ ggml_backend_event_t rpc_dispatcher::event_new(ggml_backend_dev_t dev) {
+     ev->msg = std::make_shared<rpc_msg>();
+     ev->msg->cmd = RPC_CMD_NONE;
+     ev->sf = ev->msg->completion.get_future().share();
+-    GGML_ASSERT(queue.push(ev->msg));
++    enqueue(ev->msg);
+     return new ggml_backend_event {
+         /* .device  = */ dev,
+         /* .context = */ ev,
+@@ -521,14 +628,21 @@ void rpc_dispatcher::event_record(ggml_backend_event_t event) {
+     ev->msg = std::make_shared<rpc_msg>();
+     ev->msg->cmd = RPC_CMD_NONE;
+     ev->sf = ev->msg->completion.get_future().share();
+-    GGML_ASSERT(queue.push(ev->msg));
++    enqueue(ev->msg);
+ }
+ 
+ void rpc_dispatcher::synchronize() {
++#ifdef GGML_MCDMA
++    if (mcdma_enabled()) {
++        uint64_t target = issued_sequence.load(std::memory_order_acquire);
++        while (completed_sequence.load(std::memory_order_acquire) < target) std::this_thread::yield();
++        return;
++    }
++#endif
+     // to ensure all messages are processed, submit dummy message and wait for it to complete
+     auto msg = std::make_shared<rpc_msg>();
+     msg->cmd = RPC_CMD_NONE;
+-    GGML_ASSERT(queue.push(msg));
++    enqueue(msg);
+     msg->completion.get_future().wait();
+ }
+ 
+@@ -546,9 +660,23 @@ void rpc_dispatcher::start(const std::string & endpoint) {
+     if (sock == nullptr) {
+         GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
+     }
++#ifdef GGML_MCDMA
++    if (mcdma_enabled()) sock->set_timeout(300);
++#endif
+     if (!negotiate_hello(sock)) {
+         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
+     }
++#ifdef GGML_MCDMA
++    if (mcdma_enabled()) {
++        GGML_ASSERT(sock->rdma_active() && "MCDMA metadata RDMA required; TCP fallback disabled");
++        uint64_t magic = 0;
++        RPC_STATUS_ASSERT(send_rpc_cmd(sock, RPC_CMD_MCDMA_PING, nullptr, 0, &magic, sizeof(magic)) && magic == mcdma_magic);
++        dma_channel.reset(new mcdma_channel);
++        mcdma_caps local = dma_channel->caps(), peer = {};
++        RPC_STATUS_ASSERT(send_rpc_cmd(sock, RPC_CMD_MCDMA_CONNECT, &local, sizeof(local), &peer, sizeof(peer)));
++        dma_channel->connect(peer);
++    }
++#endif
+     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
+     running = true;
+     thread = std::thread(rpc_dispatcher_trampoline, this);
+@@ -560,7 +688,15 @@ void rpc_dispatcher::work() {
+         if (!queue.pop(&msg_ptr)) {
+             break;
+         }
+-        if (msg_ptr->cmd != RPC_CMD_NONE) {
++        if (msg_ptr->native_transfer) {
++            msg_ptr->native_transfer();
++        } else if (msg_ptr->cmd != RPC_CMD_NONE) {
++#ifdef GGML_MCDMA
++            if (mcdma_enabled() && (msg_ptr->cmd == RPC_CMD_GRAPH_COMPUTE || msg_ptr->cmd == RPC_CMD_GRAPH_RECOMPUTE || msg_ptr->cmd == RPC_CMD_BUFFER_CLEAR || msg_ptr->cmd == RPC_CMD_MEMSET_TENSOR || msg_ptr->cmd == RPC_CMD_INIT_TENSOR)) {
++                uint64_t ready = 0;
++                RPC_STATUS_ASSERT(send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, &ready, sizeof(ready)) && ready == mcdma_magic);
++            } else
++#endif
+             if (msg_ptr->output) {
+                 bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->output, msg_ptr->output_size);
+                 RPC_STATUS_ASSERT(status);
+@@ -569,6 +705,7 @@ void rpc_dispatcher::work() {
+                 RPC_STATUS_ASSERT(status);
+             }
+         }
++        completed_sequence.store(msg_ptr->sequence, std::memory_order_release);
+         msg_ptr->completion.set_value();
+     }
+ }
+@@ -576,10 +713,10 @@ void rpc_dispatcher::work() {
+ rpc_dispatcher::~rpc_dispatcher() {
+     running = false;
+     queue.interrupt();
+-    sock = nullptr;
+     if (thread.joinable()) {
+         thread.join();
+     }
++    sock = nullptr;
+ }
+ 
+ static std::shared_ptr<rpc_dispatcher> get_dispatcher(const std::string & endpoint) {
+@@ -596,6 +733,13 @@ static std::shared_ptr<rpc_dispatcher> get_dispatcher(const std::string & endpoi
+ 
+     auto dispatcher = std::make_shared<rpc_dispatcher>();
+     dispatcher->start(endpoint);
++#ifdef GGML_MCDMA
++    if (mcdma_enabled()) {
++        GGML_ASSERT(active_native_dispatcher.expired() && "One native RDMA peer per process");
++        active_native_dispatcher = dispatcher;
++        ggml_backend_buffer_set_dma_observer(observe_dma_buffer);
++    }
++#endif
+     dispatchers[endpoint] = dispatcher;
+     return dispatcher;
+ }
+@@ -718,6 +862,18 @@ static bool rpc_use_hash_cache(const ggml_tensor * tensor, size_t size) {
+ }
+ 
+ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
++#ifdef GGML_MCDMA
++    if (mcdma_enabled()) {
++        auto * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
++        uintptr_t base = (uintptr_t)ggml_backend_buffer_get_base(buffer);
++        uintptr_t ptr = (uintptr_t)tensor->data;
++        GGML_ASSERT(ptr >= base && ptr - base <= buffer->size && offset <= buffer->size - (ptr - base) && size <= buffer->size - (ptr - base) - offset);
++        ggml_backend_dma_span span = {const_cast<void *>((const void *)data), size, 0, -1, nullptr};
++        ctx->dispatcher->dma_transfer(ctx->native_address + ptr - base + offset, (uint32_t)ctx->native_rkey, span, true);
++        return;
++    }
++#endif
++
+     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+     rpc_tensor rpc_tensor = serialize_tensor(tensor);
+     uint8_t cache_flag = 0;
+@@ -741,6 +897,18 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
+ }
+ 
+ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
++#ifdef GGML_MCDMA
++    if (mcdma_enabled()) {
++        auto * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
++        uintptr_t base = (uintptr_t)ggml_backend_buffer_get_base(buffer);
++        uintptr_t ptr = (uintptr_t)tensor->data;
++        GGML_ASSERT(ptr >= base && ptr - base <= buffer->size && offset <= buffer->size - (ptr - base) && size <= buffer->size - (ptr - base) - offset);
++        ggml_backend_dma_span span = {const_cast<void *>((const void *)data), size, 0, -1, nullptr};
++        ctx->dispatcher->dma_transfer(ctx->native_address + ptr - base + offset, (uint32_t)ctx->native_rkey, span, false);
++        return;
++    }
++#endif
++
+     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+     auto request = std::make_shared<rpc_msg_get_tensor_req>();
+     request->tensor = serialize_tensor(tensor);
+@@ -749,7 +917,52 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
+     ctx->dispatcher->send(RPC_CMD_GET_TENSOR, request, sizeof(*request), data, size);
+ }
+ 
++#ifdef GGML_MCDMA
++static bool mcdma_copy_tensor(const ggml_tensor * src, ggml_tensor * dst) {
++    bool remote_src = ggml_backend_buffer_is_rpc(src->buffer);
++    bool remote_dst = ggml_backend_buffer_is_rpc(dst->buffer);
++    if (!mcdma_enabled() || remote_src == remote_dst) return false;
++    const ggml_tensor * remote = remote_src ? src : dst;
++    const ggml_tensor * local = remote_src ? dst : src;
++    size_t length = ggml_nbytes(src);
++    if (!length) return true;
++    ggml_backend_buffer_t rb = remote->buffer, lb = local->buffer;
++    uintptr_t rbase = (uintptr_t)ggml_backend_buffer_get_base(rb), rptr = (uintptr_t)remote->data;
++    uintptr_t lbase = (uintptr_t)ggml_backend_buffer_get_base(lb), lptr = (uintptr_t)local->data;
++    GGML_ASSERT(rptr >= rbase && rptr - rbase <= rb->size && length <= rb->size - (rptr - rbase));
++    GGML_ASSERT(lptr >= lbase && lptr - lbase <= lb->size && length <= lb->size - (lptr - lbase));
++    ggml_backend_dma_span span = {};
++    bool host = ggml_backend_buffer_is_host(lb);
++    if (host) {
++        span = {local->data, length, 0, -1, nullptr};
++    } else {
++        GGML_ASSERT(lb->iface.dma_acquire && lb->iface.dma_release && "MCDMA GPU allocation required, no staging fallback");
++        GGML_ASSERT(lb->iface.dma_acquire(lb, lptr - lbase, length, remote_src, &span));
++        GGML_ASSERT(span.size == length);
++    }
++    auto * ctx = (ggml_backend_rpc_buffer_context *)rb->context;
++    auto * cache = static_cast<local_dma_cache *>(lb->dma_owner);
++    GGML_ASSERT(host || (cache && cache->owner == ctx->dispatcher));
++    ctx->dispatcher->dma_transfer(ctx->native_address + rptr - rbase, (uint32_t)ctx->native_rkey, span, remote_dst,
++        host ? nullptr : cache->region.get(), host ? 0 : lptr - lbase);
++    if (!host) GGML_ASSERT(lb->iface.dma_release(lb, &span));
++    if (host) return true;
++    static std::atomic<uint64_t> copies{0}, bytes{0};
++    uint64_t count = ++copies;
++    uint64_t total = (bytes += length);
++    if (count == 1 || count % 1024 == 0) GGML_LOG_INFO("MCDMA GPU tensor copies=%llu bytes=%llu staging=0\n", (unsigned long long)count, (unsigned long long)total);
++    return true;
++}
++static bool ggml_backend_rpc_buffer_cpy_tensor_from(ggml_backend_buffer_t, const ggml_tensor * src, ggml_tensor * dst) {
++    return mcdma_copy_tensor(src, dst);
++}
++#endif
++
+ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
++#ifdef GGML_MCDMA
++    if (mcdma_copy_tensor(src, dst)) return true;
++#endif
++
+     if (ggml_backend_buffer_is_rpc(src->buffer)) {
+         // check if src and dst are on the same server
+         ggml_backend_buffer_t src_buffer = src->buffer;
+@@ -790,6 +1003,13 @@ static ggml_backend_buffer_i ggml_backend_rpc_buffer_interface = {
+     /* .cpy_tensor      = */ ggml_backend_rpc_buffer_cpy_tensor,
+     /* .clear           = */ ggml_backend_rpc_buffer_clear,
+     /* .reset           = */ NULL,
++    /* .dma_acquire     = */ NULL,
++    /* .dma_release     = */ NULL,
++#ifdef GGML_MCDMA
++    /* .cpy_tensor_from = */ ggml_backend_rpc_buffer_cpy_tensor_from,
++#else
++    /* .cpy_tensor_from = */ NULL,
++#endif
+ };
+ 
+ static const char * ggml_backend_rpc_buffer_type_name(ggml_backend_buffer_type_t buft) {
+@@ -809,7 +1029,7 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
+     if (response.remote_ptr != 0) {
+         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
+             ggml_backend_rpc_buffer_interface,
+-            new ggml_backend_rpc_buffer_context{dispatcher, nullptr, response.remote_ptr},
++            new ggml_backend_rpc_buffer_context{dispatcher, (void *)(uintptr_t)response.native_base, response.remote_ptr, response.native_address, response.native_rkey},
+             response.remote_size);
+         return buffer;
+     } else {
+@@ -950,6 +1170,13 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
+ }
+ 
+ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
++#ifdef GGML_MCDMA
++    if (mcdma_enabled()) {
++        ggml_backend_rpc_buffer_set_tensor(tensor->buffer, tensor, data, offset, size);
++        return;
++    }
++#endif
++
+     ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *)backend->context;
+     rpc_tensor rpc_tensor = serialize_tensor(tensor);
+     uint8_t cache_flag = 0;
+@@ -974,6 +1201,13 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
+ }
+ 
+ static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
++#ifdef GGML_MCDMA
++    if (mcdma_enabled()) {
++        ggml_backend_rpc_buffer_get_tensor(tensor->buffer, tensor, data, offset, size);
++        return;
++    }
++#endif
++
+     ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *)backend->context;
+     auto request = std::make_shared<rpc_msg_get_tensor_req>();
+     request->tensor = serialize_tensor(tensor);
+@@ -1159,6 +1393,9 @@ public:
+     ~rpc_server();
+ 
+     void hello(rpc_msg_hello_rsp & response);
++#ifdef GGML_MCDMA
++    bool dma_connect(const mcdma_caps & peer, mcdma_caps & local);
++#endif
+     bool alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_alloc_buffer_rsp & response);
+     bool get_alignment(const rpc_msg_get_alignment_req & request, rpc_msg_get_alignment_rsp & response);
+     bool get_max_size(const rpc_msg_get_max_size_req & request, rpc_msg_get_max_size_rsp & response);
+@@ -1195,8 +1432,23 @@ private:
+     std::unordered_set<ggml_backend_buffer_t> buffers;
+     // store the last computed graph for each backend
+     std::vector<stored_graph> stored_graphs;
++#ifdef GGML_MCDMA
++    std::unique_ptr<mcdma_channel> dma_channel;
++    std::unordered_map<ggml_backend_buffer_t, std::unique_ptr<mcdma_region>> dma_regions;
++#endif
+ };
+ 
++#ifdef GGML_MCDMA
++bool rpc_server::dma_connect(const mcdma_caps & peer, mcdma_caps & local) {
++    if (!mcdma_enabled() || dma_channel) return false;
++    dma_channel.reset(new mcdma_channel);
++    dma_channel->connect(peer);
++    local = dma_channel->caps();
++    return true;
++}
++
++#endif
++
+ void rpc_server::hello(rpc_msg_hello_rsp & response) {
+     response.major = RPC_PROTO_MAJOR_VERSION;
+     response.minor = RPC_PROTO_MINOR_VERSION;
+@@ -1251,14 +1503,27 @@ bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_
+     }
+     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backends[dev_id]);
+     ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, request.size);
+-    response.remote_ptr = 0;
+-    response.remote_size = 0;
++    response = {};
+     if (buffer != nullptr) {
+         response.remote_ptr = reinterpret_cast<uint64_t>(buffer);
+         response.remote_size = buffer->size;
+         LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> remote_ptr: %" PRIx64 ", remote_size: %" PRIu64 "\n",
+             __func__, dev_id, request.size, response.remote_ptr, response.remote_size);
+         buffers.insert(buffer);
++#ifdef GGML_MCDMA
++        if (mcdma_enabled()) {
++            GGML_ASSERT(dma_channel && buffer->iface.dma_export);
++            ggml_backend_dma_span span = {};
++            GGML_ASSERT(buffer->iface.dma_export(buffer, &span) && span.size == buffer->size);
++            GGML_ASSERT(span.fd == -1 && span.fd_offset == 0 && "Native RPC requires a mapped CUDA server; Vulkan is the client");
++            auto region = dma_channel->register_span(span, true);
++            if (span.fd >= 0) GGML_ASSERT(close(span.fd) == 0);
++            response.native_base = (uintptr_t)ggml_backend_buffer_get_base(buffer);
++            response.native_address = region->address();
++            response.native_rkey = region->rkey();
++            dma_regions.emplace(buffer, std::move(region));
++        }
++#endif
+     } else {
+         LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> failed\n", __func__, dev_id, request.size);
+     }
+@@ -1313,6 +1578,9 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
+     for (auto & sg : stored_graphs) {
+         sg.graph = nullptr;
+     }
++#ifdef GGML_MCDMA
++    dma_regions.erase(buffer);
++#endif
+     ggml_backend_buffer_free(buffer);
+     buffers.erase(buffer);
+     return true;
+@@ -1426,6 +1694,10 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
+ 
+ 
+ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
++#ifdef GGML_MCDMA
++    if (mcdma_enabled()) return false;
++#endif
++
+     // serialization format: | rpc_tensor | cache_flag (1 byte) | offset (8 bytes) | data (size bytes) |
+     uint8_t  cache_flag;
+     uint64_t offset;
+@@ -1502,6 +1774,10 @@ bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
+ 
+ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response)
+ {
++#ifdef GGML_MCDMA
++    if (mcdma_enabled()) return false;
++#endif
++
+     std::vector<uint8_t> cached_file;
+     if (!get_cached_file(request.hash, cached_file)) {
+         response.result = 0;
+@@ -1578,6 +1854,10 @@ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
+ }
+ 
+ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response) {
++#ifdef GGML_MCDMA
++    if (mcdma_enabled()) return false;
++#endif
++
+     struct ggml_init_params params {
+         /*.mem_size   =*/ ggml_tensor_overhead(),
+         /*.mem_buffer =*/ NULL,
+@@ -1812,6 +2092,10 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
+ }
+ 
+ rpc_server::~rpc_server() {
++#ifdef GGML_MCDMA
++    if (dma_channel) dma_channel->stop();
++    dma_regions.clear();
++#endif
+     for (auto buffer : buffers) {
+         ggml_backend_buffer_free(buffer);
+     }
+@@ -1820,6 +2104,9 @@ rpc_server::~rpc_server() {
+ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
+                              socket_ptr sock) {
+     rpc_server server(backends, cache_dir);
++#ifdef GGML_MCDMA
++    if (mcdma_enabled()) sock->set_timeout(300);
++#endif
+     uint8_t cmd;
+     if (!sock->recv_data(&cmd, 1)) {
+         return;
+@@ -1856,6 +2143,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+ 
+     // Activate transport upgrade using client's caps
+     sock->update_caps(req.conn_caps);
++#ifdef GGML_MCDMA
++    if (mcdma_enabled() && !sock->rdma_active()) return;
++#endif
+     while (true) {
+         if (!sock->recv_data(&cmd, 1)) {
+             break;
+@@ -1866,6 +2156,18 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+             break;
+         }
+         switch (cmd) {
++#ifdef GGML_MCDMA
++            case RPC_CMD_MCDMA_PING: {
++                if (!mcdma_enabled() || !recv_msg(sock, nullptr, 0) || !send_msg(sock, &mcdma_magic, sizeof(mcdma_magic))) return;
++                break;
++            }
++            case RPC_CMD_MCDMA_CONNECT: {
++                mcdma_caps peer = {}, local = {};
++                if (!recv_msg(sock, &peer, sizeof(peer)) || !server.dma_connect(peer, local) || !send_msg(sock, &local, sizeof(local))) return;
++                break;
++            }
++
++#endif
+             case RPC_CMD_HELLO: {
+                 // HELLO command is handled above
+                 return;
+@@ -1969,6 +2271,12 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+                 if (!server.buffer_clear(request)) {
+                     return;
+                 }
++#ifdef GGML_MCDMA
++                if (mcdma_enabled()) {
++                    for (auto backend : backends) ggml_backend_synchronize(backend);
++                    if (!send_msg(sock, &mcdma_magic, sizeof(mcdma_magic))) return;
++                }
++#endif
+                 break;
+             }
+             case RPC_CMD_MEMSET_TENSOR: {
+@@ -1979,6 +2287,12 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+                 if (!server.memset_tensor(request)) {
+                     return;
+                 }
++#ifdef GGML_MCDMA
++                if (mcdma_enabled()) {
++                    for (auto backend : backends) ggml_backend_synchronize(backend);
++                    if (!send_msg(sock, &mcdma_magic, sizeof(mcdma_magic))) return;
++                }
++#endif
+                 break;
+             }
+             case RPC_CMD_SET_TENSOR: {
+@@ -2013,6 +2327,12 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+                 if (!server.init_tensor(request)) {
+                     return;
+                 }
++#ifdef GGML_MCDMA
++                if (mcdma_enabled()) {
++                    for (auto backend : backends) ggml_backend_synchronize(backend);
++                    if (!send_msg(sock, &mcdma_magic, sizeof(mcdma_magic))) return;
++                }
++#endif
+                 break;
+             }
+             case RPC_CMD_GET_TENSOR: {
+@@ -2051,6 +2371,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+                 if (!server.graph_compute(input)) {
+                     return;
+                 }
++#ifdef GGML_MCDMA
++                if (mcdma_enabled() && !send_msg(sock, &mcdma_magic, sizeof(mcdma_magic))) return;
++#endif
+                 break;
+             }
+             case RPC_CMD_GRAPH_RECOMPUTE: {
+@@ -2061,6 +2384,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+                 if (!server.graph_recompute(request)) {
+                     return;
+                 }
++#ifdef GGML_MCDMA
++                if (mcdma_enabled() && !send_msg(sock, &mcdma_magic, sizeof(mcdma_magic))) return;
++#endif
+                 break;
+             }
+             case RPC_CMD_GET_DEVICE_MEMORY: {
+diff --git a/ggml/src/ggml-rpc/mcdma-rdma.cpp b/ggml/src/ggml-rpc/mcdma-rdma.cpp
+new file mode 100644
+index 000000000..ffed265ed
+--- /dev/null
++++ b/ggml/src/ggml-rpc/mcdma-rdma.cpp
+@@ -0,0 +1,191 @@
++#include "mcdma-rdma.h"
++#include "ggml-impl.h"
++#include <infiniband/verbs.h>
++#include <algorithm>
++#include <atomic>
++#include <cerrno>
++#include <chrono>
++#include <cstdlib>
++#include <cstring>
++#include <random>
++#include <mutex>
++#include <thread>
++
++static void require(bool ok, const char * what) {
++    if (!ok) GGML_ABORT("MCDMA: %s failed (errno=%d); no staging fallback", what, errno);
++}
++static unsigned env_uint(const char * name, unsigned fallback, unsigned max) {
++    const char * s = std::getenv(name);
++    if (!s) return fallback;
++    char * end = nullptr;
++    errno = 0;
++    unsigned long v = std::strtoul(s, &end, 10);
++    require(!errno && end != s && *end == 0 && v <= max, name);
++    return (unsigned)v;
++}
++struct mcdma_channel::impl {
++    ibv_context * context = nullptr;
++    ibv_pd * pd = nullptr;
++    ibv_cq * cq = nullptr;
++    ibv_qp * qp = nullptr;
++    mcdma_caps local = {}, peer = {};
++    unsigned port = 1, gid_index = 0;
++    uint64_t serial = 0, transfers = 0, bytes = 0;
++    std::atomic<size_t> registrations{0};
++    std::mutex operation_mutex;
++    bool connected = false;
++};
++struct mcdma_region::impl {
++    ibv_mr * mr = nullptr;
++    uint64_t address = 0;
++    size_t length = 0;
++    std::atomic<size_t> * registrations = nullptr;
++};
++mcdma_region::mcdma_region(std::unique_ptr<impl> value) : p(std::move(value)) {}
++mcdma_region::~mcdma_region() {
++    if (p->mr) {
++        require(ibv_dereg_mr(p->mr) == 0, "MR deregistration");
++        --*p->registrations;
++    }
++}
++uint64_t mcdma_region::address() const { return p->address; }
++uint32_t mcdma_region::rkey() const { return p->mr->rkey; }
++size_t mcdma_region::size() const { return p->length; }
++
++mcdma_channel::mcdma_channel() : p(new impl) {
++    const char * dev = std::getenv("MCDMA_RDMA_DEV");
++    require(dev && *dev && std::getenv("MCDMA_RDMA_GID"), "explicit RDMA device/GID selection");
++    p->port = env_uint("MCDMA_RDMA_PORT", 1, 255);
++    p->gid_index = env_uint("MCDMA_RDMA_GID", 0, 255);
++    require(p->port > 0, "nonzero RDMA port");
++    int count = 0;
++    ibv_device ** devices = ibv_get_device_list(&count);
++    require(devices, "device enumeration");
++    for (int i = 0; i < count; ++i) {
++        if (!std::strcmp(ibv_get_device_name(devices[i]), dev)) p->context = ibv_open_device(devices[i]);
++    }
++    ibv_free_device_list(devices);
++    require(p->context, "selected device open");
++    ibv_port_attr port = {};
++    require(ibv_query_port(p->context, p->port, &port) == 0 && port.state == IBV_PORT_ACTIVE, "active RDMA port");
++    require(p->gid_index < (unsigned)port.gid_tbl_len, "GID index bounds");
++    ibv_gid gid = {};
++    require(ibv_query_gid(p->context, p->port, p->gid_index, &gid) == 0, "GID query");
++    std::memcpy(p->local.gid, gid.raw, 16);
++    bool nonzero = false;
++    for (auto c : p->local.gid) nonzero |= c != 0;
++    require(nonzero, "nonzero GID");
++    p->local.lid = port.lid;
++    p->local.mtu = std::min((unsigned)port.active_mtu, (unsigned)IBV_MTU_4096);
++    p->local.version = 1;
++    p->pd = ibv_alloc_pd(p->context);
++    require(p->pd, "protection domain");
++    p->cq = ibv_create_cq(p->context, 16, nullptr, nullptr, 0);
++    require(p->cq, "completion queue");
++    ibv_qp_init_attr attr = {};
++    attr.send_cq = p->cq; attr.recv_cq = p->cq; attr.qp_type = IBV_QPT_RC;
++    attr.cap.max_send_wr = 8; attr.cap.max_recv_wr = 1;
++    attr.cap.max_send_sge = 1; attr.cap.max_recv_sge = 1;
++    p->qp = ibv_create_qp(p->pd, &attr);
++    require(p->qp, "RC queue pair");
++    p->local.qpn = p->qp->qp_num;
++    p->local.psn = std::random_device{}() & 0xffffff;
++    ibv_qp_attr init = {};
++    init.qp_state = IBV_QPS_INIT; init.port_num = p->port; init.pkey_index = 0;
++    init.qp_access_flags = IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
++    require(ibv_modify_qp(p->qp, &init, IBV_QP_STATE | IBV_QP_PORT | IBV_QP_PKEY_INDEX | IBV_QP_ACCESS_FLAGS) == 0, "QP INIT");
++    GGML_LOG_INFO("MCDMA native tensor channel created; payload staging disabled\n");
++}
++mcdma_caps mcdma_channel::caps() const { return p->local; }
++void mcdma_channel::connect(const mcdma_caps & peer) {
++    require(peer.version == 1 && peer.reserved == 0 && peer.qpn && peer.qpn <= 0xffffff && peer.psn <= 0xffffff && peer.mtu >= IBV_MTU_256 && peer.mtu <= IBV_MTU_4096, "peer capabilities");
++    if (p->connected) {
++        require(std::memcmp(&peer, &p->peer, sizeof(peer)) == 0, "unchanged peer identity");
++        return;
++    }
++    ibv_qp_attr attr = {};
++    attr.qp_state = IBV_QPS_RTR;
++    attr.path_mtu = (ibv_mtu)std::min(p->local.mtu, peer.mtu);
++    attr.dest_qp_num = peer.qpn; attr.rq_psn = peer.psn;
++    attr.max_dest_rd_atomic = 1; attr.min_rnr_timer = 12;
++    attr.ah_attr.is_global = 1; attr.ah_attr.port_num = p->port;
++    attr.ah_attr.dlid = peer.lid; attr.ah_attr.grh.sgid_index = p->gid_index;
++    attr.ah_attr.grh.hop_limit = 1;
++    std::memcpy(attr.ah_attr.grh.dgid.raw, peer.gid, 16);
++    require(ibv_modify_qp(p->qp, &attr, IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER) == 0, "QP RTR");
++    attr = {};
++    attr.qp_state = IBV_QPS_RTS; attr.sq_psn = p->local.psn;
++    attr.timeout = 16; attr.retry_cnt = 5; attr.rnr_retry = 5; attr.max_rd_atomic = 1;
++    require(ibv_modify_qp(p->qp, &attr, IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_MAX_QP_RD_ATOMIC) == 0, "QP RTS");
++    p->peer = peer; p->connected = true;
++}
++std::unique_ptr<mcdma_region> mcdma_channel::register_span(const ggml_backend_dma_span & span, bool remote_write) {
++    return register_flags(span, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | (remote_write ? IBV_ACCESS_REMOTE_WRITE : 0));
++}
++std::unique_ptr<mcdma_region> mcdma_channel::register_read_only_span(const ggml_backend_dma_span & span) {
++    return register_flags(span, 0);
++}
++std::unique_ptr<mcdma_region> mcdma_channel::register_flags(const ggml_backend_dma_span & span, int access) {
++    require(p->qp && span.host_ptr && span.size && span.size <= SIZE_MAX, "registration span");
++    auto region = std::unique_ptr<mcdma_region::impl>(new mcdma_region::impl);
++    if (span.fd >= 0) {
++        require(span.fd_offset <= UINT64_MAX - span.size, "DMA-BUF range");
++        region->address = span.fd_offset;
++        region->mr = ibv_reg_dmabuf_mr(p->pd, span.fd_offset, span.size, region->address, span.fd, access);
++    } else {
++        require(span.fd == -1 && span.fd_offset == 0, "host span metadata");
++        region->address = (uintptr_t)span.host_ptr;
++        region->mr = ibv_reg_mr(p->pd, span.host_ptr, span.size, access);
++    }
++    require(region->mr, "tensor memory registration");
++    region->length = span.size;
++    region->registrations = &p->registrations;
++    ++p->registrations;
++    return std::unique_ptr<mcdma_region>(new mcdma_region(std::move(region)));
++}
++void mcdma_channel::transfer(mcdma_region & local, uint64_t remote_address, uint32_t remote_rkey, size_t bytes, bool write) {
++    transfer_at(local, 0, remote_address, remote_rkey, bytes, write);
++}
++void mcdma_channel::transfer_at(mcdma_region & local, size_t local_offset, uint64_t remote_address, uint32_t remote_rkey, size_t bytes, bool write) {
++    std::lock_guard<std::mutex> guard(p->operation_mutex);
++    require(p->connected && p->qp && bytes && local_offset <= local.size() && bytes <= local.size() - local_offset && remote_address <= UINT64_MAX - bytes, "transfer bounds/state");
++    size_t offset = 0;
++    while (offset < bytes) {
++        const size_t length = std::min(bytes - offset, size_t(4 * 1024 * 1024));
++        ibv_sge sge = {};
++        sge.addr = local.address() + local_offset + offset; sge.length = length; sge.lkey = local.p->mr->lkey;
++        ibv_send_wr wr = {}, * bad = nullptr;
++        wr.wr_id = ++p->serial; wr.sg_list = &sge; wr.num_sge = 1;
++        wr.opcode = write ? IBV_WR_RDMA_WRITE : IBV_WR_RDMA_READ;
++        wr.send_flags = IBV_SEND_SIGNALED;
++        wr.wr.rdma.remote_addr = remote_address + offset; wr.wr.rdma.rkey = remote_rkey;
++        require(ibv_post_send(p->qp, &wr, &bad) == 0, "post tensor transfer");
++        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
++        ibv_wc wc = {};
++        for (;;) {
++            int count = ibv_poll_cq(p->cq, 1, &wc);
++            require(count >= 0, "completion poll");
++            if (count) break;
++            require(std::chrono::steady_clock::now() < deadline, "tensor transfer deadline");
++        }
++        require(wc.status == IBV_WC_SUCCESS && wc.wr_id == wr.wr_id && wc.opcode == (write ? IBV_WC_RDMA_WRITE : IBV_WC_RDMA_READ), "tensor completion status/identity");
++        offset += length;
++    }
++    std::atomic_thread_fence(std::memory_order_seq_cst);
++    ++p->transfers; p->bytes += bytes;
++}
++void mcdma_channel::stop() {
++    if (p->qp) {
++        require(ibv_destroy_qp(p->qp) == 0, "QP teardown");
++        p->qp = nullptr;
++    }
++    p->connected = false;
++}
++mcdma_channel::~mcdma_channel() {
++    stop();
++    require(p->registrations == 0, "all tensor MRs released before channel destruction");
++    if (p->cq) require(ibv_destroy_cq(p->cq) == 0, "CQ teardown");
++    if (p->pd) require(ibv_dealloc_pd(p->pd) == 0, "PD teardown");
++    if (p->context) require(ibv_close_device(p->context) == 0, "device teardown");
++    GGML_LOG_INFO("MCDMA native transfers=%llu bytes=%llu payload_staging_bytes=0\n", (unsigned long long)p->transfers, (unsigned long long)p->bytes);
++}
+diff --git a/ggml/src/ggml-rpc/mcdma-rdma.h b/ggml/src/ggml-rpc/mcdma-rdma.h
+new file mode 100644
+index 000000000..6fc768aa3
+--- /dev/null
++++ b/ggml/src/ggml-rpc/mcdma-rdma.h
+@@ -0,0 +1,42 @@
++#pragma once
++#include "ggml-backend-impl.h"
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++
++struct mcdma_caps {
++    uint8_t gid[16];
++    uint32_t qpn, psn, mtu;
++    uint16_t lid, reserved;
++    uint32_t version;
++};
++
++class __attribute__((visibility("default"))) mcdma_region {
++public:
++    ~mcdma_region();
++    uint64_t address() const;
++    uint32_t rkey() const;
++    size_t size() const;
++private:
++    friend class mcdma_channel;
++    struct impl;
++    explicit mcdma_region(std::unique_ptr<impl>);
++    std::unique_ptr<impl> p;
++};
++
++class __attribute__((visibility("default"))) mcdma_channel {
++public:
++    mcdma_channel();
++    ~mcdma_channel();
++    mcdma_caps caps() const;
++    void connect(const mcdma_caps & peer);
++    std::unique_ptr<mcdma_region> register_span(const ggml_backend_dma_span & span, bool remote_write);
++    std::unique_ptr<mcdma_region> register_read_only_span(const ggml_backend_dma_span & span);
++    void transfer_at(mcdma_region & local, size_t local_offset, uint64_t remote_address, uint32_t remote_rkey, size_t bytes, bool write);
++    void transfer(mcdma_region & local, uint64_t remote_address, uint32_t remote_rkey, size_t bytes, bool write);
++    void stop();
++private:
++    std::unique_ptr<mcdma_region> register_flags(const ggml_backend_dma_span & span, int access);
++    struct impl;
++    std::unique_ptr<impl> p;
++};
+diff --git a/ggml/src/ggml-rpc/transport.cpp b/ggml/src/ggml-rpc/transport.cpp
+index b28d16605..71268cb59 100644
+--- a/ggml/src/ggml-rpc/transport.cpp
++++ b/ggml/src/ggml-rpc/transport.cpp
+@@ -72,6 +72,8 @@ struct rdma_conn {
+     void          * tx_buf = nullptr;
+     struct ibv_mr * tx_mr  = nullptr;
+ 
++    int pending_slot = -1;
++    size_t pending_offset = 0, pending_length = 0;
+     void          * rx_buf = nullptr; // RDMA_RX_DEPTH × RDMA_CHUNK contiguous
+     struct ibv_mr * rx_mr  = nullptr;
+     int             rx_head = 0;
+@@ -420,7 +422,9 @@ bool socket_t::impl::rdma_wait_event() {
+         { c->ch->fd, POLLIN,    0 },
+         { fd,        POLLRDHUP, 0 },
+     };
+-    if (poll(pfds, 2, -1) < 0) {
++    int ready = poll(pfds, 2, 300000);
++    if (ready == 0) return false;
++    if (ready < 0) {
+         return errno == EINTR;
+     }
+     if (pfds[1].revents & (POLLHUP | POLLERR | POLLRDHUP)) {
+@@ -440,7 +444,9 @@ bool socket_t::impl::rdma_wait_event() {
+ bool socket_t::impl::rdma_poll(struct ibv_cq * cq, struct ibv_wc * wc) {
+     rdma_conn * c = rdma.get();
+     bool armed = false;
++    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(300);
+     for (uint64_t s = 1; ; s++) {
++        if ((s & 0x3ff) == 0 && std::chrono::steady_clock::now() >= deadline) return false;
+         int n = ibv_poll_cq(cq, 1, wc);
+         if (n > 0) {
+             c->last_active = std::chrono::steady_clock::now();
+@@ -517,17 +523,21 @@ bool socket_t::impl::rdma_recv(void * data, size_t size) {
+     uint8_t * dst = (uint8_t *)data;
+     size_t rem = size;
+     while (rem > 0) {
+-        struct ibv_wc wc;
+-        if (!rdma_poll(c->rcq, &wc)) return false;
+-
+-        int slot = (int)wc.wr_id;
+-        size_t got = wc.byte_len;
+-        memcpy(dst, c->rx_slot(slot), got);
+-
+-        if (!c->post_rx(slot)) return false;
+-
+-        dst += got;
+-        rem -= got;
++        if (c->pending_slot < 0) {
++            struct ibv_wc wc;
++            if (!rdma_poll(c->rcq, &wc)) return false;
++            if (wc.wr_id >= RDMA_RX_DEPTH || !wc.byte_len || wc.byte_len > RDMA_CHUNK || wc.opcode != IBV_WC_RECV) return false;
++            c->pending_slot = (int)wc.wr_id;
++            c->pending_offset = 0;
++            c->pending_length = wc.byte_len;
++        }
++        size_t n = std::min(rem, c->pending_length - c->pending_offset);
++        memcpy(dst, c->rx_slot(c->pending_slot) + c->pending_offset, n);
++        dst += n; rem -= n; c->pending_offset += n;
++        if (c->pending_offset == c->pending_length) {
++            if (!c->post_rx(c->pending_slot)) return false;
++            c->pending_slot = -1;
++        }
+     }
+     return true;
+ }
+@@ -667,6 +677,18 @@ bool socket_t::recv_data(void * data, size_t size) {
+     return pimpl->recv_data(data, size);
+ }
+ 
++void socket_t::set_timeout(unsigned seconds) {
++#ifndef _WIN32
++    timeval timeout = {(long)seconds, 0};
++    GGML_ASSERT(setsockopt(pimpl->fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
++    GGML_ASSERT(setsockopt(pimpl->fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == 0);
++#else
++    GGML_UNUSED(seconds);
++#endif
++}
++
++bool socket_t::rdma_active() const { return pimpl->use_rdma; }
++
+ bool socket_t::flush() {
+     return pimpl->flush();
+ }
+diff --git a/ggml/src/ggml-rpc/transport.h b/ggml/src/ggml-rpc/transport.h
+index 3f747ecff..fb92ba0bb 100644
+--- a/ggml/src/ggml-rpc/transport.h
++++ b/ggml/src/ggml-rpc/transport.h
+@@ -19,6 +19,8 @@ struct socket_t {
+     // writes into fixed-size frames and posts the trailing partial frame only
+     // here. No-op on TCP.
+     bool flush();
++    void set_timeout(unsigned seconds);
++    bool rdma_active() const;
+ 
+     socket_ptr accept();
+ 
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp b/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp
+index 4d4c84951..fa651eb1c 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp
+@@ -1,5 +1,12 @@
+ #include "ggml-vulkan-common.h"
+ 
++#if defined(__linux__)
++#include <fcntl.h>
++#include <unistd.h>
++#endif
++
++static void ggml_vk_dma_prepare_commands(vk_device & device, vk_context & commands);
++
+ ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface = {
+     /* .get_name         = */ ggml_backend_vk_buffer_type_name,
+     /* .alloc_buffer     = */ ggml_backend_vk_buffer_type_alloc_buffer,
+@@ -190,7 +197,117 @@ vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk::Memory
+     }
+ }
+ 
++static vk_buffer ggml_vk_create_buffer_mcdma(vk_device & device, size_t size) {
++#if defined(__linux__)
++    vk_buffer buf = std::make_shared<vk_buffer_struct>();
++    if (size == 0) {
++        return buf;
++    }
++    if (size > device->max_buffer_size) {
++        GGML_ABORT("GGML_MCDMA Vulkan buffer exceeds device limit");
++    }
++    vk::BufferUsageFlags usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
++    if (device->buffer_device_address) {
++        usage |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
++    }
++    const vk::ExternalMemoryHandleTypeFlagBits handle_type = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT;
++    const auto external = device->physical_device.getExternalBufferProperties({ {}, usage, handle_type });
++    if (!(external.externalMemoryProperties.externalMemoryFeatures & vk::ExternalMemoryFeatureFlagBits::eExportable) ||
++        !(external.externalMemoryProperties.compatibleHandleTypes & handle_type)) {
++        GGML_ABORT("GGML_MCDMA Vulkan storage buffers are not DMA_BUF exportable");
++    }
++
++    void * mapped = nullptr;
++    try {
++        vk::ExternalMemoryBufferCreateInfo external_info(handle_type);
++        vk::BufferCreateInfo buffer_info({}, size, usage, vk::SharingMode::eExclusive);
++        buffer_info.setPNext(&external_info);
++        buf->buffer = device->device.createBuffer(buffer_info);
++
++        vk::MemoryDedicatedRequirements dedicated_req;
++        vk::MemoryRequirements2 requirements;
++        requirements.pNext = &dedicated_req;
++        const vk::BufferMemoryRequirementsInfo2 requirements_info(buf->buffer);
++        device->device.getBufferMemoryRequirements2(&requirements_info, &requirements);
++        const auto & req = requirements.memoryRequirements;
++        const auto properties = device->physical_device.getMemoryProperties();
++        const auto required = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
++        const auto allowed = required | vk::MemoryPropertyFlagBits::eHostCached | vk::MemoryPropertyFlagBits::eDeviceLocal;
++        uint32_t selected = UINT32_MAX;
++        int best_score = -1;
++        for (uint32_t i = 0; i < properties.memoryTypeCount; ++i) {
++            const auto flags = properties.memoryTypes[i].propertyFlags;
++            if (!(req.memoryTypeBits & (1u << i)) || (flags & required) != required || (flags & ~allowed) ||
++                properties.memoryHeaps[properties.memoryTypes[i].heapIndex].size < req.size) {
++                continue;
++            }
++            const int score = (!(flags & vk::MemoryPropertyFlagBits::eDeviceLocal) ? 2 : 0) +
++                              ((flags & vk::MemoryPropertyFlagBits::eHostCached) ? 1 : 0);
++            if (score > best_score) {
++                selected = i;
++                best_score = score;
++            }
++        }
++        if (selected == UINT32_MAX) {
++            throw std::runtime_error("no ordinary coherent DMA_BUF memory type");
++        }
++        vk::MemoryAllocateFlagsInfo flags_info;
++        if (device->buffer_device_address) {
++            flags_info.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
++        }
++        vk::MemoryDedicatedAllocateInfo dedicated_info({}, buf->buffer);
++        vk::ExportMemoryAllocateInfo export_info(handle_type);
++        export_info.setPNext(&flags_info);
++        if (dedicated_req.requiresDedicatedAllocation || dedicated_req.prefersDedicatedAllocation ||
++            (external.externalMemoryProperties.externalMemoryFeatures & vk::ExternalMemoryFeatureFlagBits::eDedicatedOnly)) {
++            flags_info.setPNext(&dedicated_info);
++        }
++        buf->device_memory = device->device.allocateMemory({req.size, selected, &export_info});
++        device->device.bindBufferMemory(buf->buffer, buf->device_memory, 0);
++        mapped = device->device.mapMemory(buf->device_memory, 0, VK_WHOLE_SIZE);
++        const long page = sysconf(_SC_PAGESIZE);
++        if (page <= 0 || reinterpret_cast<uintptr_t>(mapped) % static_cast<size_t>(page) != 0) {
++            throw std::runtime_error("DMA_BUF CPU mapping is not page aligned");
++        }
++        buf->mcdma_fd = device->device.getMemoryFdKHR({buf->device_memory, vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT});
++        if (buf->mcdma_fd < 0 || fcntl(buf->mcdma_fd, F_SETFD, FD_CLOEXEC) != 0) {
++            throw std::runtime_error("DMA_BUF descriptor export failed");
++        }
++        buf->ptr = mapped;
++        buf->memory_property_flags = properties.memoryTypes[selected].propertyFlags;
++        buf->device = device;
++        buf->size = size;
++        buf->mcdma = true;
++        if (device->buffer_device_address) {
++            buf->bda_addr = device->device.getBufferAddress(vk::BufferDeviceAddressInfo(buf->buffer));
++        }
++        device->memory_logger->log_allocation(buf, size);
++        return buf;
++    } catch (const std::exception & error) {
++        if (buf->mcdma_fd >= 0) close(buf->mcdma_fd);
++        if (mapped) {
++            device->device.unmapMemory(buf->device_memory);
++        }
++        if (buf->buffer) {
++            device->device.destroyBuffer(buf->buffer);
++        }
++        if (buf->device_memory) {
++            device->device.freeMemory(buf->device_memory);
++        }
++        buf->size = 0;
++        GGML_ABORT("GGML_MCDMA Vulkan allocation failed without fallback: %s", error.what());
++    }
++#else
++    GGML_ABORT("GGML_MCDMA Vulkan DMA_BUF requires Linux");
++    UNUSED(device);
++    UNUSED(size);
++#endif
++}
++
+ vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
++    if (device->mcdma) {
++        return ggml_vk_create_buffer_mcdma(device, size);
++    }
+     vk_buffer buf;
+     try {
+         if (device->prefer_host_memory) {
+@@ -422,6 +539,8 @@ static void ggml_vk_buffer_write_nc_async(ggml_backend_vk_context * ctx, vk_cont
+ }
+ 
+ bool ggml_vk_buffer_write_2d_async(vk_context subctx, vk_buffer& dst, size_t offset, const void * src, size_t spitch, size_t dpitch, size_t width, size_t height, bool sync_staging) {
++    ggml_vk_dma_prepare_commands(dst->device, subctx);
++    GGML_ASSERT(dst->device->mcdma_leases == 0);
+     VK_LOG_DEBUG("ggml_vk_buffer_write_2d_async(" << width << ", " << height << ")");
+     // Check if src is pinned memory
+     vk_buffer buf = nullptr;
+@@ -495,6 +614,8 @@ bool ggml_vk_buffer_write_async(vk_context subctx, vk_buffer& dst, size_t offset
+ }
+ 
+ void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * src, size_t spitch, size_t dpitch, size_t width, size_t height) {
++    if (height) ggml_vk_dma_host_access(dst, offset, (height - 1) * dpitch + width);
++    GGML_ASSERT(dst->device->mcdma_leases == 0);
+     VK_LOG_DEBUG("ggml_vk_buffer_write_2d(" << width << ", " << height << ")");
+     // Buffer is already mapped
+     if(dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
+@@ -537,6 +658,8 @@ void ggml_vk_buffer_write(vk_buffer& dst, size_t offset, const void * src, size_
+ }
+ 
+ bool ggml_vk_buffer_read_2d_async(vk_context subctx, vk_buffer& src, size_t offset, void * dst, size_t spitch, size_t dpitch, size_t width, size_t height, bool sync_staging) {
++    ggml_vk_dma_prepare_commands(src->device, subctx);
++    GGML_ASSERT(src->device->mcdma_leases == 0);
+     VK_LOG_DEBUG("ggml_vk_buffer_read_2d_async(offset=" << offset << ", width=" << width << ", height=" << height << ")");
+     GGML_ASSERT(width > 0);
+     GGML_ASSERT(height > 0);
+@@ -616,6 +739,8 @@ static bool ggml_vk_buffer_read_async(vk_context subctx, vk_buffer& src, size_t
+ }
+ 
+ void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t spitch, size_t dpitch, size_t width, size_t height) {
++    if (height) ggml_vk_dma_host_access(src, offset, (height - 1) * spitch + width);
++    GGML_ASSERT(src->device->mcdma_leases == 0);
+     VK_LOG_DEBUG("ggml_vk_buffer_read_2d(" << src->buffer << ", " << offset << ", " << width << ", " << height << ")");
+ 
+     // If the device is not an UMA device the memory is host-accessible through rebar. While writing
+@@ -674,6 +799,8 @@ void ggml_vk_buffer_read(vk_buffer& src, size_t offset, void * dst, size_t size)
+ }
+ 
+ void ggml_vk_buffer_copy_async(vk_context& ctx, vk_buffer& dst, size_t dst_offset, vk_buffer& src, size_t src_offset, size_t size) {
++    ggml_vk_dma_prepare_commands(dst->device, ctx);
++    GGML_ASSERT(dst->device->mcdma_leases == 0);
+     VK_LOG_DEBUG("ggml_vk_buffer_copy_async(" << size << ")");
+     // Make sure both buffers are on same device
+     GGML_ASSERT(src->device == dst->device);
+@@ -684,6 +811,7 @@ void ggml_vk_buffer_copy_async(vk_context& ctx, vk_buffer& dst, size_t dst_offse
+ }
+ 
+ void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& src, size_t src_offset, size_t size) {
++    GGML_ASSERT(dst->device->mcdma_leases == 0);
+     if (src->device == dst->device) {
+         std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
+         VK_LOG_DEBUG("ggml_vk_buffer_copy(SINGLE_DEVICE, " << size << ")");
+@@ -709,10 +837,12 @@ void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& src, size
+ }
+ 
+ void ggml_vk_buffer_memset_async(vk_context& ctx, vk_buffer& dst, size_t offset, uint32_t c, size_t size) {
++    ggml_vk_dma_prepare_commands(dst->device, ctx);
++    GGML_ASSERT(dst->device->mcdma_leases == 0);
+     VK_LOG_DEBUG("ggml_vk_buffer_memset_async(" << offset << ", " << c << ", " << size << ")");
+ 
+     if (dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible &&
+-        dst->device->uma) {
++        dst->device->uma && !dst->mcdma) {
+         deferred_memset((uint8_t*)dst->ptr + offset, c, size, &ctx->memsets);
+         return;
+     }
+@@ -722,6 +852,8 @@ void ggml_vk_buffer_memset_async(vk_context& ctx, vk_buffer& dst, size_t offset,
+ }
+ 
+ void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, size_t size) {
++    ggml_vk_dma_host_access(dst, offset, size);
++    GGML_ASSERT(dst->device->mcdma_leases == 0);
+     VK_LOG_DEBUG("ggml_vk_buffer_memset(" << offset << ", " << c << ", " << size << ")");
+ 
+     if (dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible &&
+@@ -742,6 +874,218 @@ void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, size_t siz
+     ggml_vk_queue_command_pools_cleanup(dst->device);
+ }
+ 
++struct ggml_vk_dma_lease {
++    vk_buffer buffer;
++    std::shared_ptr<vk_dma_range> range;
++};
++
++static void ggml_vk_dma_record_barrier(vk_context & commands, const vk_buffer & buffer, size_t offset, size_t size, bool release) {
++    const uint32_t queue = buffer->device->compute_queue->queue_family_index;
++    vk::BufferMemoryBarrier barrier;
++    barrier.srcAccessMask = release ? vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eHostWrite : vk::AccessFlags();
++    barrier.dstAccessMask = release ? vk::AccessFlags() : vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eHostRead;
++    barrier.srcQueueFamilyIndex = release ? queue : VK_QUEUE_FAMILY_FOREIGN_EXT;
++    barrier.dstQueueFamilyIndex = release ? VK_QUEUE_FAMILY_FOREIGN_EXT : queue;
++    barrier.buffer = buffer->buffer;
++    barrier.offset = offset;
++    barrier.size = size;
++    commands->s->buffer->buf.pipelineBarrier(
++        release ? vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost : vk::PipelineStageFlagBits::eTopOfPipe,
++        release ? vk::PipelineStageFlagBits::eBottomOfPipe : vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
++        {}, {}, barrier, {});
++}
++
++static void ggml_vk_dma_submit_wait(vk_device & device, vk_context & commands) {
++    ggml_vk_ctx_end(commands);
++    ggml_vk_submit(commands, device->fence);
++    VK_CHECK(device->device.waitForFences({device->fence}, true, UINT64_MAX), "MCDMA ownership fence", device);
++    device->device.resetFences({device->fence});
++    ggml_vk_queue_command_pools_cleanup(device);
++}
++
++static bool ggml_vk_dma_overlap(size_t a, size_t an, size_t b, size_t bn) {
++    return a < b + bn && b < a + an;
++}
++
++void ggml_vk_dma_host_access(vk_buffer & buffer, size_t offset, size_t size) {
++    if (!buffer || !buffer->mcdma || !size) return;
++    vk_device device = buffer->device;
++    std::lock_guard<std::recursive_mutex> guard(device->mutex);
++    GGML_ASSERT(offset <= buffer->size && size <= buffer->size - offset);
++    vk_context commands;
++    auto & ranges = device->mcdma_ranges;
++    for (auto it = ranges.begin(); it != ranges.end();) {
++        const auto & range = *it;
++        if (range->buffer.lock() != buffer || range->state == vk_dma_state::planned ||
++            !ggml_vk_dma_overlap(offset, size, range->offset, range->size)) {
++            ++it;
++            continue;
++        }
++        GGML_ASSERT(range->state != vk_dma_state::leased);
++        if (range->state == vk_dma_state::released) {
++            GGML_ASSERT(range->producer);
++            ggml_vk_synchronize(range->producer);
++        }
++        if (!commands) {
++            commands = ggml_vk_create_temporary_context(device->compute_queue->cmd_pool);
++            ggml_vk_ctx_begin(device, commands);
++        }
++        ggml_vk_dma_record_barrier(commands, buffer, range->offset, range->size, false);
++        ++device->mcdma_host_barriers;
++        it = ranges.erase(it);
++    }
++    if (commands) ggml_vk_dma_submit_wait(device, commands);
++}
++
++static void ggml_vk_dma_prepare_commands(vk_device & device, vk_context & commands) {
++    if (!device->mcdma) return;
++    auto & ranges = device->mcdma_ranges;
++    for (auto it = ranges.begin(); it != ranges.end();) {
++        auto & range = *it;
++        GGML_ASSERT(range->state == vk_dma_state::planned || range->state == vk_dma_state::reacquire);
++        if (range->state == vk_dma_state::reacquire) {
++            vk_buffer buffer = range->buffer.lock();
++            GGML_ASSERT(buffer);
++            ggml_vk_dma_record_barrier(commands, buffer, range->offset, range->size, false);
++            ++device->mcdma_consumer_barriers;
++            it = ranges.erase(it);
++        } else {
++            ++it;
++        }
++    }
++}
++
++void ggml_vk_dma_graph_begin(ggml_backend_vk_context * ctx) {
++    if (!ctx->device->mcdma || ctx->device->mcdma_ranges.empty()) return;
++    vk_context commands = ggml_vk_get_compute_ctx(ctx);
++    ggml_vk_dma_prepare_commands(ctx->device, commands);
++}
++
++void ggml_vk_dma_graph_end(ggml_backend_vk_context * ctx, vk_context & commands) {
++    if (!ctx->device->mcdma) return;
++    for (auto & range : ctx->device->mcdma_ranges) {
++        GGML_ASSERT(range->state == vk_dma_state::planned);
++        vk_buffer buffer = range->buffer.lock();
++        GGML_ASSERT(buffer);
++        ggml_vk_dma_record_barrier(commands, buffer, range->offset, range->size, true);
++        range->producer = ctx;
++        range->state = vk_dma_state::released;
++    }
++}
++
++void ggml_vk_dma_synchronized(ggml_backend_vk_context * ctx) {
++    if (!ctx->device->mcdma) return;
++    for (auto & range : ctx->device->mcdma_ranges) {
++        if (range->producer == ctx && range->state == vk_dma_state::released) {
++            range->state = vk_dma_state::ready;
++        }
++    }
++}
++
++void ggml_vk_dma_context_cleanup(ggml_backend_vk_context * ctx) {
++    if (!ctx->device->mcdma) return;
++    const auto ranges = ctx->device->mcdma_ranges;
++    for (const auto & range : ranges) {
++        if (range->producer == ctx) {
++            vk_buffer buffer = range->buffer.lock();
++            GGML_ASSERT(buffer);
++            ggml_vk_dma_host_access(buffer, range->offset, range->size);
++        }
++    }
++}
++
++void ggml_vk_dma_buffer_cleanup(vk_buffer & buffer) {
++    if (!buffer || !buffer->mcdma) return;
++    vk_device device = buffer->device;
++    for (auto * context : device->mcdma_contexts) ggml_vk_synchronize(context);
++    ggml_vk_dma_host_access(buffer, 0, buffer->size);
++    auto & ranges = device->mcdma_ranges;
++    ranges.erase(std::remove_if(ranges.begin(), ranges.end(), [&](const std::shared_ptr<vk_dma_range> & range) {
++        return range->buffer.lock() == buffer;
++    }), ranges.end());
++}
++
++static bool ggml_backend_vk_dma_export(ggml_backend_buffer_t buffer, ggml_backend_dma_span * span) {
++#if defined(__linux__)
++    auto * context = static_cast<ggml_backend_vk_buffer_context *>(buffer->context);
++    vk_buffer storage = context->dev_buffer;
++    if (!span || !storage || !storage->mcdma || storage->mcdma_fd < 0) return false;
++    const int fd = fcntl(storage->mcdma_fd, F_DUPFD_CLOEXEC, 0);
++    if (fd < 0) return false;
++    *span = {storage->ptr, storage->size, 0, fd, nullptr};
++    return true;
++#else
++    UNUSED(buffer); UNUSED(span);
++    return false;
++#endif
++}
++
++static bool ggml_backend_vk_dma_plan(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
++    auto * context = static_cast<ggml_backend_vk_buffer_context *>(buffer->context);
++    vk_buffer storage = context->dev_buffer;
++    if (!storage || !storage->mcdma || !size || offset > storage->size || size > storage->size - offset) return false;
++    std::lock_guard<std::recursive_mutex> guard(storage->device->mutex);
++    for (const auto & range : storage->device->mcdma_ranges) {
++        if (range->buffer.lock() != storage || range->state == vk_dma_state::reacquire) continue;
++        if (range->state == vk_dma_state::planned && range->offset == offset && range->size == size) return true;
++        if (ggml_vk_dma_overlap(offset, size, range->offset, range->size)) return false;
++    }
++    storage->device->mcdma_ranges.push_back(std::make_shared<vk_dma_range>(vk_dma_range {storage, offset, size, vk_dma_state::planned, nullptr}));
++    return true;
++}
++
++static bool ggml_backend_vk_dma_acquire(ggml_backend_buffer_t buffer, size_t offset, size_t size, bool write, ggml_backend_dma_span * span) {
++    UNUSED(write);
++    auto * context = static_cast<ggml_backend_vk_buffer_context *>(buffer->context);
++    vk_buffer storage = context->dev_buffer;
++    if (!span || !storage || !storage->mcdma || size == 0 || offset > storage->size || size > storage->size - offset) return false;
++    vk_device device = storage->device;
++    std::lock_guard<std::recursive_mutex> guard(device->mutex);
++    if (device->mcdma_leases != 0) return false;
++    std::shared_ptr<vk_dma_range> selected;
++    for (const auto & range : device->mcdma_ranges) {
++        if (range->buffer.lock() != storage || !ggml_vk_dma_overlap(offset, size, range->offset, range->size)) continue;
++        if (range->state != vk_dma_state::ready || range->offset != offset || range->size != size) return false;
++        selected = range;
++    }
++    if (selected) ++device->mcdma_planned_acquires;
++    if (!selected) {
++        ++device->mcdma_cold_acquires;
++        for (auto * backend_context : device->mcdma_contexts) {
++            ggml_vk_synchronize(backend_context);
++            ggml_vk_graph_cleanup(backend_context);
++        }
++        vk_context commands = ggml_vk_create_temporary_context(device->compute_queue->cmd_pool);
++        ggml_vk_ctx_begin(device, commands);
++        ggml_vk_dma_record_barrier(commands, storage, offset, size, true);
++        ggml_vk_dma_submit_wait(device, commands);
++        selected = std::make_shared<vk_dma_range>(vk_dma_range {storage, offset, size, vk_dma_state::ready, nullptr});
++        device->mcdma_ranges.push_back(selected);
++    }
++    std::unique_ptr<ggml_vk_dma_lease> lease(new ggml_vk_dma_lease {storage, selected});
++    selected->state = vk_dma_state::leased;
++    ++device->mcdma_leases;
++    *span = {static_cast<char *>(storage->ptr) + offset, size, offset, storage->mcdma_fd, lease.release()};
++    return true;
++}
++
++static bool ggml_backend_vk_dma_release(ggml_backend_buffer_t buffer, ggml_backend_dma_span * span) {
++    if (!span || !span->opaque) return false;
++    auto * lease = static_cast<ggml_vk_dma_lease *>(span->opaque);
++    auto * context = static_cast<ggml_backend_vk_buffer_context *>(buffer->context);
++    const auto & range = lease->range;
++    if (context->dev_buffer != lease->buffer || span->fd != lease->buffer->mcdma_fd || span->size != range->size ||
++        span->fd_offset != range->offset || span->host_ptr != static_cast<char *>(lease->buffer->ptr) + range->offset) return false;
++    vk_device device = lease->buffer->device;
++    std::lock_guard<std::recursive_mutex> guard(device->mutex);
++    GGML_ASSERT(device->mcdma_leases == 1 && range->state == vk_dma_state::leased);
++    range->state = vk_dma_state::reacquire;
++    --device->mcdma_leases;
++    delete lease;
++    *span = {nullptr, 0, 0, -1, nullptr};
++    return true;
++}
++
+ ggml_backend_buffer_i ggml_backend_vk_buffer_interface = {
+     /* .free_buffer     = */ ggml_backend_vk_buffer_free_buffer,
+     /* .get_base        = */ ggml_backend_vk_buffer_get_base,
+@@ -754,10 +1098,15 @@ ggml_backend_buffer_i ggml_backend_vk_buffer_interface = {
+     /* .cpy_tensor      = */ ggml_backend_vk_buffer_cpy_tensor,
+     /* .clear           = */ ggml_backend_vk_buffer_clear,
+     /* .reset           = */ NULL,
++    /* .dma_acquire     = */ ggml_backend_vk_dma_acquire,
++    /* .dma_release     = */ ggml_backend_vk_dma_release,
++    /* .cpy_tensor_from = */ NULL,
++    /* .dma_export      = */ ggml_backend_vk_dma_export,
++    /* .dma_plan        = */ ggml_backend_vk_dma_plan,
+ };
+ 
+ vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t size) {
+-    if (!device->external_memory_host) {
++    if (device->mcdma || !device->external_memory_host) {
+         return {};
+     }
+ 
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-common.h b/ggml/src/ggml-vulkan/ggml-vulkan-common.h
+index 4ae5fea7a..e47452386 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-common.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-common.h
+@@ -59,6 +59,13 @@ void ggml_vk_buffer_memset_async(vk_context& ctx, vk_buffer& dst, size_t offset,
+ void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, size_t size);
+ vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t size);
+ 
++void ggml_vk_dma_host_access(vk_buffer & buffer, size_t offset, size_t size);
++void ggml_vk_dma_graph_begin(ggml_backend_vk_context * ctx);
++void ggml_vk_dma_graph_end(ggml_backend_vk_context * ctx, vk_context & commands);
++void ggml_vk_dma_synchronized(ggml_backend_vk_context * ctx);
++void ggml_vk_dma_context_cleanup(ggml_backend_vk_context * ctx);
++void ggml_vk_dma_buffer_cleanup(vk_buffer & buffer);
++
+ // pipelines
+ uint64_t vk_tensor_offset(const ggml_tensor * tensor);
+ uint32_t get_misalign_bytes(const ggml_backend_vk_context * ctx, const ggml_tensor * t);
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+index 252359bf8..30309561f 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -3,6 +3,9 @@
+ #include "ggml-vulkan.h"
+ 
+ #include <vulkan/vulkan_core.h>
++#if defined(__linux__)
++#include <unistd.h>
++#endif
+ 
+ #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
+ #include <chrono>
+@@ -300,6 +303,7 @@ using matmul_tile_selector_t = std::function<uint32_t(
+     const std::vector<vk_matmul_pipeline_pair>& configs)>;
+ 
+ struct vk_device_struct;
++struct ggml_backend_vk_context;
+ 
+ typedef std::shared_ptr<vk_device_struct> vk_device;
+ 
+@@ -311,6 +315,15 @@ typedef std::shared_ptr<vk_buffer_struct> vk_buffer;
+ 
+ typedef std::weak_ptr<vk_buffer_struct> vk_buffer_ref;
+ 
++enum class vk_dma_state { planned, released, ready, leased, reacquire };
++struct vk_dma_range {
++    vk_buffer_ref buffer;
++    size_t offset;
++    size_t size;
++    vk_dma_state state;
++    ggml_backend_vk_context * producer = nullptr;
++};
++
+ struct ggml_backend_vk_buffer_type_context {
+     std::string name;
+     vk_device device;
+@@ -686,6 +699,14 @@ struct vk_device_struct {
+     uint64_t suballocation_block_size;
+     uint64_t min_imported_host_pointer_alignment;
+     bool external_memory_host {};
++    bool mcdma {};
++    size_t mcdma_leases {};
++    std::vector<ggml_backend_vk_context *> mcdma_contexts;
++    std::vector<std::shared_ptr<vk_dma_range>> mcdma_ranges;
++    uint64_t mcdma_planned_acquires {};
++    uint64_t mcdma_cold_acquires {};
++    uint64_t mcdma_consumer_barriers {};
++    uint64_t mcdma_host_barriers {};
+     bool fp16;
+     bool bf16;
+     bool pipeline_robustness;
+@@ -1047,6 +1068,8 @@ struct vk_buffer_struct {
+     void * ptr;
+     size_t size = 0;
+     vk::DeviceAddress bda_addr {};
++    bool mcdma {};
++    int mcdma_fd = -1;
+ 
+     vk_device device;
+ 
+@@ -1056,8 +1079,17 @@ struct vk_buffer_struct {
+         }
+         VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
+ 
+-        device->device.freeMemory(device_memory);
+-        device->device.destroyBuffer(buffer);
++        if (mcdma) {
++#if defined(__linux__)
++            if (mcdma_fd >= 0) close(mcdma_fd);
++#endif
++            device->device.unmapMemory(device_memory);
++            device->device.destroyBuffer(buffer);
++            device->device.freeMemory(device_memory);
++        } else {
++            device->device.freeMemory(device_memory);
++            device->device.destroyBuffer(buffer);
++        }
+     }
+ };
+ 
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 414e14f85..37663658b 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -3999,6 +3999,23 @@ vk_device ggml_vk_get_device(size_t idx) {
+ 
+         device->architecture = get_device_architecture(device->physical_device);
+ 
++        const char * mcdma = getenv("GGML_MCDMA");
++        device->mcdma = mcdma != nullptr && strcmp(mcdma, "1") == 0;
++        if (device->mcdma) {
++#if defined(__linux__)
++            for (const char * required : { "VK_KHR_external_memory_fd", "VK_EXT_external_memory_dma_buf", "VK_EXT_queue_family_foreign" }) {
++                const bool supported = std::any_of(ext_props.begin(), ext_props.end(), [required](const vk::ExtensionProperties & ext) {
++                    return strcmp(required, ext.extensionName) == 0;
++                });
++                if (!supported) {
++                    GGML_ABORT("GGML_MCDMA requires Vulkan extension %s", required);
++                }
++            }
++#else
++            GGML_ABORT("GGML_MCDMA Vulkan DMA_BUF requires Linux");
++#endif
++        }
++
+         const char* GGML_VK_PREFER_HOST_MEMORY = getenv("GGML_VK_PREFER_HOST_MEMORY");
+         device->prefer_host_memory = GGML_VK_PREFER_HOST_MEMORY != nullptr;
+ 
+@@ -4276,10 +4293,10 @@ vk_device ggml_vk_get_device(size_t idx) {
+         const bool allow_graphics_queue = (getenv("GGML_VK_ALLOW_GRAPHICS_QUEUE") != nullptr);
+         const vk::QueueFlagBits graphics_flag = allow_graphics_queue ? (vk::QueueFlagBits)0 : vk::QueueFlagBits::eGraphics;
+         const uint32_t compute_queue_family_index = ggml_vk_find_queue_family_index(queue_family_props, vk::QueueFlagBits::eCompute, graphics_flag, -1, 1);
+-        const uint32_t transfer_queue_family_index = ggml_vk_find_queue_family_index(queue_family_props, vk::QueueFlagBits::eTransfer, vk::QueueFlagBits::eCompute | graphics_flag, compute_queue_family_index, 1);
++        const uint32_t transfer_queue_family_index = device->mcdma ? compute_queue_family_index : ggml_vk_find_queue_family_index(queue_family_props, vk::QueueFlagBits::eTransfer, vk::QueueFlagBits::eCompute | graphics_flag, compute_queue_family_index, 1);
+ 
+         const float priorities[] = { 1.0f, 1.0f };
+-        device->single_queue = compute_queue_family_index == transfer_queue_family_index && queue_family_props[compute_queue_family_index].queueCount == 1;
++        device->single_queue = device->mcdma || (compute_queue_family_index == transfer_queue_family_index && queue_family_props[compute_queue_family_index].queueCount == 1);
+ 
+         std::vector<vk::DeviceQueueCreateInfo> device_queue_create_infos;
+         vk::DeviceCreateInfo device_create_info{};
+@@ -4439,6 +4456,11 @@ vk_device ggml_vk_get_device(size_t idx) {
+         if (device->external_memory_host) {
+             device_extensions.push_back("VK_EXT_external_memory_host");
+         }
++        if (device->mcdma) {
++            device_extensions.push_back("VK_KHR_external_memory_fd");
++            device_extensions.push_back("VK_EXT_external_memory_dma_buf");
++            device_extensions.push_back("VK_EXT_queue_family_foreign");
++        }
+ 
+ #if defined(VK_EXT_shader_64bit_indexing)
+         VkPhysicalDeviceShader64BitIndexingFeaturesEXT shader_64bit_indexing_features {};
+@@ -4878,6 +4900,9 @@ vk_device ggml_vk_get_device(size_t idx) {
+         };
+ 
+         device->fence = device->device.createFence({});
++        if (device->mcdma) {
++            GGML_LOG_INFO("ggml_vulkan: MCDMA coherent DMA_BUF tensor allocator enabled, one queue family\n");
++        }
+ 
+         device->idx = idx;
+ 
+@@ -5441,6 +5466,10 @@ void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
+     if (vk_perf_logger_enabled) {
+         ctx->perf_logger = std::unique_ptr<vk_perf_logger>(new vk_perf_logger());
+     }
++    if (ctx->device->mcdma) {
++        std::lock_guard<std::recursive_mutex> guard(ctx->device->mutex);
++        ctx->device->mcdma_contexts.push_back(ctx);
++    }
+ 
+ #ifdef GGML_VULKAN_CHECK_RESULTS
+     const char* skip_checks = getenv("GGML_VULKAN_SKIP_CHECKS");
+@@ -12681,6 +12710,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
+ #endif
+ 
+     if (submit || last_node) {
++        if (last_node) ggml_vk_dma_graph_end(ctx, compute_ctx);
+         ggml_vk_ctx_end(compute_ctx);
+ 
+         // TODO probably it'd be better to pass a exit_node flag to ggml_vk_compute_forward
+@@ -12788,6 +12818,16 @@ void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
+ 
+ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
+     VK_LOG_DEBUG("ggml_vk_cleanup(" << ctx->name << ")");
++    ggml_vk_dma_context_cleanup(ctx);
++    if (ctx->device->mcdma) {
++        GGML_LOG_INFO("ggml_vulkan: MCDMA planned_acquires=%llu cold_acquires=%llu consumer_barriers=%llu host_barriers=%llu\n",
++            (unsigned long long)ctx->device->mcdma_planned_acquires, (unsigned long long)ctx->device->mcdma_cold_acquires,
++            (unsigned long long)ctx->device->mcdma_consumer_barriers, (unsigned long long)ctx->device->mcdma_host_barriers);
++        std::lock_guard<std::recursive_mutex> guard(ctx->device->mutex);
++        GGML_ASSERT(ctx->device->mcdma_leases == 0);
++        auto & contexts = ctx->device->mcdma_contexts;
++        contexts.erase(std::remove(contexts.begin(), contexts.end(), ctx), contexts.end());
++    }
+     // discard any unsubmitted command buffers
+     ctx->compute_ctx.reset();
+     // wait for any pending command buffers to finish
+@@ -12858,6 +12898,8 @@ bool ggml_backend_buffer_is_vk(ggml_backend_buffer_t buffer) {
+ void ggml_backend_vk_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+     VK_LOG_MEMORY("ggml_backend_vk_buffer_free_buffer()");
+     ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
++    GGML_ASSERT(ctx->dev_buffer->device == nullptr || ctx->dev_buffer->device->mcdma_leases == 0);
++    ggml_vk_dma_buffer_cleanup(ctx->dev_buffer);
+     ggml_vk_destroy_buffer(ctx->dev_buffer);
+     delete ctx;
+ }
+@@ -13365,6 +13407,7 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
+         }
+         ctx->compute_ctx.reset();
+     }
++    ggml_vk_dma_synchronized(ctx);
+ }
+ 
+ static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
+@@ -14107,6 +14150,7 @@ static int32_t find_first_set(uint32_t x) {
+ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
+     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
++    GGML_ASSERT(ctx->device->mcdma_leases == 0);
+ 
+     ctx->device->diag_cgraph = nullptr;
+     ctx->device->diag_prev_start = -1;
+@@ -14170,6 +14214,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         ggml_vk_sync_buffers(ctx, compute_ctx);
+     }
+ 
++    ggml_vk_dma_graph_begin(ctx);
++
+     ctx->prealloc_y_last_pipeline_used = nullptr;
+     ctx->prealloc_y_last_tensor_used = nullptr;
+     ctx->prealloc_y_last_k_padded = false;
