@@ -1,7 +1,7 @@
 {
   "base_commit": "4da6337767f973e2b4d0797e5b323d77d8565e4a",
   "backend_abi": 3,
-  "patch_sha256": "9f6abde1f4780aa7f4bfa9399084fee1bd08558a054400f800ba39819d0d857f",
+  "patch_sha256": "baadaa61bee089bc1bbb94c7975a67fb16999e2d368f16c2b7e85de3e3ebd633",
   "files": [
     {
       "path": "ggml/src/ggml-backend-impl.h",
@@ -76,7 +76,7 @@
     {
       "path": "ggml/src/ggml-vulkan/ggml-vulkan.cpp",
       "before_sha256": "9db78aa3fe75dc1de2037f3a7990d6fdb95eb20fbdb8109153fd1d4c46697926",
-      "after_sha256": "248e910e9f4e1f768f826b2ed934c765f9a9805f3114bb01460b6c2d950c442a"
+      "after_sha256": "c47df744bfa22c93c275d1313c2ad70e042185fd57bcfe0f9a7bb7da417ccd23"
     }
   ],
   "scope": "Linux two-peer CUDA RPC server and local Vulkan client; GPU tensor payload uses registered compute storage"

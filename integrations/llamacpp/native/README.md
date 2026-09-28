@@ -21,6 +21,18 @@ Control graph commands also use RDMA, with TCP restricted to bootstrap and peer
 liveness. Legacy serialized SET/GET tensor payloads and TCP transport fallback
 are rejected in native mode.
 
+Native Vulkan completion polling uses one group of ten CPU pause instructions
+between fence checks, reducing the delay before observing a completed GPU graph.
+The previous 100-group backoff took about 13 microseconds on the tested Strix
+CPU. This changes CPU polling frequency, not GPU/NIC synchronization or payload
+access, and can increase CPU use and power. Set `MCDMA_VK_FENCE_PAUSE_GROUPS=100`
+before starting the process to restore the previous backoff; decimal values
+from 0 through 100 are accepted. The default outside `GGML_MCDMA=1` remains 100,
+and the override is ignored there. Both settings are read once and must remain
+unchanged for the process lifetime. See the
+[polling validation](../../../docs/validation-2026-09-28-native-polling.md) for
+matched measurements and the remaining latency limit.
+
 Use fresh builds on both hosts; ABI3 is incompatible with an unpatched backend
 library. The patch is distributed as an MCDMA integration under the original
 [llama.cpp MIT notice](LLAMA_LICENSE_MIT.txt); it is not an upstream release.
