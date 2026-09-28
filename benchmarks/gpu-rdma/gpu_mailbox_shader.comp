@@ -1,0 +1,30 @@
+#version 450
+// SPDX-License-Identifier: Apache-2.0
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) buffer Payload { uint words[]; };
+layout(set = 0, binding = 1, std430) buffer Errors { uint errors; };
+layout(push_constant) uniform Parameters {
+    uint operation;
+    uint total_bytes;
+    uint payload_bytes;
+    uint sequence;
+    uint kind;
+} p;
+uint value(uint i) {
+    if (i >= p.payload_bytes) return 211u;
+    uint salt = p.sequence ^ (p.sequence >> 8) ^ (p.sequence >> 16) ^ (p.sequence >> 24);
+    return (i * (p.kind == 1u ? 37u : 53u) + salt * (p.kind == 1u ? 19u : 101u) + p.kind * 13u) & 255u;
+}
+void main() {
+    uint word = gl_GlobalInvocationID.x;
+    if (word >= p.total_bytes / 4u) return;
+    uint expected = 0u;
+    for (uint b = 0u; b < 4u; ++b) expected |= value(word * 4u + b) << (b * 8u);
+    if (p.operation == 1u) words[word] = expected;
+    else {
+        uint difference = words[word] ^ expected;
+        uint bad = 0u;
+        for (uint b = 0u; b < 4u; ++b) if (((difference >> (b * 8u)) & 255u) != 0u) ++bad;
+        if (bad != 0u) atomicAdd(errors, bad);
+    }
+}

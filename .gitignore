@@ -1,5 +1,6 @@
 # Generated output and local environments
 /build/
+/benchmarks/gpu-rdma/build/
 /results/
 /local/
 /.private/

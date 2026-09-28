@@ -37,15 +37,28 @@ MCDMA is an experimental native macOS RDMA driver and userspace verbs provider f
 
 ## Integration with inference engines
 
-MCDMA provides the RDMA driver and verbs transport. Using that transport for inference requires further integration in engines and frameworks such as **oMLX, MLX-LM and llama.cpp**, through their memory allocators and communication backends. The runtime needs to allocate transferred tensors in GPU-accessible memory that can also be registered for RDMA, retain those allocations and registrations until transfers finish, and synchronize GPU execution with transfer completion.
+Linux CUDA and Vulkan applications can now share GPU-accessible communication
+memory through optional GPU wrappers and Linux DMA-BUF registration; the GPU-generated,
+GPU-verified RDMA test exercises READ and WRITE from both machines without a
+payload staging copy. Start with the [CUDA/Vulkan setup guide](docs/cuda-vulkan.md)
+and [public GPU APIs](rpc/gpu/README.md). This path uses GPU-accessible host
+allocations and does not enable GPUDirect access to existing GB10 `cudaMalloc`
+storage.
+
+The [28 September report](docs/validation-2026-09-28-cuda-vulkan.md) records
+GPU-only payload checks through separate daemon/application processes, plus
+Qwen3-8B prefill/decode handoff and actual CUDA/Vulkan TP=2 measurements through
+the explicitly host-staged model adapter.
+
+MCDMA provides the RDMA driver and verbs transport. Using that transport without payload staging in inference requires further integration in engines and frameworks such as **oMLX, MLX-LM and llama.cpp**, through their memory allocators and communication backends. The runtime needs to allocate transferred tensors in GPU-accessible memory that can also be registered for RDMA, retain those allocations and registrations until transfers finish, and synchronize GPU execution with transfer completion.
 
 Separate functional tests have verified RDMA WRITE and READ in both initiation directions using Metal shared buffers and CUDA mapped host allocations. GPU kernels produced and checked the payload in the same allocations registered with RDMA, without a payload staging copy. These tests establish GPU access to the transferred memory; the latency table above measures ordinary host buffers and is not an inference or GPU-buffer benchmark. The CPU still schedules GPU work and manages RDMA operations.
 
 Installing MCDMA alone does not connect an inference engine to this path. Direct registration of an existing `cudaMalloc` allocation still fails on the tested Spark, and direct access to Metal private buffers remains unverified; the verified approach is to create the transferred tensors in compatible shared allocations from the outset.
 
-**I have submitted a pull request to oMLX that uses MCDMA:** [jundot/omlx#3869](https://github.com/jundot/omlx/pull/3869). In a Mac and CUDA ring deployment it carries the pipeline hand-off from a CUDA worker to the Mac through the link daemon described below, once oMLX has proven the link live; otherwise the launch uses oMLX's TCP ring as before. The pull request is awaiting review and has not yet run on ConnectX hardware. It does not include the allocation support for the shared GPU-accessible memory path described above, which is still to come.
+**I have submitted a pull request to oMLX that uses MCDMA:** [jundot/omlx#3869](https://github.com/jundot/omlx/pull/3869). In a Mac and CUDA ring deployment it carries the pipeline hand-off from a CUDA worker to the Mac through the link daemon described below, once oMLX has proven the link live; otherwise the launch uses oMLX's TCP ring as before. The pull request merged on 2026-09-23; its original validation was offline, and later hardware reports and follow-ups have their own scope. It does not include the allocation support for the shared GPU-accessible memory path described above, which is still to come.
 
-The [link daemon](docs/link-daemon.md) is the transport for that kind of integration: applications on the Mac and on a Linux peer exchange requests and replies through shared-memory mailboxes, while only `mcdma-rpcd` holds queue pairs. It is compiled and offline-tested but has not yet run on hardware in this form.
+The [link daemon](docs/link-daemon.md) is the transport for that kind of integration: applications on the Mac and on a Linux peer exchange requests and replies through shared-memory mailboxes, while only `mcdma-rpcd` holds queue pairs. Protocol 1 now has Linux application and model-adapter hardware checks in the [28 September report](docs/validation-2026-09-28-cuda-vulkan.md); those checks do not establish a fresh Mac installation.
 
 [KV handoff](docs/kv-handoff.md) builds on it: a vLLM connector exports a finished prefill's KV cache over a link, so a decoder on the Mac can pull it instead of prefilling the prompt itself. It is offline-tested, not yet run on hardware.
 
@@ -218,7 +231,7 @@ I also have around **25 experiments planned for heterogeneous AI workloads**: pi
 
 The repository contains the native driver, userspace provider, build/setup tools and tests needed to validate CX5 RDMA. Runtime installation requires only the kernel extension, provider and provider configuration; the optional Metal keepalive runs separately. Historical benchmark archives, model-serving experiments, vendor firmware, SDK/KDK files, private installers and generated binaries are excluded.
 
-The portable setup has offline checks, but a fresh-machine installation following this recipe has not yet been completed. Foreign-QPN isolation and hot removal with mapped pages remain open; 12 client terminations during sustained traffic passed recovery checks on 0.1.18, but did not exercise the driver's fallback orphan reclaim because Apple's RDMA core cleaned up the resources itself. The provider is RC-only with 31 requests per queue; immediate data, fence and solicited flags, two-entry scatter lists and small inline sends have offline tests but remain unvalidated on hardware, while 4 MiB registrations have passed hardware checks and larger or heavily fragmented mappings remain unvalidated. The shared GPU-accessible buffer checks described above do not establish direct access to existing CUDA device allocations or Metal private buffers, inference-engine integration, universal ConnectX support or zero-CPU operation. Read [removal and recovery](docs/install.md#removal-and-recovery) before installation.
+The portable setup has offline checks, but a fresh-machine installation following this recipe has not yet been completed. Foreign-QPN isolation and hot removal with mapped pages remain open; 12 client terminations during sustained traffic passed recovery checks on 0.1.18, but did not exercise the driver's fallback orphan reclaim because Apple's RDMA core cleaned up the resources itself. The provider is RC-only with 31 requests per queue; immediate data, fence and solicited flags, two-entry scatter lists and small inline sends have offline tests but remain unvalidated on hardware, while 4 MiB registrations have passed hardware checks and larger or heavily fragmented mappings remain unvalidated. The shared GPU-accessible buffer checks described above do not establish direct access to existing CUDA device allocations or Metal private buffers, no-staging integration into an inference allocator, universal ConnectX support or zero-CPU operation. Read [removal and recovery](docs/install.md#removal-and-recovery) before installation.
 
 A sourced [comparison with MelonDMA](docs/comparison.md), checked 2026-09-15, lists what each project supports and what each has measured, including the verbs MCDMA does not yet implement.
 

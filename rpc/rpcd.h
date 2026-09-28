@@ -14,6 +14,12 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+/* The test define exercises FD ownership with a fake verbs implementation on
+ * any build host; it is never enabled by the production build. */
+#if defined(__linux__) || defined(MCDMA_RPC_TEST_DMABUF)
+#define MCDMA_RPC_HAS_DMABUF 1
+#endif
+
 #define PROTOCOL 1
 #define RELEASE "1.0.0"
 #ifndef MCDMA_RPC_BOX_DIR
@@ -66,6 +72,7 @@ struct ep {
     int nmr;
     union ibv_gid gid;
     int outstanding;               /* posted, not yet completed; nothing is destroyed while this is > 0 */
+    int cleanup_failed;             /* retained handles must not be replaced or released out of order */
 };
 
 struct piece {
@@ -120,8 +127,11 @@ const char *socket_path(const char *fallback);
 
 /* rpcd_verbs.c */
 struct ibv_mr *ep_reg(struct ep *e, void *addr, size_t len, int access);
+struct ibv_mr *ep_reg_dmabuf(struct ep *e, int fd, uint64_t offset, void *addr, size_t len, int access);
 void ep_destroy_qp(struct ep *e);
 void teardown_all(void);
+/* teardown_all exits 2 before returning to callers that would unmap memory if
+ * any destroy/deregister/deallocate operation failed. */
 void on_signal(int sig);
 int ep_open(struct ep *e, const char *device, int gid_index, int mtu);
 int ep_create_qp(struct ep *e);
@@ -137,5 +147,9 @@ void write_sizes(struct box *b);
 int run_listen(const char *name, const char *device, int gid_index, int mtu, struct in_addr bind_addr, int port,
                uint64_t req_bytes, uint64_t rep_bytes, const struct owner *owner);
 int run_connect(int npeers, char **specs, int direct);
+/* fd is borrowed; the single-peer Linux path retains its own CLOEXEC duplicate. */
+int run_connect_with_buffer(int npeers, char **specs, int direct, int fd);
+/* Optional read-only FIFO lease: EOF requests orderly shutdown. */
+int run_connect_with_fds(int npeers, char **specs, int direct, int buffer_fd, int parent_fd);
 
 #endif

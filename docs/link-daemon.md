@@ -5,8 +5,9 @@ MCDMA RDMA. Neither application opens a verbs context. Each one talks to its loc
 mailbox, and only the daemons hold queue pairs, so an application that crashes or is killed cannot leave a queue pair
 behind. `libmcdma-rpc` gives applications in any language the ordered word loads and stores the mailbox needs.
 
-Status: compiled and offline-tested with this repository's checks. It has not yet been run on hardware in this form;
-its transfer and teardown logic is carried over from an earlier, hardware-tested version.
+Status: protocol 1 now has Linux CUDA/Vulkan application and model-adapter hardware checks in the
+[28 September report](validation-2026-09-28-cuda-vulkan.md), plus offline lifetime tests. This does not establish
+a fresh Mac installation or every inference-engine integration on the same revision.
 
 ## Build and install
 
@@ -59,6 +60,16 @@ half into MLX through DLPack and copies large frames into its own buffers on the
 the caller's memory. Helpers built before these functions simply lack them, and callers fall back to a CPU copy.
 
 ## Status and shutdown
+
+On Linux, `connect --buffer-fd FD [--parent-fd PIPE_FD] PEER` can use one
+application-exported DMA-BUF instead of creating a POSIX mailbox. This optional
+single-peer mode registers the FD's existing allocation directly and never falls
+back to host registration or copies payload into a replacement buffer. The
+parent read-pipe lease requests orderly shutdown when its writer closes; the
+GPU owner must wait for successful daemon teardown before releasing storage.
+See the [CUDA/Vulkan guide](cuda-vulkan.md) for the allocation and launch order,
+and use a fresh dedicated listener for the bounded GPU application example.
+The default shared-memory route and protocol 1 remain available.
 
 ```bash
 printf 'STATUS\n' | nc -U /tmp/mcdma-rpcd.sock

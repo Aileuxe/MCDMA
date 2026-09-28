@@ -8,14 +8,32 @@
 #define _GNU_SOURCE 1
 #endif
 #include <infiniband/verbs.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#if defined(MCDMA_RPC_TEST_DMABUF) && defined(__APPLE__)
+#include <poll.h>
+#include <sys/ioctl.h>
+/* Darwin reports empty FIFO EOF as readable as well as hung up. The FD mode
+ * exists only on Linux in production; emulate Linux poll events on Mac tests,
+ * preserving POLLIN whenever an actual byte remains. This never consumes data
+ * or changes flags on the caller's descriptor. */
+short mcdma_rpc_test_parent_events(int fd, short events) {
+    int pending = -1;
+    if ((events & (POLLIN | POLLHUP)) == (POLLIN | POLLHUP) && !ioctl(fd, FIONREAD, &pending) && pending == 0)
+        events &= ~POLLIN;
+    return events;
+}
+#endif
 
-struct scq { struct ibv_cq cq; int pending; int destroyed; pthread_mutex_t mu; };
+struct scq { struct ibv_cq cq; int pending; int destroyed; int qps; pthread_mutex_t mu; };
 struct sqp { struct ibv_qp qp; int destroyed; int st; };
+struct spd { struct ibv_pd pd; int mrs, qps; };
+struct smr { struct ibv_mr mr; int dmabuf_fd; };
 
 static struct ibv_device g_dev[2];
 static int g_qpn = 100, g_key = 1000;
@@ -82,7 +100,10 @@ struct ibv_context *ibv_open_device(struct ibv_device *d) {
     c->ops.post_send = stub_post;
     return c;
 }
-int ibv_close_device(struct ibv_context *c) { free(c); return 0; }
+int ibv_close_device(struct ibv_context *c) {
+    if (getenv("STUB_FAIL_CLOSE_DEVICE")) return EBUSY;
+    free(c); return 0;
+}
 #undef ibv_query_port
 int ibv_query_port(struct ibv_context *c, uint8_t port, struct _compat_ibv_port_attr *a) {
     (void)c; (void)port;
@@ -97,22 +118,63 @@ int ibv_query_gid(struct ibv_context *c, uint8_t port, int index, union ibv_gid 
     g->raw[0] = 0xfe; g->raw[1] = 0x80; g->raw[15] = 1;
     return 0;
 }
-struct ibv_pd *ibv_alloc_pd(struct ibv_context *c) { struct ibv_pd *p = calloc(1, sizeof(*p)); p->context = c; return p; }
-int ibv_dealloc_pd(struct ibv_pd *p) { free(p); return 0; }
-struct ibv_mr *ibv_reg_mr_iova2(struct ibv_pd *pd, void *addr, size_t len, uint64_t iova, unsigned int access) {
-    (void)iova; (void)access;
-    struct ibv_mr *m = calloc(1, sizeof(*m));
+struct ibv_pd *ibv_alloc_pd(struct ibv_context *c) { struct spd *p = calloc(1, sizeof(*p)); p->pd.context = c; return &p->pd; }
+int ibv_dealloc_pd(struct ibv_pd *pd) {
+    struct spd *p = (struct spd *)pd;
+    if (p->mrs || p->qps) die("deallocate PD with retained MR/QP");
+    if (getenv("STUB_FAIL_DEALLOC_PD")) return EBUSY;
+    free(p); return 0;
+}
+static struct ibv_mr *make_mr(struct ibv_pd *pd, void *addr, size_t len, int fd) {
+    struct smr *storage = calloc(1, sizeof(*storage));
+    struct ibv_mr *m = &storage->mr;
+    storage->dmabuf_fd = fd;
     m->context = pd->context; m->pd = pd; m->addr = addr; m->length = len;
+    ((struct spd *)pd)->mrs++;
     pthread_mutex_lock(&g_mu);
     m->lkey = m->rkey = (uint32_t)g_key++;
     pthread_mutex_unlock(&g_mu);
     return m;
 }
+struct ibv_mr *ibv_reg_mr_iova2(struct ibv_pd *pd, void *addr, size_t len, uint64_t iova, unsigned int access) {
+    (void)iova; (void)access;
+    if (getenv("STUB_FORBID_HOST_REG")) die("unexpected host-memory registration fallback");
+    return make_mr(pd, addr, len, -1);
+}
 #undef ibv_reg_mr
 struct ibv_mr *ibv_reg_mr(struct ibv_pd *pd, void *addr, size_t len, int access) {
     return ibv_reg_mr_iova2(pd, addr, len, (uintptr_t)addr, (unsigned)access);
 }
-int ibv_dereg_mr(struct ibv_mr *m) { free(m); return 0; }
+int ibv_dereg_mr(struct ibv_mr *m) {
+    struct smr *storage = (struct smr *)m;
+    if (((struct spd *)m->pd)->qps) die("deregister MR while a QP is retained");
+    if (storage->dmabuf_fd >= 0) {
+        if (fcntl(storage->dmabuf_fd, F_GETFD) < 0) die("DMA-BUF descriptor closed before MR deregistration");
+        volatile unsigned char first = *(volatile unsigned char *)m->addr;
+        (void)first; /* A premature unmap must fail this test rather than pass. */
+        fprintf(stderr, "STUB_DMABUF_DEREG fd_alive=1 mapping_alive=1\n");
+    }
+    if (getenv("STUB_FAIL_DEREG_MR")) return EBUSY;
+    ((struct spd *)m->pd)->mrs--;
+    free(storage); return 0;
+}
+#ifdef MCDMA_RPC_TEST_DMABUF
+/* A regular temporary file substitutes for a DMA-BUF in offline ownership
+ * tests. This function does not claim hardware import or GPU compatibility. */
+struct ibv_mr *ibv_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset, size_t len, uint64_t iova, int fd, int access) {
+    (void)access;
+    static int calls;
+    calls++;
+    long page = sysconf(_SC_PAGESIZE);
+    off_t size = lseek(fd, 0, SEEK_END);
+    if (size < 0 || offset > (uint64_t)size || len > (uint64_t)size - offset ||
+        page <= 0 || iova % (uint64_t)page != offset % (uint64_t)page) die("invalid DMA-BUF registration geometry");
+    const char *fail_at = getenv("STUB_FAIL_DMABUF_AT");
+    if (fail_at && calls == atoi(fail_at)) { errno = ENOTSUP; return NULL; }
+    fprintf(stderr, "STUB_DMABUF_REG offset=%llu length=%zu\n", (unsigned long long)offset, len);
+    return make_mr(pd, (void *)(uintptr_t)iova, len, fd);
+}
+#endif
 struct ibv_cq *ibv_create_cq(struct ibv_context *ctx, int cqe, void *cq_context, struct ibv_comp_channel *ch, int vec) {
     (void)cq_context; (void)ch; (void)vec;
     if (cqe > 31) return NULL;
@@ -125,6 +187,8 @@ struct ibv_cq *ibv_create_cq(struct ibv_context *ctx, int cqe, void *cq_context,
 int ibv_destroy_cq(struct ibv_cq *cq) {
     struct scq *c = (struct scq *)cq;
     if (c->destroyed) die("double destroy of a CQ");
+    if (c->qps) die("destroy CQ while a QP is retained");
+    if (getenv("STUB_FAIL_DESTROY_CQ")) return EBUSY;
     c->destroyed = 1;          /* never freed, so later use is detected */
     return 0;
 }
@@ -132,6 +196,8 @@ struct ibv_qp *ibv_create_qp(struct ibv_pd *pd, struct ibv_qp_init_attr *init) {
     if (init->qp_type != IBV_QPT_RC || init->cap.max_send_wr > 31) return NULL;
     struct sqp *q = calloc(1, sizeof(*q));
     q->qp.context = pd->context; q->qp.pd = pd; q->qp.send_cq = init->send_cq; q->qp.recv_cq = init->recv_cq;
+    ((struct spd *)pd)->qps++;
+    ((struct scq *)init->send_cq)->qps++;
     pthread_mutex_lock(&g_mu);
     q->qp.qp_num = (uint32_t)g_qpn++;
     pthread_mutex_unlock(&g_mu);
@@ -143,6 +209,7 @@ int ibv_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *a, int mask) {
     if (q->destroyed) die("modify_qp on a destroyed QP");
     if (mask & IBV_QP_STATE) {
         if (a->qp_state == IBV_QPS_RTR && getenv("STUB_FAIL_RTR")) return 22;
+        if (a->qp_state == IBV_QPS_ERR && getenv("STUB_FAIL_QP_ERROR")) return EBUSY;
         q->st = a->qp_state;
     }
     return 0;
@@ -153,6 +220,9 @@ int ibv_destroy_qp(struct ibv_qp *qp) {
     const char *us = getenv("STUB_DESTROY_US");
     if (us) usleep((useconds_t)atoi(us));
     if (q->destroyed) die("double destroy of a QP (concurrent)");
+    if (getenv("STUB_FAIL_DESTROY_QP")) return EBUSY;
     q->destroyed = 1;
+    ((struct spd *)qp->pd)->qps--;
+    ((struct scq *)qp->send_cq)->qps--;
     return 0;
 }

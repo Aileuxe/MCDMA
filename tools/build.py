@@ -85,6 +85,10 @@ if len(sys.argv)>1 and sys.argv[1]=='test':
     run([sys.executable,'-B','tests/test_ndp_neighbor.py'])
     run([sys.executable,'-B','tests/test_bw_payload.py'])
     run([sys.executable,'-B','tests/test_bw_payload_trial.py'])
+    run(['make','-C','rpc/gpu','test'])
+    run([sys.executable,'-B','-m','unittest','discover','-s','tests','-p','test_gpu_rdma_runner.py'])
+    run([sys.executable,'-B','-m','unittest','discover','-s','benchmarks/gpu-rdma','-p','test_mailbox_app.py'])
+    run([sys.executable,'-B','-m','unittest','discover','-s','integrations/llamacpp','-p','test_*.py'])
     sys.exit(0)
 if len(sys.argv)>1 and sys.argv[1]=='native':
     ms=sdk('macosx')

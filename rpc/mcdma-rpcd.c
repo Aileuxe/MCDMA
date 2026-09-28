@@ -11,11 +11,19 @@
  *       write into the mailbox, so bind it to the address the Mac connects to and let only the Mac through the
  *       firewall. Started as root, --owner gives the mailbox and socket to USER, whose services then attach without
  *       root.
- *   mcdma-rpcd connect PEER...
+ *   mcdma-rpcd connect [--buffer-fd FD [--parent-fd FD]] PEER...
  *       The Mac end. PEER = name,host,port,device,gid_index,path_mtu[,req_mib,rep_mib]
  *       e.g. worker-a,192.0.2.21,18620,rdma_mcrdma0,0,4096,4,64
  *       One POSIX shared memory mailbox /mcdma-rpc.NAME and one thread per peer. The Unix socket
  *       /tmp/mcdma-rpcd.sock answers STATUS and SHUTDOWN (tears every verbs object down, then exits).
+ *       Linux-only --buffer-fd imports one caller-exported DMA-BUF for one peer,
+ *       without creating a POSIX mailbox or touching payload bytes. The caller
+ *       must supply coherent CPU/GPU memory and finish GPU work before publishing
+ *       requests. Only control pages are initialized; no GPU driver is loaded.
+ *       --parent-fd is a distinct read-only FIFO lease; parent EOF stops the
+ *       daemon normally, and unexpected data/errors stop it with a failure.
+ *       FD mode accepts one Unix control command per connection, with an
+ *       absolute five-second deadline and parent-lease polling throughout.
  *   mcdma-rpcd version
  *
  * MCDMA_RPCD_SOCKET replaces the Unix socket path. Mailboxes and sockets are owner-only: run the daemon as the user
@@ -62,6 +70,8 @@
 #include "rpcd.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
+#include <limits.h>
 #include <pwd.h>
 #include <signal.h>
 #include <stdio.h>
@@ -90,7 +100,7 @@ static int parse_bind(const char *text, struct in_addr *addr, int *port) {
 
 static int usage(void) {
     fprintf(stderr, "usage: mcdma-rpcd listen [--owner USER] NAME DEVICE GID_INDEX PATH_MTU [ADDR:]PORT [REQ_MIB REP_MIB]\n"
-                    "       mcdma-rpcd connect name,host,port,device,gid_index,path_mtu[,req_mib,rep_mib] ...\n"
+                    "       mcdma-rpcd connect [--buffer-fd FD [--parent-fd FD]] name,host,port,device,gid_index,path_mtu[,req_mib,rep_mib] ...\n"
                     "       mcdma-rpcd version\n");
     return 2;
 }
@@ -141,7 +151,20 @@ int main(int argc, char **argv) {
     }
     if (argc >= 3 && !strcmp(argv[1], "connect")) {
         const char *pull = getenv("MCDMA_RPC_PULL");
-        return run_connect(argc - 2, argv + 2, !(pull && !strcmp(pull, "1")));
+        char **arg = argv + 2;
+        int left = argc - 2, buffer_fd = -1, parent_fd = -1;
+        while (left >= 2 && (!strcmp(arg[0], "--buffer-fd") || !strcmp(arg[0], "--parent-fd"))) {
+            int *destination = !strcmp(arg[0], "--buffer-fd") ? &buffer_fd : &parent_fd;
+            if (*destination >= 0) return usage();
+            char *end = NULL;
+            errno = 0;
+            long fd = strtol(arg[1], &end, 10);
+            if (errno || !*arg[1] || *end || fd < 3 || fd > INT_MAX) return usage();
+            *destination = (int)fd;
+            arg += 2; left -= 2;
+        }
+        if (left < 1 || (parent_fd >= 0 && buffer_fd < 0) || (buffer_fd >= 0 && left != 1)) return usage();
+        return run_connect_with_fds(left, arg, !(pull && !strcmp(pull, "1")), buffer_fd, parent_fd);
     }
     return usage();
 }

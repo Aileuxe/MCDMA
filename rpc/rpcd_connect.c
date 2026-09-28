@@ -1,4 +1,4 @@
-/* mcdma-rpcd connect: the Mac end, one mailbox and one thread per peer link. */
+/* mcdma-rpcd connect: one mailbox and one thread per peer link. */
 #include "rpcd.h"
 
 #include <errno.h>
@@ -12,9 +12,14 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef MCDMA_RPC_CONTROL_SESSION_S
+#define MCDMA_RPC_CONTROL_SESSION_S IO_TIMEOUT_S
+#endif
 
 struct peer {
     char name[32], host[128], device[64];
@@ -22,6 +27,8 @@ struct peer {
     struct ep e;
     struct box b;
     int fd;
+    int external_buffer;             /* caller-exported Linux DMA-BUF; no POSIX shm name exists */
+    int buffer_fd;                   /* owned duplicate, kept past every MR deregistration */
     struct reader rd;
     int up;                        /* read by the control thread through __atomic loads */
     long long since;
@@ -39,13 +46,49 @@ static int g_npeers;
    off (MCDMARelaxedOrdering = No); MCDMA_RPC_PULL=1 falls back to READing the payload. */
 static int g_direct = 1;
 
-static void box_shm_name(const struct peer *p, char *out, size_t n) { snprintf(out, n, "/mcdma-rpc.%s", p->name); }
+static void box_shm_name(const struct peer *p, char *out, size_t n) { snprintf(out, n, "/mcdma-rpc.%.*s", (int)sizeof(p->name), p->name); }
 
 static int box_create(struct peer *p) {
+    uint64_t total = p->b.req + p->b.rep;
+    if (p->external_buffer) {
+#ifdef MCDMA_RPC_HAS_DMABUF
+        off_t size = lseek(p->buffer_fd, 0, SEEK_END);
+        if (size < 0 || (uint64_t)size < total) {
+            logf_("%s: DMA-BUF is not seekable or is smaller than the mailbox; no fallback", p->name);
+            return -1;
+        }
+        p->b.base = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, p->buffer_fd, 0);
+        if (p->b.base == MAP_FAILED) {
+            p->b.base = NULL;
+            logf_("%s: DMA-BUF shared mapping failed (%d); no fallback", p->name, errno);
+            return -1;
+        }
+        for (uint64_t off = 0; off < total; off += SEG) {
+            int access = off < p->b.req ? IBV_ACCESS_LOCAL_WRITE : IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE;
+            struct ibv_mr *mr = ep_reg_dmabuf(&p->e, p->buffer_fd, off, p->b.base + off, SEG, access);
+            if (!mr) {
+                logf_("%s: DMA-BUF segment %" PRIu64 " registration failed (%d); no fallback", p->name, (uint64_t)(off / SEG), errno);
+                return -1;
+            }
+            p->b.seg[p->b.nseg++] = mr;
+        }
+        /* Register first: the kernel must accept a genuine DMA-BUF before we
+         * write anything into a caller-supplied descriptor. Only control pages
+         * belong to the daemon; the application owns every payload byte. */
+        memset(p->b.base, 0, CTRL);
+        memset(p->b.base + p->b.req, 0, CTRL);
+        write_sizes(&p->b);
+        logf_("%s: DMA_BUF_MAILBOX bytes=%" PRIu64 " segments=%d control_bytes=%u payload_initialization=0",
+              p->name, total, p->b.nseg, (unsigned)(2 * CTRL));
+        return 0;
+#else
+        logf_("DMA-BUF mailboxes require Linux; no fallback");
+        return -1;
+#endif
+    }
     char name[64];
     box_shm_name(p, name, sizeof(name));
     shm_unlink(name);
-    uint64_t total = p->b.req + p->b.rep;
     int f = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
     if (f < 0 || ftruncate(f, (off_t)total)) {
         logf_("shm %s errno=%d", name, errno);
@@ -243,6 +286,7 @@ static void *peer_thread(void *arg) {
 static int parse_peer(const char *spec, struct peer *p) {
     memset(p, 0, sizeof(*p));
     p->fd = -1;
+    p->buffer_fd = -1;
     unsigned req_mib = 4, rep_mib = 4;
     int n = sscanf(spec, "%31[^,],%127[^,],%d,%63[^,],%d,%d,%u,%u", p->name, p->host, &p->port, p->device,
                    &p->gid_index, &p->mtu, &req_mib, &rep_mib);
@@ -258,12 +302,13 @@ static void connect_status(int fd) {
         struct peer *p = &g_peers[i];
         int up = __atomic_load_n(&p->up, __ATOMIC_ACQUIRE);
         snprintf(out, sizeof(out),
-                 "PEER %s %s calls %" PRIu64 " failures %" PRIu64 " MiB %" PRIu64
-                 " host=%s port=%d device=%s req_mib=%" PRIu64 " rep_mib=%" PRIu64 " since=%lld",
-                 p->name, up ? "up" : "down", __atomic_load_n(&p->calls, __ATOMIC_RELAXED),
+                 "PEER %.*s %s calls %" PRIu64 " failures %" PRIu64 " MiB %" PRIu64
+                 " host=%.*s port=%d device=%.*s req_mib=%" PRIu64 " rep_mib=%" PRIu64 " since=%lld%s",
+                 (int)sizeof(p->name), p->name, up ? "up" : "down", __atomic_load_n(&p->calls, __ATOMIC_RELAXED),
                  __atomic_load_n(&p->failures, __ATOMIC_RELAXED), __atomic_load_n(&p->bytes, __ATOMIC_RELAXED) >> 20,
-                 p->host, p->port, p->device, p->b.req >> 20, p->b.rep >> 20,
-                 up ? __atomic_load_n(&p->since, __ATOMIC_RELAXED) : 0);
+                 (int)sizeof(p->host), p->host, p->port, (int)sizeof(p->device), p->device, p->b.req >> 20, p->b.rep >> 20,
+                 up ? __atomic_load_n(&p->since, __ATOMIC_RELAXED) : 0,
+                 p->external_buffer ? " memory=dmabuf" : "");
         send_line(fd, out);
     }
     send_line(fd, "END");
@@ -272,16 +317,113 @@ static void connect_status(int fd) {
 /* Remove the mailboxes of the first `count` peers after a failed start or at exit. */
 static void unlink_boxes(int count) {
     for (int i = 0; i < count; ++i) {
+        if (g_peers[i].external_buffer) continue;
         char name[64];
         box_shm_name(&g_peers[i], name, sizeof(name));
         shm_unlink(name);
     }
 }
 
-int run_connect(int npeers, char **specs, int direct) {
-    if (npeers > MAX_PEERS) {
+static int release_boxes(int count) {
+    int failed = 0;
+    for (int i = 0; i < count; ++i) {
+        struct peer *p = &g_peers[i];
+        if (p->b.base) {
+            if (munmap(p->b.base, p->b.req + p->b.rep)) failed = 1;
+            else p->b.base = NULL;
+        }
+        if (p->buffer_fd >= 0) {
+            if (close(p->buffer_fd)) failed = 1;
+            p->buffer_fd = -1;
+        }
+    }
+    if (failed) logf_("mailbox mapping/descriptor cleanup failed");
+    return failed;
+}
+
+/* Readiness is the complete lease signal. Never read a borrowed FIFO: another
+ * reader could consume a ready byte before read(), turning shutdown into a
+ * blocking wait. Only bare HUP denotes an ordinary parent exit. */
+static int parent_lease_event(int fd, short events, int *failed) {
+#if defined(MCDMA_RPC_TEST_DMABUF) && defined(__APPLE__)
+    /* The optional transport is Linux-only; the Mac test double translates
+     * Darwin's EOF POLLIN|POLLHUP into Linux's bare POLLHUP without reading. */
+    extern short mcdma_rpc_test_parent_events(int fd, short events);
+    events = mcdma_rpc_test_parent_events(fd, events);
+#else
+    (void)fd;
+#endif
+    if (!events) return 0;
+    *failed = events != POLLHUP;
+    logf_(*failed ? "parent lease received unexpected data or failed; shutting down"
+                 : "parent lease closed; shutting down");
+    g_stop = 1;
+    return 1;
+}
+
+/* FD-backed sessions accept one command, with an absolute deadline independent
+ * of partial input. The accepted socket is ours, so making it nonblocking does
+ * not alter either caller-owned FD's shared file flags. Responses are also
+ * nonblocking; a client that will not read its answer is simply disconnected. */
+static int take_fd_control_line(struct reader *reader, char *line, size_t n, int lease_fd, int *lease_failed) {
+    int flags = fcntl(reader->fd, F_GETFL);
+    if (flags < 0 || fcntl(reader->fd, F_SETFL, flags | O_NONBLOCK) < 0) return -1;
+    uint64_t deadline = now_ns() + (uint64_t)MCDMA_RPC_CONTROL_SESSION_S * 1000000000ull;
+    while (!g_stop) {
+        uint64_t now = now_ns();
+        if (now >= deadline) {
+            logf_("FD-mode control session deadline expired");
+            return -1;
+        }
+        uint64_t remaining_ms = (deadline - now + 999999) / 1000000;
+        int timeout_ms = remaining_ms < 500 ? (int)remaining_ms : 500;
+        struct pollfd wait[2] = {{.fd = reader->fd, .events = POLLIN}, {.fd = lease_fd, .events = POLLIN}};
+        int polled = poll(wait, lease_fd >= 0 ? 2 : 1, timeout_ms);
+        if (polled < 0) {
+            if (errno == EINTR) continue;
+            *lease_failed = 1;
+            g_stop = 1;
+            logf_("FD-mode control/parent polling failed (%d)", errno);
+            return -1;
+        }
+        if (lease_fd >= 0 && parent_lease_event(lease_fd, wait[1].revents, lease_failed)) return -1;
+        if (wait[0].revents & (POLLERR | POLLNVAL)) return -1;
+        if (wait[0].revents & (POLLIN | POLLHUP)) {
+            int got = take_line(reader, line, n, 0);
+            if (got != 0) return got;
+        }
+    }
+    return -1;
+}
+
+int run_connect_with_fds(int npeers, char **specs, int direct, int buffer_fd, int parent_fd) {
+    if (npeers < 1 || npeers > MAX_PEERS) {
         logf_("at most %d peers", MAX_PEERS);
         return 2;
+    }
+    if (buffer_fd >= 0) {
+#ifndef MCDMA_RPC_HAS_DMABUF
+        logf_("--buffer-fd requires Linux DMA-BUF support; no fallback");
+        return 2;
+#else
+        if (npeers != 1 || buffer_fd < 3) {
+            logf_("--buffer-fd requires one peer and a descriptor of at least 3");
+            return 2;
+        }
+        if (fcntl(buffer_fd, F_GETFD) < 0) {
+            logf_("--buffer-fd is not an open descriptor");
+            return 2;
+        }
+#endif
+    }
+    if (parent_fd >= 0) {
+        struct stat info;
+        int flags = fcntl(parent_fd, F_GETFL);
+        if (buffer_fd < 0 || npeers != 1 || parent_fd < 3 || parent_fd == buffer_fd ||
+            flags < 0 || (flags & O_ACCMODE) != O_RDONLY || fstat(parent_fd, &info) || !S_ISFIFO(info.st_mode)) {
+            logf_("--parent-fd requires a distinct read-only FIFO and single-peer --buffer-fd mode");
+            return 2;
+        }
     }
     g_direct = direct;
     for (int i = 0; i < npeers; ++i) {
@@ -295,6 +437,14 @@ int run_connect(int npeers, char **specs, int direct) {
                 return 2;
             }
     }
+    if (buffer_fd >= 0) g_peers[0].external_buffer = 1;
+    if (buffer_fd >= 0) {
+        off_t size = lseek(buffer_fd, 0, SEEK_END);
+        if (size < 0 || (uint64_t)size < g_peers[0].b.req + g_peers[0].b.rep) {
+            logf_("--buffer-fd is not seekable or is smaller than the mailbox");
+            return 2;
+        }
+    }
     /* locks and the socket come before any device or mailbox, so a running daemon is never orphaned */
     for (int i = 0; i < npeers; ++i)
         if (hold_link_lock(g_peers[i].name) < 0) return 2;
@@ -305,6 +455,26 @@ int run_connect(int npeers, char **specs, int direct) {
     }
     int us = unix_listen(sock_path);
     if (us < 0) return 2;
+    int lease_fd = -1;
+    if (parent_fd >= 0) {
+        lease_fd = fcntl(parent_fd, F_DUPFD_CLOEXEC, 3);
+        if (lease_fd < 0) {
+            logf_("--parent-fd descriptor duplication failed (%d)", errno);
+            close(us);
+            unlink(sock_path);
+            return 2;
+        }
+    }
+    if (buffer_fd >= 0) {
+        g_peers[0].buffer_fd = fcntl(buffer_fd, F_DUPFD_CLOEXEC, 3);
+        if (g_peers[0].buffer_fd < 0) {
+            logf_("--buffer-fd descriptor duplication failed (%d)", errno);
+            close(us);
+            unlink(sock_path);
+            if (lease_fd >= 0) close(lease_fd);
+            return 2;
+        }
+    }
     for (int i = 0; i < npeers; ++i) {
         struct peer *p = &g_peers[i];
         g_npeers = i + 1;
@@ -313,6 +483,8 @@ int run_connect(int npeers, char **specs, int direct) {
             close(us);
             unlink(sock_path);
             teardown_all();
+            release_boxes(g_npeers);
+            if (lease_fd >= 0) close(lease_fd);
             return 2;
         }
     }
@@ -327,10 +499,19 @@ int run_connect(int npeers, char **specs, int direct) {
     }
     char *line = malloc(LINE);
     static struct reader rd;
+    int lease_failed = 0;
     while (!g_stop && line) {
         /* a short tick, so a signal that lands on any thread still ends the loop promptly */
-        struct pollfd wait = {.fd = us, .events = POLLIN};
-        if (poll(&wait, 1, 500) <= 0) continue;
+        struct pollfd wait[2] = {{.fd = us, .events = POLLIN}, {.fd = lease_fd, .events = POLLIN}};
+        int polled = poll(wait, lease_fd >= 0 ? 2 : 1, 500);
+        if (polled < 0 && errno != EINTR) {
+            lease_failed = 1;
+            logf_("connect control/parent polling failed (%d)", errno);
+            break;
+        }
+        if (polled <= 0) continue;
+        if (lease_fd >= 0 && parent_lease_event(lease_fd, wait[1].revents, &lease_failed)) break;
+        if (!(wait[0].revents & POLLIN)) continue;
         int fd = accept(us, NULL, NULL);
         if (fd < 0) {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
@@ -340,7 +521,10 @@ int run_connect(int npeers, char **specs, int direct) {
         set_io_timeout(fd, IO_TIMEOUT_S);
         memset(&rd, 0, sizeof(rd));
         rd.fd = fd;
-        while (take_line(&rd, line, LINE, 1) == 1) {
+        while (!g_stop) {
+            int got = buffer_fd >= 0 ? take_fd_control_line(&rd, line, LINE, lease_fd, &lease_failed)
+                                     : take_line(&rd, line, LINE, 1);
+            if (got != 1) break;
             if (!strcmp(line, "STATUS")) {
                 connect_status(fd);
             } else if (!strcmp(line, "SHUTDOWN")) {
@@ -350,6 +534,7 @@ int run_connect(int npeers, char **specs, int direct) {
             } else {
                 send_line(fd, "ERR unknown command");
             }
+            if (buffer_fd >= 0) break; /* one bounded command per FD-mode session */
         }
         close(fd);
     }
@@ -361,6 +546,17 @@ int run_connect(int npeers, char **specs, int direct) {
     close(us);
     unlink(sock_path);
     teardown_all();
+    int cleanup = release_boxes(g_npeers);
+    if (lease_fd >= 0 && close(lease_fd)) cleanup = 1;
+    if (cleanup || lease_failed) return 2;
     logf_("connect: every verbs object destroyed, exiting");
     return started < g_npeers ? 2 : 0;
+}
+
+int run_connect_with_buffer(int npeers, char **specs, int direct, int buffer_fd) {
+    return run_connect_with_fds(npeers, specs, direct, buffer_fd, -1);
+}
+
+int run_connect(int npeers, char **specs, int direct) {
+    return run_connect_with_buffer(npeers, specs, direct, -1);
 }

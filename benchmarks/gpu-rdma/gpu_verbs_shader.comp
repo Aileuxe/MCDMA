@@ -1,0 +1,54 @@
+#version 450
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) buffer Payload { uint words[]; };
+layout(set = 0, binding = 1, std430) buffer Errors { uint errors; };
+layout(push_constant) uniform Parameters {
+    uint operation;
+    uint offset;
+    uint byte_count;
+    uint p0;
+    uint p1;
+    uint p2;
+    uint seed;
+} parameters;
+
+uint value(uint byte_index, uint pattern) {
+    if (pattern == 1) return (byte_index * 37u + 19u + parameters.seed) & 255u;
+    if (pattern == 2) return (byte_index * 53u + 101u + parameters.seed) & 255u;
+    if (pattern == 3) return 165u;
+    return 211u;
+}
+
+void main() {
+    uint word = gl_GlobalInvocationID.x;
+    if (word >= 6144u) return;
+    if (parameters.operation == 0u) {
+        words[word] = 0xd3d3d3d3u;
+        return;
+    }
+    if (parameters.operation == 1u) {
+        uint start = 4096u + parameters.offset;
+        uint byte_index = word * 4u;
+        if (byte_index < start || byte_index >= start + parameters.byte_count) return;
+        uint packed = 0u;
+        for (uint b = 0u; b < 4u; ++b)
+            packed |= value(byte_index + b - start, parameters.p0) << (b * 8u);
+        words[word] = packed;
+        return;
+    }
+    uint actual = words[word];
+    uint mismatches = 0u;
+    for (uint b = 0u; b < 4u; ++b) {
+        uint byte_index = word * 4u + b;
+        uint expected = 211u;
+        if (byte_index >= 4096u && byte_index < 16384u) {
+            uint relative = byte_index - 4096u;
+            uint slot = relative / 4096u;
+            uint offset = relative % 4096u;
+            uint pattern = slot == 0u ? parameters.p0 : slot == 1u ? parameters.p1 : parameters.p2;
+            if (offset < parameters.byte_count) expected = value(offset, pattern);
+        }
+        if (((actual >> (b * 8u)) & 255u) != expected) ++mismatches;
+    }
+    if (mismatches != 0u) atomicAdd(errors, mismatches);
+}

@@ -23,6 +23,9 @@ static char g_name[32], g_sock[104];
 static unsigned char *g_peerbuf;
 static volatile uint64_t g_mac_reply;
 static volatile int g_finished, g_passed;
+static int g_buffer_fd = -1;
+
+static int race_mode(void) { return !strcmp(g_mode, "race") || !strcmp(g_mode, "dmabuf"); }
 
 static int read_line(int fd, char *out, size_t n) {
     size_t at = 0;
@@ -67,7 +70,7 @@ static void *fake_listen(void *arg) {
             if (WORD_SEQ(w) && WORD_SEQ(w) != last) {
                 last = WORD_SEQ(w);
                 unsigned char *mac = (unsigned char *)(uintptr_t)g_mac_reply;
-                if (!strcmp(g_mode, "race")) {
+                if (race_mode()) {
                     memcpy(mac + CTRL, "pong", 4);
                     store_word((volatile uint64_t *)(mac + 64), WORD(last, 4));
                 } else if (!strcmp(g_mode, "pullcrash")) {
@@ -81,6 +84,10 @@ static void *fake_listen(void *arg) {
 }
 
 static unsigned char *map_mailbox(void) {
+    if (g_buffer_fd >= 0) {
+        void *memory = mmap(NULL, 8u << 20, PROT_READ | PROT_WRITE, MAP_SHARED, g_buffer_fd, 0);
+        return memory == MAP_FAILED ? NULL : memory;
+    }
     char shm[64];
     snprintf(shm, sizeof(shm), "/mcdma-rpc.%s", g_name);
     int f = -1;
@@ -113,10 +120,19 @@ static void *client(void *arg) {
     uint64_t deadline = now_ns() + 5000000000ull;
     while (load_word(up) != 1)
         if (now_ns() > deadline) return NULL;
+    if (g_buffer_fd >= 0) {
+        /* The imported allocation was filled before daemon startup; no payload
+         * byte, including the old prefault loop's page starts, may be touched. */
+        for (size_t i = CTRL; i < (8u << 20); ++i) {
+            if (i >= (4u << 20) && i < (4u << 20) + CTRL) continue;
+            if (b[i] != 0xa7) { fprintf(stderr, "dmabuf: daemon modified a payload byte\n"); return NULL; }
+        }
+    }
     memcpy(b + CTRL, "hello", 5);
     store_word(req, WORD(1, 5));
-    if (!strcmp(g_mode, "race")) {
+    if (race_mode()) {
         g_passed = wait_word(done, 1, 1, 2000);
+        if (g_passed && memcmp(b + (4u << 20) + CTRL, "pong", 4)) g_passed = 0;
         if (!g_passed) fprintf(stderr, "race: a request staged right after link-up was lost\n");
     } else if (!strcmp(g_mode, "pullcrash")) {
         g_passed = wait_word(up, 0, 0, 5000);
@@ -172,6 +188,15 @@ int main(int argc, char **argv) {
     snprintf(g_name, sizeof(g_name), "t%dc", (int)getpid());
     snprintf(g_sock, sizeof(g_sock), "/tmp/rpcd-test-%d.sock", (int)getpid());
     setenv("MCDMA_RPCD_SOCKET", g_sock, 1);
+    if (!strcmp(g_mode, "dmabuf")) {
+        char filename[] = "/tmp/rpcd-buffer-test-XXXXXX";
+        g_buffer_fd = mkstemp(filename);
+        if (g_buffer_fd < 0 || unlink(filename) || ftruncate(g_buffer_fd, 8u << 20)) return 2;
+        unsigned char *initial = mmap(NULL, 8u << 20, PROT_READ | PROT_WRITE, MAP_SHARED, g_buffer_fd, 0);
+        if (initial == MAP_FAILED) return 2;
+        memset(initial, 0xa7, 8u << 20);
+        munmap(initial, 8u << 20);
+    }
     g_peerbuf = calloc(1, 8u << 20);
     int ls = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in a;
@@ -188,8 +213,12 @@ int main(int argc, char **argv) {
     char spec[160];
     snprintf(spec, sizeof(spec), "%s,127.0.0.1,%d,stub0,0,4096", g_name, ntohs(a.sin_port));
     char *specs[1] = {spec};
-    int direct = !strcmp(g_mode, "race");
-    int rc = run_connect(1, specs, direct);
+    int direct = race_mode();
+    int rc = g_buffer_fd >= 0 ? run_connect_with_buffer(1, specs, direct, g_buffer_fd) : run_connect(1, specs, direct);
+    if (g_buffer_fd >= 0) {
+        if (fcntl(g_buffer_fd, F_GETFD) < 0) { fprintf(stderr, "dmabuf: borrowed descriptor was closed\n"); return 1; }
+        close(g_buffer_fd);
+    }
     g_finished = 1;
 #ifdef MCDMA_RPC_LOCK_DIR
     char lock[160];

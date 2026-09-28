@@ -1,5 +1,10 @@
 # Hardware validation
 
+For Linux CUDA/Vulkan transfers, use the [GPU setup guide](cuda-vulkan.md) and
+[28 September validation](validation-2026-09-28-cuda-vulkan.md). Those checks
+use stock Linux mlx5/rdma-core, anonymous host imports or Vulkan-owned DMA-BUF
+storage, and do not extend the macOS kernel-extension installation scope below.
+
 The default build does not enable PCI ownership. The [developer installation guide](install.md) covers setup and recovery; its portable procedure still needs a fresh-machine end-to-end check, and the original machine-specific installers are outside this tree.
 
 For an already approved lab installation, record the exact kernel UUID, OS build, SDK, provider/client hashes, NIC identity, firmware, physical link, Ethernet MTU and RC path MTU. Resolve each interface from its actual hardware identity after every restart rather than assuming its previous enumeration.

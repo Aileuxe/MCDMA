@@ -14,7 +14,7 @@ SHARED := -dynamiclib -install_name $(PREFIX)/lib/$(HELPER)
 HELPER_EXTRA := libmcdma_rpc_metal.m -fobjc-arc -framework Metal -framework Foundation
 else
 # shm_open lives in librt before glibc 2.34
-VERBS := -libverbs -lrt
+VERBS := -libverbs -lrt -ldl
 HELPER := libmcdma-rpc.so
 SHARED := -shared -fPIC
 endif
@@ -38,6 +38,10 @@ test: ../tests/test_rpc_helper.c ../tests/test_rpcd_socket.c libmcdma_rpc.c mcdm
 	$(CC) $(CFLAGS) -o $(OUT)/test-rpcd-socket ../tests/test_rpcd_socket.c rpcd_common.c
 	$(OUT)/test-rpcd-socket
 	cd .. && python3 -B tests/test_rpcd_daemon.py
+	$(MAKE) -C gpu test
+	cd .. && python3 -B -m unittest discover -s tests -p 'test_gpu_rdma_runner.py'
+	cd .. && python3 -B -m unittest discover -s benchmarks/gpu-rdma -p 'test_mailbox_app.py'
+	cd .. && python3 -B -m unittest discover -s integrations/llamacpp -p 'test_*.py'
 
 install: all
 	install -d $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/lib $(DESTDIR)$(PREFIX)/include
