@@ -1,14 +1,35 @@
 # MCDMA
 
-![MCDMA connecting a Mac Studio and NVIDIA DGX Spark over Thunderbolt 5 and ConnectX-5, with measured RDMA completion times](assets/mcdma.png)
+![MCDMA RDMA for Mac Studio, NVIDIA DGX Spark and AMD Strix Halo, with CLI 1.2.0 and macOS driver 0.1.18](assets/mcdma.png)
 
-*Measured host-memory RDMA with the Studio GPU active; shared Metal/CUDA buffer correctness was verified separately.*
+*Hero artwork uses official [Mac Studio](https://www.apple.com/newsroom/2025/03/apple-unveils-new-mac-studio-the-most-powerful-mac-ever/) and [DGX Spark](https://www.nvidia.com/en-us/products/workstations/dgx-spark/) product references and an AMD Strix Halo reference.*
+
+MCDMA now includes **AMD Strix Halo Linux hosts** alongside Mac Studio and NVIDIA DGX Spark. Strix/Spark bidirectional RDMA is hardware-verified; the Strix/Mac setup workflow is available and still needs physical validation.
+
+## New in CLI 1.2.0: Strix Halo and Linux endpoints
+
+Register Strix and other Linux RDMA hosts in the same MCDMA fabric, build the peer tool natively on x86-64 or ARM64, discover the connected RDMA port and GIDs, and verify READ and WRITE from both endpoints. Linux/Linux links use stock libibverbs; Mac/Linux links use the Mac's MCDMA driver and the Linux stock provider. The CPU submits work and observes NIC completions.
+
+Real Strix Halo and Spark tests passed all four transfer directions at 1 KiB and 4 KiB, with byte verification and clean teardown. The 29 September run measured these medians:
+
+The tested Strix host uses Ryzen AI Max+ 395 and Radeon 8060S on Linux x86-64, with a ConnectX-5 Ex adapter through USB4. The Spark uses NVIDIA GB10 on Linux ARM64 with ConnectX-7. The hero illustrates the supported device families; benchmark results apply to this tested configuration.
+
+| Initiator → peer | Payload | RDMA WRITE | RDMA READ |
+|---|---:|---:|---:|
+| Strix Halo → Spark | 1 KiB | 4.510 µs | 3.980 µs |
+| Spark → Strix Halo | 1 KiB | 2.704 µs | 4.640 µs |
+| Strix Halo → Spark | 4 KiB | 5.710 µs | 5.220 µs |
+| Spark → Strix Halo | 4 KiB | 3.168 µs | 5.024 µs |
+
+Each cell contains 1,000 measured samples after 100 warmups, at queue depth one and RDMA path MTU 1024. Timing starts at CPU posting and ends when the initiating application observes NIC completion. It excludes GPU work, memory registration and SSH bootstrap; GPU activity was uncontrolled. These are host-memory completion times, not one-way network or inference latency. See the [validation report and full statistics](docs/validation-2026-09-29-linux-endpoints.md).
+
+Use the [Linux endpoint guide](docs/linux-endpoints.md) to register and install Strix, test a Strix/Spark link, or map a Strix endpoint to a Mac port. Strix/Mac transfer and performance validation remain pending. GPU-buffer APIs and inference integration have separate validation requirements.
 
 ## What changed in 0.1.18
 
 **0.1.18 is the current development release**, with larger memory registrations, safer context cleanup, additional verbs support, lifecycle tests and bandwidth tooling. The 17 September update also restricts runtime setting changes to root and adds PCIe counter diagnostics. Hardware checks now include 12 process terminations during sustained traffic, concurrent transfers on both Spark links and measured sustained bandwidth; see the [validation and bandwidth report](docs/validation-2026-09-17.md).
 
-**CLI 1.1.0** prevents driver downgrades, checks package integrity, invalidates stale test results and verifies the requested posting mode; latency runs retain raw samples, and `mcdma bandwidth` runs the new throughput tool. See [all 0.1.18 changes and remaining checks](docs/release-0.1.18.md) and the [CLI guide](cli/README.md).
+**CLI 1.2.0** adds the Linux endpoint workflow above and retains driver downgrade protection, package integrity checks, stale-test invalidation and posting-mode verification. Latency runs retain raw samples, and `mcdma bandwidth` runs the throughput tool. The Mac driver remains 0.1.18. See [all 0.1.18 changes and remaining checks](docs/release-0.1.18.md) and the [CLI guide](cli/README.md).
 
 A speedup over 0.1.17 has **not** been measured in a matched comparison, and the original unattributed panic is not proven fixed. The latency table below remains the historical 0.1.17 result.
 
@@ -35,12 +56,6 @@ ConnectX-4 Lx PF (`15b3:1015`) is also accepted in source following a contributo
 
 MCDMA is an experimental native macOS RDMA driver and userspace verbs provider for Mellanox ConnectX-5 Ex, developed by **Ash Hart**. The NICs move the payload; the CPU still submits work and observes completions.
 
-CLI 1.2 adds Strix and other Linux RDMA endpoints to the same fabric: native
-peer-tool builds, observed port/GID discovery, Linux/Linux verification and
-reuse of existing Mac/Linux mappings. Linux uses stock verbs; see
-[Linux endpoint setup](docs/linux-endpoints.md). This transport support does
-not imply automatic inference integration or GPU-initiated networking.
-
 ## Integration with inference engines
 
 MCDMA provides the RDMA driver and verbs transport. Using that transport for inference requires further integration in engines and frameworks such as **oMLX, MLX-LM and llama.cpp**, through their memory allocators and communication backends. The runtime needs to allocate transferred tensors in GPU-accessible memory that can also be registered for RDMA, retain those allocations and registrations until transfers finish, and synchronize GPU execution with transfer completion.
@@ -59,9 +74,9 @@ A first end-to-end hand-off has run: **Qwen3-4B in MXFP4** was prefilled by vLLM
 
 ## Get started
 
-**New setup? Start with the [Mac and Spark user guide](docs/user-guide.md)** for hardware, Studio and candidate MacBook layouts, wiring diagrams, checkpoints and inference-engine setup, or give your agent the [setup runbook](docs/agent-setup.md).
+For Strix/Spark or Strix/Mac, start with the [Linux endpoint guide](docs/linux-endpoints.md). For a new Mac/Spark setup, use the [Mac and Spark user guide](docs/user-guide.md) for hardware, wiring and checkpoints, or give your agent the [setup runbook](docs/agent-setup.md).
 
-### Hardware used
+### Mac/Spark hardware used
 
 | Part | Tested setup |
 |---|---|
@@ -90,7 +105,7 @@ The agent can prepare the software and checks; Recovery security changes and mac
 
 [`cli/`](cli/README.md) holds **mcdma**, a command-line tool over the same
 checks and steps. It discovers the ConnectX card and its enclosure, the driver
-state, the Sparks and the cabling, then runs the remaining steps in order
+state, registered Spark/Linux endpoints and the cabling, then runs the remaining steps in order
 (driver install and approval, wiring detection by real RDMA transfers,
 addresses and neighbours persisted on both ends, transfer tests with latency)
 and can stream a per-link throughput monitor. `mcdma status --json` exposes all
