@@ -35,6 +35,9 @@ public:
     bool start();
     bool attach_and_start(IOPCIDevice *device, IOService *owner);
     IOReturn startup_error = kIOReturnSuccess;
+    uint16_t startup_page_phase = 0;
+    uint16_t startup_page_step = 0;
+    int32_t startup_page_count = 0;
     bool stop();
     bool port_active(bool &active);
     // PCIe performance counters: an ACCESS_REG query of MPCNT group 0. The

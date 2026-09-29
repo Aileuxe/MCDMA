@@ -13,7 +13,9 @@ struct Simulation {
     uint32_t next_id=1;
     uint64_t next_dma=0x40000000;
     uint16_t fail_opcode=0;
-    bool removed=false, timeout=false, bad_reclaim=false;
+    int32_t query_pages_count=2;
+    uint64_t fail_buffer_allocate_bytes=0;
+    bool removed=false, timeout=false, bad_reclaim=false, foreign_command_queue=false;
     // Lock-coupling regression gate: when set, the next port-status ACCESS_REG
     // reports arrival and blocks inside the fake firmware until the test
     // releases it, exactly like a stalled health query under the command lock.

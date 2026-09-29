@@ -9,6 +9,7 @@ using namespace cx5_test;
 namespace cx5_native {
 IOReturn Buffer::allocate(IOMapper *,uint64_t bytes) {
     assert(!cpu && bytes);
+    if (bytes==sim.fail_buffer_allocate_bytes) return kIOReturnNoMemory;
     size=(bytes+16383)&~uint64_t(16383);
     cpu=static_cast<uint8_t *>(calloc(1,size)); assert(cpu);
     memory=new IOBufferMemoryDescriptor;
@@ -26,7 +27,7 @@ IOReturn Buffer::release() {
 IOReturn Transport::attach(IOPCIDevice *,IOService *) { return kIOReturnSuccess; }
 IOReturn Transport::open() {
     // Match the real transport: a bound command queue cannot be opened twice.
-    if (bound_) return kIOReturnBusy;
+    if (bound_ || sim.foreign_command_queue) return kIOReturnBusy;
     if (!mcdma_supported_device(sim.vendor_id,sim.device_id)) return kIOReturnUnsupported;
     vendor_id_=sim.vendor_id; device_id_=sim.device_id;
     pci_=&sim.pci; sim.pci.inactive=&sim.removed;
@@ -84,7 +85,7 @@ bool Transport::execute(const uint8_t *in,size_t in_bytes,uint8_t *out,size_t ou
         assert(in_bytes==4112 && cx5::read_be32(in+4)==0 && !initialized); ++sim.set_caps;
         if (!sim.uar_pages_16k_supported) { last.firmware_status=1; return false; }
         sim.uar_page_log=unsigned(cx5::get_bits(in+16,4096,0x490,16)); break;
-    case 0x107: cx5::write_be32(out+8,1); cx5::write_be32(out+12,2); break;
+    case 0x107: cx5::write_be32(out+8,1); cx5::write_be32(out+12,uint32_t(sim.query_pages_count)); break;
     case 0x108: {
         const auto count=cx5::read_be32(in+12);
         if (cx5::read_be32(in+4)==1) {

@@ -31,9 +31,49 @@ void connect(Hca &hca,HardwareQP &qp) {
 void driver_startup() {
     reset(); Hca hca;
     // Same composition called by the real IOService, with fake PCI/firmware.
-    assert(hca.attach_and_start(nullptr,nullptr));
+    assert(hca.attach_and_start(nullptr,nullptr) && hca.startup_error==kIOReturnSuccess);
     assert(hca.transport.initialized && !sim.objects.empty());
     assert(hca.stop() && !sim.buffers);
+}
+void issue_9_page_query_without_firmware_error() {
+    reset(); sim.foreign_command_queue=true;
+    Hca boot_owned;
+    assert(!boot_owned.start());
+    assert(boot_owned.startup_error==kIOReturnBusy &&
+           boot_owned.startup_page_phase==0 && boot_owned.startup_page_step==0 &&
+           !sim.calls && !sim.buffers);
+    assert(boot_owned.stop());
+
+    // QUERY_PAGES succeeded, then a local validation or allocation failed.
+    // The issue's last-opcode/firmware fields alone cannot distinguish them.
+    reset(); sim.query_pages_count=8193;
+    Hca invalid_count;
+    assert(!invalid_count.start());
+    assert(invalid_count.transport.last.opcode==0x107 &&
+           invalid_count.transport.last.firmware_status==0);
+    assert(invalid_count.startup_error==kIOReturnBadArgument);
+    assert(invalid_count.startup_page_phase==1 &&
+           invalid_count.startup_page_step==2 &&
+           invalid_count.startup_page_count==8193);
+    assert(invalid_count.stop() && !sim.buffers);
+
+    reset(); sim.query_pages_count=-1;
+    Hca negative_count;
+    assert(!negative_count.start());
+    assert(negative_count.startup_error==kIOReturnBadArgument &&
+           negative_count.startup_page_step==2 && negative_count.startup_page_count==-1);
+    assert(negative_count.stop() && !sim.buffers);
+
+    reset(); sim.fail_buffer_allocate_bytes=8192;
+    Hca no_memory;
+    assert(!no_memory.start());
+    assert(no_memory.transport.last.opcode==0x107 &&
+           no_memory.transport.last.firmware_status==0);
+    assert(no_memory.startup_error==kIOReturnNoMemory);
+    assert(no_memory.startup_page_phase==1 &&
+           no_memory.startup_page_step==3 &&
+           no_memory.startup_page_count==2);
+    assert(no_memory.stop() && !sim.buffers);
 }
 void transport_access_guards() {
     reset(); Transport transport;
@@ -506,6 +546,7 @@ int main() {
     blueflame_guards_and_fallback();
     mtu_configuration();
     driver_startup();
+    issue_9_page_query_without_firmware_error();
     pcie_counters();
     lifecycle(); failed_create(false); failed_create(true); corrupt_completion(); corrupt_page_return();
     native_data_callbacks();
