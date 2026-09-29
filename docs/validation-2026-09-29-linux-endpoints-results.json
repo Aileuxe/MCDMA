@@ -1,0 +1,142 @@
+{
+  "schema": 1,
+  "observation_date": "2026-09-29",
+  "cli_version": "1.2.0",
+  "endpoint_a": "Strix Halo, Linux x86-64, ConnectX-5 Ex via USB4",
+  "endpoint_b": "NVIDIA GB10, Linux ARM64, ConnectX-7",
+  "payload_sizes": [
+    1024,
+    4096
+  ],
+  "path_mtu": 1024,
+  "samples_per_operation": 1000,
+  "warmup_per_operation": 100,
+  "measured_samples_total": 8000,
+  "timing_boundary": "CPU posting begins through application-observed NIC completion on the initiating host",
+  "cpu_submission": true,
+  "GPU_compute_included": false,
+  "registration_included": false,
+  "SSH_bootstrap_included": false,
+  "correctness_passed": true,
+  "cleanup_passed": true,
+  "statistics_us": {
+    "1024": {
+      "a": {
+        "write": {
+          "op": "write",
+          "bytes": 1024,
+          "samples": 1000,
+          "min": 4.46,
+          "median": 4.51,
+          "p95": 4.66,
+          "p99": 4.73,
+          "max": 120.44,
+          "mean": 4.728,
+          "warmup": 100,
+          "queueDepth": 1
+        },
+        "read": {
+          "op": "read",
+          "bytes": 1024,
+          "samples": 1000,
+          "min": 3.82,
+          "median": 3.98,
+          "p95": 4.01,
+          "p99": 4.05,
+          "max": 5.34,
+          "mean": 3.95,
+          "warmup": 100,
+          "queueDepth": 1
+        }
+      },
+      "b": {
+        "write": {
+          "op": "write",
+          "bytes": 1024,
+          "samples": 1000,
+          "min": 2.48,
+          "median": 2.704,
+          "p95": 3.248,
+          "p99": 3.296,
+          "max": 5.696,
+          "mean": 2.864,
+          "warmup": 100,
+          "queueDepth": 1
+        },
+        "read": {
+          "op": "read",
+          "bytes": 1024,
+          "samples": 1000,
+          "min": 4.128,
+          "median": 4.64,
+          "p95": 4.704,
+          "p99": 4.8,
+          "max": 15.584,
+          "mean": 4.51,
+          "warmup": 100,
+          "queueDepth": 1
+        }
+      }
+    },
+    "4096": {
+      "a": {
+        "write": {
+          "op": "write",
+          "bytes": 4096,
+          "samples": 1000,
+          "min": 5.66,
+          "median": 5.71,
+          "p95": 5.83,
+          "p99": 5.87,
+          "max": 6.45,
+          "mean": 5.717,
+          "warmup": 100,
+          "queueDepth": 1
+        },
+        "read": {
+          "op": "read",
+          "bytes": 4096,
+          "samples": 1000,
+          "min": 4.79,
+          "median": 5.22,
+          "p95": 5.27,
+          "p99": 5.41,
+          "max": 5.57,
+          "mean": 5.159,
+          "warmup": 100,
+          "queueDepth": 1
+        }
+      },
+      "b": {
+        "write": {
+          "op": "write",
+          "bytes": 4096,
+          "samples": 1000,
+          "min": 2.848,
+          "median": 3.168,
+          "p95": 3.312,
+          "p99": 3.344,
+          "max": 3.856,
+          "mean": 3.163,
+          "warmup": 100,
+          "queueDepth": 1
+        },
+        "read": {
+          "op": "read",
+          "bytes": 4096,
+          "samples": 1000,
+          "min": 4.944,
+          "median": 5.024,
+          "p95": 5.056,
+          "p99": 5.12,
+          "max": 8.864,
+          "mean": 5.025,
+          "warmup": 100,
+          "queueDepth": 1
+        }
+      }
+    }
+  },
+  "mac_driver_version_unchanged": "0.1.18",
+  "linux_nic_driver": "stock mlx5/libibverbs"
+}

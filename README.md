@@ -35,6 +35,12 @@ ConnectX-4 Lx PF (`15b3:1015`) is also accepted in source following a contributo
 
 MCDMA is an experimental native macOS RDMA driver and userspace verbs provider for Mellanox ConnectX-5 Ex, developed by **Ash Hart**. The NICs move the payload; the CPU still submits work and observes completions.
 
+CLI 1.2 adds Strix and other Linux RDMA endpoints to the same fabric: native
+peer-tool builds, observed port/GID discovery, Linux/Linux verification and
+reuse of existing Mac/Linux mappings. Linux uses stock verbs; see
+[Linux endpoint setup](docs/linux-endpoints.md). This transport support does
+not imply automatic inference integration or GPU-initiated networking.
+
 ## Integration with inference engines
 
 MCDMA provides the RDMA driver and verbs transport. Using that transport for inference requires further integration in engines and frameworks such as **oMLX, MLX-LM and llama.cpp**, through their memory allocators and communication backends. The runtime needs to allocate transferred tensors in GPU-accessible memory that can also be registered for RDMA, retain those allocations and registrations until transfers finish, and synchronize GPU execution with transfer completion.

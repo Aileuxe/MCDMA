@@ -9,6 +9,15 @@ const readline = require('readline');
 
 const SSH = '/usr/bin/ssh';
 let cmDir = null;
+let sshConfig = null;
+function setSshConfig(file) {
+  if (cmDir) throw new Error('Cannot change SSH configuration while connections are active');
+  if (file == null) { sshConfig = null; return; }
+  const resolved = path.resolve(file);
+  if (!fs.statSync(resolved).isFile()) throw new Error('SSH configuration must be a readable file');
+  fs.accessSync(resolved, fs.constants.R_OK);
+  sshConfig = resolved;
+}
 
 function sshBase() {
   if (!cmDir) {
@@ -17,6 +26,7 @@ function sshBase() {
     fs.chmodSync(cmDir, 0o700);
   }
   return [
+    ...(sshConfig ? ['-F', sshConfig] : []),
     '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', '-o', 'ServerAliveInterval=15',
     '-o', 'StrictHostKeyChecking=accept-new',
     '-o', 'ControlMaster=auto', '-o', `ControlPath=${cmDir}/%C`, '-o', 'ControlPersist=600'
@@ -157,4 +167,4 @@ function dispose(hosts) {
   cmDir = null;
 }
 
-module.exports = { run, sh, ssh, sshEnd, adminRun, setPrivilegeRunner, sudoRunner, runInherit, Host, Endpoint, dispose };
+module.exports = { run, sh, ssh, sshEnd, adminRun, setPrivilegeRunner, setSshConfig, sudoRunner, runInherit, Host, Endpoint, dispose };

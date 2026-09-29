@@ -142,6 +142,26 @@ static int benchmark(struct ibv_qp *qp,struct ibv_cq *cq,struct ibv_mr *mr,
 }
 int main(int argc,char **argv) {
     setvbuf(stdout,NULL,_IOLBF,0);
+    if (argc==2 && !strcmp(argv[1],"--version")) {
+#if defined(__linux__) && !defined(__APPLE__)
+        puts("MCDMA_VERBS_PEER abi=1 platform=linux stock_initiator=1 stock_responder=1");
+#elif defined(__APPLE__)
+        puts("MCDMA_VERBS_PEER abi=1 platform=macos stock_initiator=0");
+#else
+        puts("MCDMA_VERBS_PEER abi=1 platform=unsupported stock_initiator=0");
+#endif
+        return 0;
+    }
+    unsigned rdma_port=1;
+    const char *port_number=getenv("MCDMA_RDMA_PORT");
+    if (port_number) {
+        char *end=NULL;
+        unsigned long parsed=strtoul(port_number,&end,10);
+        if (!*port_number || strspn(port_number,"0123456789")!=strlen(port_number) || *end || parsed<1 || parsed>255) {
+            fputs("RDMA port must be an integer from 1 through 255\n",stderr); return 2;
+        }
+        rdma_port=(unsigned)parsed;
+    }
     const char *bytes=getenv("MCDMA_PAYLOAD_BYTES");
     if (bytes && strcmp(bytes,"1024") && strcmp(bytes,"4096")) {
         fputs("Payload must be 1024 or 4096 bytes\n",stderr); return 2;
@@ -168,34 +188,62 @@ int main(int argc,char **argv) {
     fprintf(stderr,"BENCHMARK_THREAD qos_request=%s qos_actual=0x%x relative=%d profile=%d\n",
             qos?qos:"inherit",(unsigned)actual,relative,profile_latency);
 #endif
-    if (argc!=3 && (argc!=4 || (strcmp(argv[3],"readonly") && strcmp(argv[3],"initiator") && strcmp(argv[3],"responder") && strcmp(argv[3],"resources")))) {
-        fputs("Usage: verbs-peer RDMA_DEVICE GID_INDEX [readonly|initiator|responder|resources]\n",stderr); return 2;
+    int stock_initiator=0,stock_responder=0;
+#if defined(__linux__) && !defined(__APPLE__)
+    stock_initiator=argc==4 && !strcmp(argv[3],"stock-initiator");
+    stock_responder=argc==4 && !strcmp(argv[3],"stock-responder");
+#endif
+    if (argc!=3 && (argc!=4 || (!stock_initiator && !stock_responder && strcmp(argv[3],"readonly") && strcmp(argv[3],"initiator") && strcmp(argv[3],"responder") && strcmp(argv[3],"resources")))) {
+#if defined(__linux__) && !defined(__APPLE__)
+        fputs("Usage: verbs-peer RDMA_DEVICE GID_INDEX [readonly|initiator|responder|resources|stock-initiator|stock-responder]\n",stderr);
+#else
+        fputs("Usage: verbs-peer RDMA_DEVICE GID_INDEX [readonly|initiator|responder|resources]\n",stderr);
+#endif
+        return 2;
     }
     const int resources=argc==4 && !strcmp(argv[3],"resources");
     const int readonly=argc==4 && !strcmp(argv[3],"readonly");
-    const int initiator=argc==4 && !strcmp(argv[3],"initiator");
+    const int native_initiator=argc==4 && !strcmp(argv[3],"initiator");
+    const int initiator=native_initiator || stock_initiator;
     const int responder=argc==4 && !strcmp(argv[3],"responder");
     int count=0; struct ibv_device **list=ibv_get_device_list(&count); if (!list) fail("device list");
     struct ibv_context *ctx=NULL;
     for (int i=0;i<count;++i) if (!strcmp(ibv_get_device_name(list[i]),argv[1])) ctx=ibv_open_device(list[i]);
     ibv_free_device_list(list); if (!ctx) fail("open device");
-    struct ibv_port_attr port; if (ibv_query_port(ctx,1,&port)) fail("query port");
+    struct ibv_port_attr port; if (ibv_query_port(ctx,(uint8_t)rdma_port,&port)) fail("query port");
     if (port.state!=IBV_PORT_ACTIVE || port.link_layer!=IBV_LINK_LAYER_ETHERNET) {
         fputs("QSFP port is not active Ethernet\n",stderr); return 2;
     }
-    if (initiator || responder) {
+    if (native_initiator || responder) {
         struct ibv_device_attr device={0};
         if (ibv_query_device(ctx,&device)) fail("query device");
         if (!mcdma_native_peer(device.vendor_id,device.vendor_part_id,port.link_layer)) {
             fputs("Native peer must be a supported ConnectX Ethernet device\n",stderr); return 2;
         }
     }
+    if (stock_initiator || stock_responder) {
+        struct ibv_device_attr device={0};
+        if (ibv_query_device(ctx,&device)) fail("query device");
+        /* rdma-core reports Mellanox's IEEE OUI; the macOS provider reports
+         * its PCI vendor ID. Both identify the intended hardware family. */
+        if (device.vendor_id!=0x02c9 && device.vendor_id!=0x15b3) {
+            fputs("Stock Linux peer requires a Mellanox/NVIDIA Ethernet RDMA device\n",stderr);
+            ibv_close_device(ctx); return 2;
+        }
+        fprintf(stderr,"LINUX_PEER_CONFIG backend=stock-libibverbs vendor_id=0x%x rdma_port=%u role=%s\n",
+                device.vendor_id,rdma_port,stock_initiator ? "stock-initiator" : "stock-responder");
+    }
     if (path_mtu>port.active_mtu || path_mtu>port.max_mtu) {
         fprintf(stderr,"Requested path MTU exceeds port active/max MTU (%u/%u)\n",
                 128u<<port.active_mtu,128u<<port.max_mtu); ibv_close_device(ctx); return 2;
     }
-    int gid_index=atoi(argv[2]); union ibv_gid gid;
-    if (ibv_query_gid(ctx,1,gid_index,&gid)) fail("query gid");
+    char *gid_end=NULL;
+    long parsed_gid=strtol(argv[2],&gid_end,10);
+    if (!*argv[2] || strspn(argv[2],"0123456789")!=strlen(argv[2]) || *gid_end || parsed_gid<0 || parsed_gid>255) {
+        fputs("GID index must be an integer from 0 through 255\n",stderr); ibv_close_device(ctx); return 2;
+    }
+    int gid_index=(int)parsed_gid; union ibv_gid gid;
+    if (ibv_query_gid(ctx,(uint8_t)rdma_port,gid_index,&gid)) fail("query gid");
     struct ibv_pd *pd=ibv_alloc_pd(ctx); if (!pd) fail("PD");
     unsigned char *memory=NULL; if (posix_memalign((void **)&memory,16384,16384)) fail("memory");
     memset(memory,0,16384);
@@ -206,7 +254,7 @@ int main(int argc,char **argv) {
     struct ibv_qp_init_attr init={0}; init.send_cq=cq; init.recv_cq=cq; init.qp_type=IBV_QPT_RC;
     init.cap.max_send_wr=31; init.cap.max_recv_wr=31; init.cap.max_send_sge=1; init.cap.max_recv_sge=1;
     struct ibv_qp *qp=ibv_create_qp(pd,&init); if (!qp) fail("QP");
-    struct ibv_qp_attr attr={0}; attr.qp_state=IBV_QPS_INIT; attr.port_num=1;
+    struct ibv_qp_attr attr={0}; attr.qp_state=IBV_QPS_INIT; attr.port_num=(uint8_t)rdma_port;
     attr.qp_access_flags=IBV_ACCESS_REMOTE_READ|IBV_ACCESS_REMOTE_WRITE;
     modify_or_fail(qp,&attr,IBV_QP_STATE|IBV_QP_PKEY_INDEX|IBV_QP_PORT|IBV_QP_ACCESS_FLAGS,"INIT");
     if (resources) {
@@ -220,7 +268,7 @@ int main(int argc,char **argv) {
     if (scanf("%u %u %79s",&remote_qpn,&remote_psn,remote_gid)!=3 || remote_qpn>0xffffff || remote_psn>0xffffff) return 2;
     memset(&attr,0,sizeof(attr)); attr.qp_state=IBV_QPS_RTR; attr.path_mtu=path_mtu;
     attr.dest_qp_num=remote_qpn; attr.rq_psn=remote_psn; attr.max_dest_rd_atomic=1; attr.min_rnr_timer=12;
-    attr.ah_attr.is_global=1; attr.ah_attr.port_num=1; attr.ah_attr.grh.sgid_index=gid_index; attr.ah_attr.grh.hop_limit=64;
+    attr.ah_attr.is_global=1; attr.ah_attr.port_num=(uint8_t)rdma_port; attr.ah_attr.grh.sgid_index=gid_index; attr.ah_attr.grh.hop_limit=64;
     if (inet_pton(AF_INET6,remote_gid,&attr.ah_attr.grh.dgid)!=1) return 2;
     modify_or_fail(qp,&attr,IBV_QP_STATE|IBV_QP_AV|IBV_QP_PATH_MTU|IBV_QP_DEST_QPN|IBV_QP_RQ_PSN|IBV_QP_MAX_DEST_RD_ATOMIC|IBV_QP_MIN_RNR_TIMER,"RTR");
     memset(&attr,0,sizeof(attr)); attr.qp_state=IBV_QPS_RTS; attr.timeout=14; attr.retry_cnt=7; attr.rnr_retry=7; attr.sq_psn=0x654321; attr.max_rd_atomic=1;

@@ -208,12 +208,21 @@ function sparkScript(entries) {
 set -e
 [ "$(id -u)" = 0 ] || { echo "not root"; exit 5; }
 mkdir -p /etc/mcdma /usr/local/sbin
-cat > /etc/mcdma/neighbours.conf <<'CONF'
+task_neighbours=$(mktemp /etc/mcdma/neighbours.conf.XXXXXX)
+trap 'rm -f "$task_neighbours"' EXIT
+cat > "$task_neighbours" <<'CONF'
 ${conf}
 CONF
+if [ -f /etc/mcdma/neighbours.conf ]; then
+  awk 'NR==FNR { if (NF==3) managed[$1 " " $2]=1; next } NF==3 && !(($1 " " $2) in managed) { print }' "$task_neighbours" /etc/mcdma/neighbours.conf >> "$task_neighbours.existing"
+  cat "$task_neighbours.existing" >> "$task_neighbours"
+  rm -f "$task_neighbours.existing"
+fi
+chmod 644 "$task_neighbours"
+mv "$task_neighbours" /etc/mcdma/neighbours.conf
 cat > /usr/local/sbin/mcdma-neighbours <<'SCRIPT'
 #!/bin/bash
-# Re-applies the permanent IPv6 neighbours for the Mac's MCDMA ports.
+# Re-applies permanent IPv6 neighbours for managed MCDMA peers.
 # Format of /etc/mcdma/neighbours.conf: IFACE STUDIO_LINK_LOCAL STUDIO_MAC
 while read -r iface ll mac; do
   [ -n "$iface" ] || continue
@@ -267,9 +276,10 @@ echo "configured"
 async function configureSpark({ spark, entries }) {
   for (const e of entries) if (![e.iface, e.studioLinkLocal, e.studioMac].every(ident)) return { ok: false, message: `invalid identifier in ${JSON.stringify(e)}` };
   const host = new Host('ssh', spark.host);
-  const r = await run('/usr/bin/ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=6', spark.host, '/bin/bash -s'], { input: sparkScript(entries), timeoutMs: 40000 });
+  const r = await host.sh(spark.root ? '/bin/bash -s' : 'sudo -n /bin/bash -s', { input: sparkScript(entries), timeoutMs: 40000 });
   const ok = r.code === 0 && /configured/.test(r.out);
-  return { ok, message: ok ? `${spark.id}: neighbours set and persisted (systemd service + 30 s timer${/NetworkManager/.test(r.out) ? '' : ', NetworkManager hook'})` : `${spark.id}: ${(r.err || r.out).trim().split('\n').slice(-2).join(' ') || 'failed'}`, log: r.out + r.err, host: host.alias };
+  const waitingFor = !ok && /password is required|a terminal is required|not root/.test(r.err + r.out) ? 'sudo' : null;
+  return { ok, waitingFor, message: ok ? `${spark.id}: neighbours set and persisted (systemd service + 30 s timer${/NetworkManager/.test(r.out) ? '' : ', NetworkManager hook'})` : waitingFor ? `${spark.id}: authenticate sudo locally or use a root SSH alias, then configure again` : `${spark.id}: ${(r.err || r.out).trim().split('\n').slice(-2).join(' ') || 'failed'}`, log: r.out + r.err, host: host.alias };
 }
 
 // Ad-hoc neighbour entries on a Spark without persistence (used by wiring detection).

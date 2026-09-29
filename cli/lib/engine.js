@@ -13,6 +13,7 @@ const driverpkg = require('./driverpkg');
 const demo = require('./demo');
 const { sshConfigHosts } = require('./store');
 const { FabricCollector } = require('./collect');
+const linuxlinks = require('./linuxlinks');
 
 const { compareVersions } = require('./version');
 
@@ -95,7 +96,7 @@ class Engine extends EventEmitter {
             return { ...m, label: info.ok ? (info.chip.hostname || m.id) : (m.host || 'This Mac'), info };
           })).then((r) => { this.state.macs = r; this.state.studio = r[0].info; }));
         }
-        if (what === 'all' || what === 'sparks') jobs.push(Promise.all(this.sparkHosts().map(async (s) => ({ ...(await sparksProbe.probe(s.hostObj)), id: s.id, host: s.host }))).then((r) => { this.state.sparks = r; }));
+        if (what === 'all' || what === 'sparks') jobs.push(Promise.all(this.sparkHosts().map(async (s) => ({ ...(await sparksProbe.probe(s.hostObj)), id: s.id, host: s.host, kind: s.kind || 'spark' }))).then((r) => { this.state.sparks = r; }));
         await Promise.all(jobs);
       }
       this.state.lastRefresh = Date.now(); this.state.ready = true;
@@ -126,7 +127,7 @@ class Engine extends EventEmitter {
     const after = this.store.get();
     if (patch.demo !== undefined) this.state.demo = !!patch.demo;
     if (patch.demoStage) this.state.demoStage = patch.demoStage;
-    const reprobe = patch.studio || patch.macs || patch.demo !== undefined || patch.demoStage || patch.driverPackage !== undefined;
+    const reprobe = patch.studio || patch.macs || patch.sparks || patch.demo !== undefined || patch.demoStage || patch.driverPackage !== undefined;
     if (reprobe) this.refresh('all'); else this.recompute();
     if (this.state.monitorRunning && (patch.monitor || JSON.stringify(before.mapping) !== JSON.stringify(after.mapping))) this.startMonitor();
     return after;
@@ -141,13 +142,14 @@ class Engine extends EventEmitter {
     if (this.state.monitorRunning) this.startMonitor();
     return this.store.get();
   }
-  async addSpark({ host, id }) {
+  async addSpark({ host, id, kind = 'spark' }) {
     host = String(host || '').trim(); id = String(id || host).trim();
     if (!/^[A-Za-z0-9_.@-]{1,80}$/.test(host) || !/^[A-Za-z0-9_.-]{1,40}$/.test(id)) return { ok: false, message: 'invalid host or name' };
     const t = await sparksProbe.testSsh(new Host('ssh', host));
+    if (kind === 'linux' && (!t.ok || t.system !== 'Linux')) return { ok: false, message: t.ok ? `${host} is not Linux (${t.system})` : `ssh ${host} failed: ${t.error}` };
     const s = this.store.get();
     if (s.sparks.some((x) => x.id === id)) return { ok: false, message: `${id} is already added` };
-    this.store.set({ sparks: [...s.sparks, { id, host }], firstRunDone: true });
+    this.store.set({ sparks: [...s.sparks, { id, host, kind }], firstRunDone: true });
     await this.refresh('sparks');
     return { ok: true, message: t.ok ? `${id} added (${t.hostname}${t.root ? ', root' : ''})` : `${id} added but ssh failed: ${t.error}` };
   }
@@ -155,7 +157,7 @@ class Engine extends EventEmitter {
     const s = this.store.get();
     const mapping = { ...s.mapping };
     for (const [k, v] of Object.entries(mapping)) if (v && v.spark === id) delete mapping[k];
-    this.store.set({ sparks: s.sparks.filter((x) => x.id !== id), mapping });
+    this.store.set({ sparks: s.sparks.filter((x) => x.id !== id), mapping, linuxLinks: (s.linuxLinks || []).filter((l) => l.a.node !== id && l.b.node !== id) });
     this.state.sparks = this.state.sparks.filter((x) => x.id !== id);
     this.recompute();
     return this.store.get();
@@ -185,6 +187,45 @@ class Engine extends EventEmitter {
   sshHosts() { return sshConfigHosts(); }
   scanSsh() { return actions.scanSsh(); }
 
+  setLinuxLink({ id, a, b }) {
+    const settings = this.store.get();
+    const records = [...(settings.linuxLinks || []).filter((l) => l.id !== id), { id, a, b }];
+    linuxlinks.buildLinuxLinks({ peers: this.state.sparks, savedLinks: records, lastTests: settings.lastLinuxTests || {} });
+    this.persist({ linuxLinks: records });
+    this.recompute();
+    return this.state.topology.linuxLinks.find((l) => l.id === id);
+  }
+
+  async runLinuxTest({ id, latency = true }) {
+    if (this.state.busy.test) return { passed: false, errors: ['a test is already running'] };
+    const link = (this.state.topology && this.state.topology.linuxLinks || []).find((l) => l.id === id);
+    if (!link) return { passed: false, errors: ['no such Linux RDMA link'] };
+    if (this.state.demo) return { passed: false, errors: ['Linux transfers require real endpoints'] };
+    this.state.busy.test = id; this.publish();
+    let result;
+    try {
+      result = await linuxlinks.runLinuxTransferTest({ link, settings: this.store.get(), latency, onProgress: (m) => this.progress('linux-test', m) });
+      result.identity = link.identity;
+      this.persist({ lastLinuxTests: { ...this.store.get().lastLinuxTests, [id]: result } });
+    } catch (e) { result = { passed: false, errors: [e.message] }; }
+    finally { this.state.busy.test = null; this.recompute(); }
+    if (result && result.passed) await this.refresh('sparks');
+    return result;
+  }
+
+  async configureLinuxNetwork(ids = null) {
+    const links = (this.state.topology && this.state.topology.linuxLinks || []).filter((l) => !ids || ids.includes(l.id));
+    if (!links.length) return { ok: false, message: 'no Linux links selected' };
+    const entries = linuxlinks.linuxNeighbourEntries(links);
+    const results = [];
+    for (const [id, neighbours] of Object.entries(entries)) {
+      const peer = this.state.sparks.find((p) => p.id === id);
+      if (!peer || !peer.reachable) return { ok: false, message: `${id}: Linux endpoint is unavailable` };
+      results.push(await actions.configureSpark({ spark: peer, entries: neighbours }));
+    }
+    return { ok: results.length > 0 && results.every((r) => r.ok), waitingFor: results.find((r) => r.waitingFor)?.waitingFor || null, message: results.map((r) => r.message).join(' ') };
+  }
+
   /* ---------- actions ---------- */
   linkEntriesBySpark(links) {
     const by = {};
@@ -193,20 +234,23 @@ class Engine extends EventEmitter {
   }
 
   async configureNetwork({ onProgress = () => {} } = {}) {
-    const links = (this.state.topology || { links: [] }).links;
-    if (!links.length) return { ok: false, message: 'no links to configure' };
+    const topo = this.state.topology || { links: [], linuxLinks: [] };
+    const links = topo.links;
+    if (!links.length && !(topo.linuxLinks || []).length) return { ok: false, message: 'no links to configure' };
+    const allEntries = this.linkEntriesBySpark(links);
+    for (const [node, entries] of Object.entries(linuxlinks.linuxNeighbourEntries(topo.linuxLinks || []))) allEntries[node] = [...(allEntries[node] || []), ...entries];
     const rs = [];
     const localLinks = links.filter((l) => l.mac.kind === 'local');
     if (localLinks.length) { onProgress('Configuring this Mac (administrator rights)…'); rs.push(await actions.configureStudio({ links: localLinks })); }
     const remote = links.filter((l) => l.mac.kind !== 'local');
     if (remote.length) rs.push({ ok: true, message: `${remote.length} link${remote.length === 1 ? '' : 's'} on ${[...new Set(remote.map((l) => l.mac.label))].join(', ')} must be configured on that Mac.` });
-    for (const [sparkId, entries] of Object.entries(this.linkEntriesBySpark(links))) {
+    for (const [sparkId, entries] of Object.entries(allEntries)) {
       const sp = this.state.topology.sparks.find((s) => s.id === sparkId);
       if (!sp) continue;
       onProgress(`Configuring ${sp.hostname || sp.id}…`);
       rs.push(await actions.configureSpark({ spark: sp, entries }));
     }
-    return { ok: rs.every((x) => x.ok), message: rs.map((x) => x.message).join(' ') };
+    return { ok: rs.every((x) => x.ok), waitingFor: rs.find((x) => x.waitingFor)?.waitingFor || null, message: rs.map((x) => x.message).join(' ') };
   }
 
   async runAction(id, args = {}) {
@@ -232,7 +276,10 @@ class Engine extends EventEmitter {
         }
         case 'installSparkPeer': {
           const sp = this.state.sparks.find((s) => s.id === args.spark);
-          r = sp && this.state.pkg && this.state.pkg.available ? await testrun.installSparkPeer({ archive: this.state.pkg.archive, sparkHostAlias: sp.host }) : { ok: false, message: 'Spark or driver package not available' };
+          if (sp && sp.kind === 'linux') {
+            r = await require('./linuxinstall').installLinuxPeer({ peer: sp });
+            if (r.ok) this.persist({ tools: { linuxPeerPaths: { ...this.store.get().tools.linuxPeerPaths, [sp.id]: r.binary } } });
+          } else r = sp && this.state.pkg && this.state.pkg.available ? await testrun.installSparkPeer({ archive: this.state.pkg.archive, sparkHostAlias: sp.host }) : { ok: false, message: 'Spark or driver package not available' };
           break;
         }
         case 'installCli': r = await actions.installCli(args); break;

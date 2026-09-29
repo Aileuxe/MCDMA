@@ -7,12 +7,14 @@ const os = require('os');
 const DEFAULTS = {
   studio: { mode: 'local', host: '' },                // 'ssh' manages a remote Mac read-only
   sparks: [],                                          // [{ id, host }]
+  linuxLinks: [],                                      // [{id, a:{node,iface}, b:{node,iface}}]
+  lastLinuxTests: {},
   macs: [],                                            // additional Macs with cards, managed over ssh: [{ id, host }]
   enableInProgress: false,                             // the one-click flow was started and may resume after a restart
   mapping: {},                                         // studio iface -> { spark, iface } | null
   wiringVerified: {},                                  // studio iface -> { spark, iface, at }
   lastTests: {},                                       // studio iface -> result
-  tools: { macPeer: '', sparkPeer: '', keepalive: '', provider: '', macBw: '', sparkBw: '', macChecker: '' },
+  tools: { macPeer: '', sparkPeer: '', linuxPeerPaths: {}, keepalive: '', provider: '', macBw: '', sparkBw: '', macChecker: '' },
   test: { payload: 4096, mtu: 1024, arm: 'bf64', iterations: 1000 },
   monitor: { pollMs: 1000, heavyEveryTicks: 5, extraLinks: [] },
   driverPackage: '',

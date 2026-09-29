@@ -7,10 +7,10 @@ const fs = require('fs');
 const readline = require('readline');
 const { Engine } = require('../lib/engine');
 const { Store } = require('../lib/store');
-const { setPrivilegeRunner, sudoRunner } = require('../lib/exec');
+const { setPrivilegeRunner, setSshConfig, sudoRunner } = require('../lib/exec');
 const pkgJson = require('../package.json');
 
-const USAGE = `mcdma ${pkgJson.version} — set up, verify and watch a Mac ↔ DGX Spark RDMA fabric (MCDMA driver)
+const USAGE = `mcdma ${pkgJson.version} — set up, verify and watch Mac, Spark and Linux RDMA links
 
 Usage: mcdma <command> [options]
 
@@ -24,6 +24,10 @@ Commands
   driver install|load       Install the bundled driver package / ask macOS to load it
   sparks list|add HOST [--name N]|remove ID
   macs list|add HOST [--name N]|remove ID          Another Mac with a card, managed over ssh
+  linux list|add HOST [--name N]|remove ID         Linux RDMA peers, including Strix
+  linux link NODE/IFACE NODE/IFACE --name ID       Save a Linux/Linux connection
+  linux install NODE                             Build the native stock-verbs test tool
+  linux status|configure|test [LINK]              Inspect, configure and verify Linux links
   map MAC-PORT SPARK/IFACE|none                     e.g. map local:mcrdma1 spark1/enp1s0f0np0
   keepalive run|status      Hold the Mac's fast platform state (runs until Ctrl-C)
   monitor [--seconds N]     Stream per-link throughput and Spark inference state
@@ -37,6 +41,7 @@ Options
   -q, --quiet     No progress lines
   --quick         Transfer test without latency sampling
   --studio-host H Manage the Mac with the card over ssh (checks, wiring, Sparks and tests only)
+  --ssh-config F  Existing private OpenSSH configuration for all remote peers
   --demo          Synthetic data, no hardware needed
   --output DIR    New bandwidth evidence directory
   --settings-dir D  Separate local CLI settings directory
@@ -46,7 +51,7 @@ Exit codes: 0 done · 1 failed · 2 usage · 3 waiting for you (approve the driv
 
 /* ---------- argv ---------- */
 const argv = process.argv.slice(2);
-const flags = { json: false, yes: false, quiet: false, quick: false, demo: false, color: process.stdout.isTTY, studioHost: null, name: null, seconds: null, output: null, settingsDir: null, bandwidth: {} };
+const flags = { json: false, yes: false, quiet: false, quick: false, demo: false, color: process.stdout.isTTY, studioHost: null, sshConfig: null, name: null, seconds: null, output: null, settingsDir: null, bandwidth: {} };
 const words = [];
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
@@ -57,6 +62,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--demo') flags.demo = true;
   else if (a === '--no-color') flags.color = false;
   else if (a === '--studio-host') flags.studioHost = argv[++i];
+  else if (a === '--ssh-config') flags.sshConfig = argv[++i];
   else if (a === '--output') flags.output = argv[++i];
   else if (a === '--settings-dir') flags.settingsDir = argv[++i];
   else if (['--ops', '--sizes', '--depths', '--qps', '--total', '--repeats', '--warmup', '--verify-bytes'].includes(a)) flags.bandwidth[a.slice(2)] = argv[++i];
@@ -90,6 +96,7 @@ async function confirm(question) {
 const userData = flags.settingsDir ? path.resolve(flags.settingsDir) : path.join(os.homedir(), 'Library', 'Application Support', 'MCDMA');
 const packagePaths = { appPath: path.resolve(__dirname, '..') };
 const store = new Store(userData);
+if (flags.sshConfig) setSshConfig(flags.sshConfig);
 if (flags.studioHost) store.override({ studio: { mode: 'ssh', host: flags.studioHost } });
 setPrivilegeRunner(sudoRunner);
 const engine = new Engine({ store, packagePaths, demo: flags.demo, version: pkgJson.version });
@@ -122,6 +129,7 @@ function printStatus(S) {
     for (const s of topo.sparkLinks) out(`  ${bold(`${s.a.spark} ↔ ${s.b.spark}`)}  ${s.speedGbps ? `${s.speedGbps}G` : ''}  ${s.a.iface} ↔ ${s.b.iface}  ${dim(`cable ${s.cable.sn}`)}`);
     for (const o of topo.orphans || []) out(`  ${yellow('?')} ${o.spark} ${o.iface} has a link but no known Mac uses it`);
   }
+  for (const l of topo && topo.linuxLinks || []) out(`  ${bold(l.id)}  ${l.a.node}/${l.a.iface} ↔ ${l.b.node}/${l.b.iface}  ${l.status.ready ? green('ready') : yellow('needs configuration')}`);
   if (c.next) { const n = c.steps.find((s) => s.id === c.next); out(`\n${bold('Next:')} ${n.title} — ${n.summary}${n.actions.length ? dim(`  (${n.actions.map((a) => a.label).join(' / ')})`) : ''}`); }
 }
 
@@ -212,6 +220,60 @@ const commands = {
   },
   async sparks() { return hosts('sparks'); },
   async macs() { return hosts('macs'); },
+  async linux() {
+    const sub = rest[0] || 'list';
+    if (flags.demo) throw new Error('Linux endpoint setup and tests require real hosts');
+    if (sub === 'add' && rest[1]) {
+      const r = await engine.addSpark({ host: rest[1], id: flags.name || rest[1].replace(/^.*@/, ''), kind: 'linux' });
+      if (flags.json) jsonOut(r); else out(r.message);
+      return r.ok ? 0 : 1;
+    }
+    if (sub === 'remove' && rest[1]) { engine.removeSpark(rest[1]); if (flags.json) jsonOut(store.get()); else out(`${rest[1]} removed`); return 0; }
+    await engine.refresh('sparks');
+    if (sub === 'list') {
+      if (flags.json) jsonOut(engine.state.sparks);
+      else for (const node of engine.state.sparks) out(`${node.id}  ${node.host}  ${node.arch || 'unknown architecture'}  ${node.reachable ? (node.gpus || []).join(', ') || 'Linux' : node.error || 'unreachable'}`);
+      return engine.state.sparks.every((node) => node.reachable) ? 0 : 1;
+    }
+    if (sub === 'install' && rest[1]) {
+      const peer = engine.state.sparks.find((node) => node.id === rest[1]);
+      const { installLinuxPeer } = require('../lib/linuxinstall');
+      const r = await installLinuxPeer({ peer });
+      if (r.ok) engine.persist({ tools: { linuxPeerPaths: { ...store.get().tools.linuxPeerPaths, [peer.id]: r.binary } } });
+      if (flags.json) jsonOut(r); else out(r.message);
+      return r.ok ? 0 : 1;
+    }
+    if (sub === 'link') {
+      const endpoint = (word) => { const match = /^([^/]+)\/(.+)$/.exec(word || ''); if (!match) throw new Error('Use registered NODE/IFACE endpoints'); return { node: match[1], iface: match[2] }; };
+      const a = endpoint(rest[1]), b = endpoint(rest[2]);
+      const id = flags.name || `${a.node}-${b.node}`;
+      if (!/^[A-Za-z0-9_.-]{1,80}$/.test(id)) throw new Error('Invalid Linux link name');
+      const r = engine.setLinuxLink({ id, a, b });
+      if (flags.json) jsonOut(r); else out(`${id}: ${a.node}/${a.iface} ↔ ${b.node}/${b.iface}`);
+      return 0;
+    }
+    const links = (engine.state.topology && engine.state.topology.linuxLinks || []).filter((l) => !rest[1] || l.id === rest[1]);
+    if (sub === 'status') {
+      const result = { peers: engine.state.sparks, links, transport: 'stock-linux-verbs', cpuSubmission: true, gpuInitiated: false };
+      if (flags.json) jsonOut(result); else for (const l of links) out(`${l.id}: ${l.a.node}/${l.a.iface} ↔ ${l.b.node}/${l.b.iface} ${l.status.ready ? 'ready' : 'needs configuration'}`);
+      return links.length && links.every((l) => l.status.ready) ? 0 : 1;
+    }
+    if (sub === 'configure') {
+      if (!(await confirm('Configure managed Linux neighbours while preserving existing Mac links?'))) return 1;
+      const r = await engine.configureLinuxNetwork(rest[1] ? [rest[1]] : null);
+      if (flags.json) jsonOut(r); else out(r.message);
+      return r.ok ? 0 : r.waitingFor ? 3 : 1;
+    }
+    if (sub === 'test') {
+      if (!links.length) throw new Error('No Linux RDMA link selected');
+      const results = [];
+      for (const l of links) results.push({ link: l.id, ...await engine.runLinuxTest({ id: l.id, latency: !flags.quick }) });
+      if (flags.json) jsonOut({ ok: results.every((r) => r.passed), results });
+      else for (const r of results) out(`${r.link}: ${r.passed ? 'passed' : (r.errors || []).join('; ')}${r.latency ? ` · ${r.latency.a.write.median}/${r.latency.a.read.median} µs from A · ${r.latency.b.write.median}/${r.latency.b.read.median} µs from B` : ''}`);
+      return results.every((r) => r.passed) ? 0 : 1;
+    }
+    throw new Error('Use mcdma linux list, add, remove, link, install, status, configure or test');
+  },
   async map() {
     const [key, target] = rest;
     if (!key || !target) { err(USAGE); return 2; }

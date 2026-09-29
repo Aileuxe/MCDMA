@@ -4,6 +4,7 @@
 // configured with, and how far along each link is. Pure functions.
 const { eui64 } = require('./parse');
 const { driverIdentity } = require('./verification');
+const { buildLinuxLinks } = require('./linuxlinks');
 
 const portKey = (macId, iface) => `${macId}:${iface}`;
 
@@ -32,8 +33,8 @@ function candidatePorts(sparks) {
       if (!p.primary) continue;
       if (p.cable && p.cable.sn && sn[p.cable.sn].size > 1) continue;
       out.push({ spark: sp.id, host: sp.host, hostname: sp.hostname, iface: p.iface, mac: p.mac, gid: p.gid, gidIndex: p.gidIndex,
-        rdmaDevice: p.rdmaDevice, speedGbps: p.speedGbps, link: p.link, cable: p.cable, eui64: p.eui64, views: p.views,
-        neighbours: p.neighbours, peerTools: sp.peerTools || [], key: `${sp.id}/${p.iface}` });
+        rdmaDevice: p.rdmaDevice, rdmaPort: p.rdmaPort || 1, speedGbps: p.speedGbps, link: p.link, cable: p.cable, eui64: p.eui64, views: p.views,
+        neighbours: p.neighbours, peerTools: sp.peerTools || [], peerToolHashes: sp.peerToolHashes || {}, bootId: sp.bootId || null, kind: sp.kind || 'spark', key: `${sp.id}/${p.iface}` });
     }
   }
   return out;
@@ -99,6 +100,10 @@ function build({ macs, sparks, settings, lastTests = {} }) {
   const ports = macPorts(macs);
   const candidates = candidatePorts(sparks);
   const sLinks = sparkLinks(sparks);
+  const registered = (settings && settings.sparks) || [];
+  const linuxPeers = [...sparks];
+  for (const peer of registered) if (!linuxPeers.some((p) => p.id === peer.id)) linuxPeers.push({ ...peer, reachable: false, ports: [] });
+  const linuxLinks = buildLinuxLinks({ peers: linuxPeers, savedLinks: (settings && settings.linuxLinks) || [], lastTests: (settings && settings.lastLinuxTests) || {}, test: (settings && settings.test) || {} });
   const saved = (settings && settings.mapping) || {};
   const verified = (settings && settings.wiringVerified) || {};
   const { mapping, reasons } = suggestMapping(ports, candidates, saved, verified);
@@ -142,11 +147,11 @@ function build({ macs, sparks, settings, lastTests = {} }) {
   const macsSettled = macs.length > 0 && macs.every((m) => m.info && m.info.ok && m.info.loaded && m.info.loaded.loaded) && !unmapped.some((p) => p.portActive);
   const orphans = macsSettled ? candidates.filter((c) => !usedCand.has(c.key) && c.link) : [];
   const summary = describe(macs, sparks, links, sLinks);
-  return { ports, studioPorts: ports, candidates, sparkLinks: sLinks, mapping, reasons, links, unmapped, orphans, preset: summary.preset, presetName: summary.name, summary: summary.text,
+  return { ports, studioPorts: ports, candidates, sparkLinks: sLinks, linuxLinks, mapping, reasons, links, unmapped, orphans, preset: summary.preset, presetName: summary.name, summary: linuxLinks.length ? `${summary.text} · ${linuxLinks.length} Linux RDMA link${linuxLinks.length === 1 ? '' : 's'}` : summary.text,
     macs: macs.map((m) => ({ id: m.id, kind: m.kind, host: m.host || null, label: m.label, ok: !!(m.info && m.info.ok), error: m.info && m.info.error || null,
       cards: m.info && m.info.ok ? m.info.pci.cards : [], thunderbolt: m.info && m.info.ok ? m.info.thunderbolt : [], loaded: m.info && m.info.ok ? m.info.loaded : null,
       chip: m.info && m.info.ok ? m.info.chip : null, os: m.info && m.info.ok ? m.info.os : null })),
-    sparks: sparks.map((s) => ({ id: s.id, host: s.host, hostname: s.hostname, reachable: !!s.reachable, gpus: s.gpus || [], os: s.os || null, ports: s.ports || [], error: s.error || null, root: !!s.root, tools: s.tools || {}, peerTools: s.peerTools || [], persist: s.persist || {} })) };
+    sparks: sparks.map((s) => ({ id: s.id, kind: s.kind || 'spark', host: s.host, hostname: s.hostname, reachable: !!s.reachable, gpus: s.gpus || [], os: s.os || null, arch: s.arch || null, ports: s.ports || [], error: s.error || null, root: !!s.root, tools: s.tools || {}, peerTools: s.peerTools || [], peerToolHashes: s.peerToolHashes || {}, persist: s.persist || {} })) };
 }
 
 module.exports = { build, candidatePorts, sparkLinks, suggestMapping, portKey };

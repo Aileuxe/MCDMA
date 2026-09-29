@@ -94,7 +94,7 @@ test('CLI status emits parseable JSON with isolated demo settings', () => {
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'mcdma-cli-test-'));
   try {
     const result=spawnSync(process.execPath,[path.join(__dirname,'../bin/mcdma.js'),'status','--demo','--json','--settings-dir',dir],{encoding:'utf8'});
-    assert.equal(result.status,0,result.stderr);assert.equal(JSON.parse(result.stdout).version,'1.1.0');
+    assert.equal(result.status,0,result.stderr);assert.equal(JSON.parse(result.stdout).version,'1.2.0');
   } finally {fs.rmSync(dir,{recursive:true});}
 });
 

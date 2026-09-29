@@ -9,8 +9,10 @@ echo '===ID'; hostname; id -u; grep -E '^(PRETTY_NAME|ID)=' /etc/os-release 2>/d
 echo '===LINKS'; ip -o link show 2>/dev/null
 echo '===RDMA'; rdma link 2>/dev/null
 echo '===GPU'; nvidia-smi -L 2>/dev/null
+for c in /sys/class/drm/card[0-9]*; do [ -r "$c/device/vendor" ] || continue; [ "$(cat "$c/device/vendor")" = 0x1002 ] && printf 'AMD GPU %s\\n' "\${c##*/}"; done
+echo '===BOOT'; cat /proc/sys/kernel/random/boot_id 2>/dev/null
 echo '===TOOLS'; for t in ethtool ip rdma ibv_devinfo ibv_rc_pingpong ib_write_lat; do printf '%s=%s\\n' "$t" "$(command -v $t 2>/dev/null)"; done
-for p in /usr/local/libexec/mcdma/verbs-peer /usr/local/bin/verbs-peer /opt/mcdma/verbs-peer; do [ -x "$p" ] && echo "PEER=$p"; done
+for p in "$HOME/.local/libexec/mcdma/verbs-peer" /usr/local/libexec/mcdma/verbs-peer /usr/local/bin/verbs-peer /opt/mcdma/verbs-peer; do [ -x "$p" ] && { echo "PEER=$p"; h=$(sha256sum "$p" 2>/dev/null | cut -d' ' -f1); [ -n "$h" ] && printf 'PEER_HASH %s %s\\n' "$h" "$p"; }; done
 echo '===PERSIST'; ls -1 /etc/systemd/system/mcdma-neighbours.service /etc/NetworkManager/dispatcher.d/90-mcdma-neighbours 2>/dev/null; echo '---CONF'; cat /etc/mcdma/neighbours.conf 2>/dev/null
 for i in $(rdma link 2>/dev/null | awk '{for(k=1;k<=NF;k++) if($k=="netdev") print $(k+1)}' | sort -u); do
   echo "===PORT $i"
@@ -19,14 +21,19 @@ for i in $(rdma link 2>/dev/null | awk '{for(k=1;k<=NF;k++) if($k=="netdev") pri
   echo '---ADDR'; ip -6 addr show dev $i 2>/dev/null | grep inet6
   echo '---NEIGH'; ip -6 neigh show dev $i 2>/dev/null
   echo '---STATS'; ethtool -S $i 2>/dev/null | grep -E '^\\s+(rx_packets_phy|tx_packets_phy|rx_bytes_phy|tx_bytes_phy):'
-  dev=$(rdma link 2>/dev/null | awk -v n="$i" '{for(k=1;k<=NF;k++) if($k=="netdev" && $(k+1)==n) print $2}' | head -1 | cut -d/ -f1)
-  echo "---DEV $dev"
-  for g in 0 1 2 3 4 5; do f=/sys/class/infiniband/$dev/ports/1/gids/$g; [ -r "$f" ] && echo "GID $g $(cat $f) $(cat /sys/class/infiniband/$dev/ports/1/gid_attrs/types/$g 2>/dev/null)"; done
+  rd=$(rdma link 2>/dev/null | awk -v n="$i" '{for(k=1;k<=NF;k++) if($k=="netdev" && $(k+1)==n) print $2}' | head -1)
+  dev=\${rd%/*}; port=\${rd##*/}
+  echo "---DEV $dev $port"
+  for f in /sys/class/infiniband/"$dev"/ports/"$port"/gids/*; do
+    [ -r "$f" ] || continue
+    g=\${f##*/}
+    printf 'GID %s %s %s %s\\n' "$g" "$(cat "$f")" "$(cat /sys/class/infiniband/"$dev"/ports/"$port"/gid_attrs/types/"$g" 2>/dev/null)" "$(cat /sys/class/infiniband/"$dev"/ports/"$port"/gid_attrs/ndevs/"$g" 2>/dev/null)"
+  done
 done
 `;
 
 function parsePort(name, body) {
-  const p = { iface: name, speedGbps: null, link: false, cable: null, addrs: [], neighbours: [], stats: {}, rdmaDevice: null, gids: [] };
+  const p = { iface: name, speedGbps: null, link: false, cable: null, addrs: [], neighbours: [], stats: {}, rdmaDevice: null, rdmaPort: 1, gids: [] };
   const [head, ...rest] = body.split(/^---/m);
   const sp = head.match(/Speed:\s*(\d+)Mb\/s/); if (sp) p.speedGbps = Number(sp[1]) / 1000;
   p.link = /Link detected:\s*yes/.test(head);
@@ -47,10 +54,11 @@ function parsePort(name, body) {
     } else if (tag === 'STATS') {
       for (const m of text.matchAll(/(\w+):\s*(\d+)/g)) p.stats[m[1]] = Number(m[2]);
     } else if (tag.startsWith('DEV')) {
-      p.rdmaDevice = tag.slice(3).trim() || null;
-      for (const m of text.matchAll(/^GID (\d+) (\S+) (.*)$/gm)) {
+      const [device, port] = tag.slice(3).trim().split(/\s+/);
+      p.rdmaDevice = device || null; p.rdmaPort = port ? Number(port) : 1;
+      for (const m of text.matchAll(/^GID (\d+) (\S+) (RoCE v[12])(?: (\S+))?\s*$/gm)) {
         const addr = normIp6(m[2]);
-        if (addr && addr !== '::') p.gids.push({ index: Number(m[1]), addr, type: m[3].trim() });
+        if (addr && addr !== '::') p.gids.push({ index: Number(m[1]), addr, type: m[3], ndev: m[4] || null });
       }
     }
   }
@@ -73,6 +81,8 @@ function parse(out) {
   const tools = {};
   for (const m of (s.TOOLS || '').matchAll(/^(\w+)=(.*)$/gm)) tools[m[1]] = m[2] || null;
   const peers = [...(s.TOOLS || '').matchAll(/^PEER=(.+)$/gm)].map((m) => m[1]);
+  const peerToolHashes = {};
+  for (const m of (s.TOOLS || '').matchAll(/^PEER_HASH ([a-f0-9]{64}) (.+)$/gm)) peerToolHashes[m[2]] = m[1];
   const [persistList, persistConf] = (s.PERSIST || '').split('---CONF');
   const ports = [];
   for (const [k, v] of Object.entries(s)) {
@@ -80,7 +90,9 @@ function parse(out) {
     const p = parsePort(k.slice(5), v);
     p.mac = macs[p.iface] || null;
     p.eui64 = p.mac ? eui64(p.mac) : null;
-    const v2 = p.gids.find((g) => /RoCE v2/.test(g.type) && g.addr === p.eui64) || p.gids.find((g) => /RoCE v2/.test(g.type));
+    const observed = p.gids.filter((g) => g.type === 'RoCE v2' && /^fe80:/.test(g.addr) && p.addrs.includes(g.addr) && (!g.ndev || g.ndev === p.iface));
+    const preferred = observed.filter((g) => g.addr === p.eui64);
+    const v2 = preferred.length === 1 ? preferred[0] : observed.length === 1 ? observed[0] : null;
     p.gidIndex = v2 ? v2.index : null;
     p.gid = v2 ? v2.addr : null;
     ports.push(p);
@@ -97,8 +109,9 @@ function parse(out) {
   ports.sort((a, b) => a.iface.localeCompare(b.iface));
   return {
     ok: true, reachable: true, hostname: id[0] || null, root: id[1] === '0', os, arch: id[id.length - 1] || null,
+    bootId: (s.BOOT || '').trim() || null,
     gpus: (s.GPU || '').trim().split('\n').filter(Boolean).map((l) => l.replace(/\s*\(UUID.*$/, '')),
-    tools, peerTools: peers, persist: { service: /mcdma-neighbours\.service/.test(persistList || ''), dispatcher: /dispatcher/.test(persistList || ''), conf: (persistConf || '').trim() || null },
+    tools, peerTools: peers, peerToolHashes, persist: { service: /mcdma-neighbours\.service/.test(persistList || ''), dispatcher: /dispatcher/.test(persistList || ''), conf: (persistConf || '').trim() || null },
     rdmaLinks, ports
   };
 }

@@ -2,6 +2,9 @@
 
 A command-line tool that takes a Mac with a Mellanox ConnectX card from "just
 plugged in" to a verified RDMA fabric with DGX Sparks, and keeps it that way.
+CLI 1.2 also registers stock Linux RDMA endpoints, including Strix Halo, builds
+their peer tool natively and verifies Linux/Linux links without the Mac driver.
+See [Linux endpoints](../docs/linux-endpoints.md) for Strix/Spark and Strix/Mac setup.
 It sits on top of the driver in this repository: the documented,
 hardware-validated installation route remains `docs/install.md` with
 `tools/install-native.sh` and `tools/restore-rdma.py`; `mcdma` automates the
@@ -29,6 +32,10 @@ mcdma test [LINK]         RDMA transfer test with latency; --quick for a bare ch
 mcdma driver install|load
 mcdma sparks list|add HOST [--name N]|remove ID
 mcdma macs list|add HOST [--name N]|remove ID     another Mac with a card, over ssh
+mcdma linux list|add HOST [--name N]|remove ID   register Linux peers, including Strix
+mcdma linux install NODE                       build a native peer for x86-64/ARM64
+mcdma linux link NODE/IFACE NODE/IFACE --name ID save a Linux connection
+mcdma linux status|configure|test [LINK]        inspect, persist or verify Linux links
 mcdma map MAC-PORT SPARK/IFACE|none               e.g. map local:mcrdma1 spark1/enp1s0f0np0
 mcdma keepalive run       hold the Mac's fast platform state until Ctrl-C
 mcdma monitor [--seconds N]   per-link throughput and Spark inference state
@@ -42,6 +49,8 @@ Options: `--json` (one JSON document on stdout, progress on stderr), `-y`
 over ssh for checks, wiring and Spark setup; its driver and its own addresses
 must be handled on that Mac), `--demo` (fictional data, never touches
 settings), `--no-color`.
+`--ssh-config FILE` selects an existing private OpenSSH configuration for all
+remote peers; no credentials are stored by that option.
 
 Exit codes: 0 done, 1 failed, 2 usage, 3 waiting for you (driver approval in
 System Settings or a restart; run `mcdma enable` again afterwards).
@@ -104,6 +113,9 @@ MAC=<ssh host> BUILD_DIR=<dir of the built tools on that Mac> SPARK=<ssh host> n
 - `lib/collect.js` — monitor collector; `lib/exec.js`, `lib/store.js`,
   `lib/driverpkg.js`, `lib/demo.js`, `lib/parse.js`.
 - `tools/make-driver-package.sh`.
+- `native-peer.json` and `tools/bundle-linux-peer.js` retain the canonical stock
+  Linux peer sources for native destination builds; run `npm run bundle-linux-peer`
+  after changing the peer or device guard.
 
 Settings live in `~/Library/Application Support/MCDMA/settings.json`.
 

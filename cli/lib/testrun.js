@@ -60,7 +60,7 @@ async function runTransferTest({ studioHost, link, settings, onProgress = () => 
     const mac = new Endpoint(studioHost, `env ${envText(macEnv)} ${q(macClient)} ${q(link.studio.rdmaDevice)} 0 initiator`, (l) => log.push(l));
     endpoints.push(mac);
     note(`Starting verbs-peer on ${link.sparkName} (${link.spark.rdmaDevice}, GID index ${link.spark.gidIndex})`);
-    const spark = new Endpoint(sparkHost, `env ${envText(env)} ${q(sparkClient)} ${q(link.spark.rdmaDevice)} ${link.spark.gidIndex}`, (l) => log.push(l));
+    const spark = new Endpoint(sparkHost, `env ${envText({ ...env, MCDMA_RDMA_PORT: String(link.spark.rdmaPort || 1) })} ${q(sparkClient)} ${q(link.spark.rdmaDevice)} ${link.spark.gidIndex}`, (l) => log.push(l));
     endpoints.push(spark);
     const local = descriptor(await mac.line(25000));
     if (!local) throw new Error(`Mac endpoint did not start: ${(mac.stderr || '').trim().split('\n').pop() || 'no ENDPOINT line'}`);

@@ -5,9 +5,11 @@ function driverIdentity(info, port, peer, settings) {
   const loaded = info.loaded || {}, provider = info.provider || {};
   if (!loaded.loaded || !loaded.uuid || !loaded.version || !provider.present || !provider.sha256) return null;
   return crypto.createHash('sha256').update(JSON.stringify({
-    schema: 1, demo: !!info.demo, os: info.os && info.os.build,
+    schema: 2, demo: !!info.demo, os: info.os && info.os.build,
     version: loaded.version, uuid: loaded.uuid, provider: provider.sha256,
     mac: port.mac, device: port.rdmaDevice, peer: peer.mac, peerGid: peer.gid,
+    peerGidIndex: peer.gidIndex, peerPort: peer.rdmaPort || 1,
+    peerBootId: peer.bootId || null, peerTools: peer.peerToolHashes || {},
     payload: settings.test && settings.test.payload, mtu: settings.test && settings.test.mtu,
     arm: settings.test && settings.test.arm,
     knobs: port.registry && port.registry.knobs
