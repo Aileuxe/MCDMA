@@ -36,13 +36,34 @@ void driver_startup() {
     assert(hca.stop() && !sim.buffers);
 }
 void issue_9_page_query_without_firmware_error() {
-    reset(); sim.foreign_command_queue=true;
+    reset(); sim.command_queue_high=1; sim.command_queue_low=0x156;
     Hca boot_owned;
     assert(!boot_owned.start());
     assert(boot_owned.startup_error==kIOReturnBusy &&
            boot_owned.startup_page_phase==0 && boot_owned.startup_page_step==0 &&
            !sim.calls && !sim.buffers);
     assert(boot_owned.stop());
+
+    // Both functions report this exact low word after the enclosure is
+    // power-cycled. They must be able to reach QUERY_PAGES on first attach.
+    reset(); sim.command_queue_low=0x80000156;
+    Hca cold_boot;
+    assert(cold_boot.start());
+    assert(cold_boot.transport.last.opcode!=0 && sim.calls>0);
+    assert(cold_boot.stop() && !sim.buffers);
+
+    // An apparent host address remains protected unless the entire observed
+    // disabled-mode signature matches. A high word always keeps it busy.
+    for (const auto low : {0x80000056u,0x80001156u,0x80000157u}) {
+        reset(); sim.command_queue_low=low;
+        Hca occupied;
+        assert(!occupied.start() && occupied.startup_error==kIOReturnBusy && !sim.calls);
+        assert(occupied.stop() && !sim.buffers);
+    }
+    reset(); sim.command_queue_high=1; sim.command_queue_low=0x80000156;
+    Hca high_address;
+    assert(!high_address.start() && high_address.startup_error==kIOReturnBusy && !sim.calls);
+    assert(high_address.stop() && !sim.buffers);
 
     // QUERY_PAGES succeeded, then a local validation or allocation failed.
     // The issue's last-opcode/firmware fields alone cannot distinguish them.

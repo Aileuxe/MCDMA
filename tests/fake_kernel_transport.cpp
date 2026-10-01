@@ -1,5 +1,6 @@
 #include "fake_kernel_transport.hpp"
 #include "cx5_device.h"
+#include "command_queue_ownership.hpp"
 #include <assert.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -27,7 +28,7 @@ IOReturn Buffer::release() {
 IOReturn Transport::attach(IOPCIDevice *,IOService *) { return kIOReturnSuccess; }
 IOReturn Transport::open() {
     // Match the real transport: a bound command queue cannot be opened twice.
-    if (bound_ || sim.foreign_command_queue) return kIOReturnBusy;
+    if (bound_ || !command_queue_available(sim.command_queue_high,sim.command_queue_low)) return kIOReturnBusy;
     if (!mcdma_supported_device(sim.vendor_id,sim.device_id)) return kIOReturnUnsupported;
     vendor_id_=sim.vendor_id; device_id_=sim.device_id;
     pci_=&sim.pci; sim.pci.inactive=&sim.removed;
