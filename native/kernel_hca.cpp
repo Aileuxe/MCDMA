@@ -51,7 +51,7 @@ bool Hca::provide(Pool &p,uint16_t phase) {
         for (uint32_t j=0;j<batch;++j)
             cx5::write_be64(input_+16+j*8,p.buffer.dma+uint64_t(offset+j)*4096);
         if (!call(16+batch*8)) return false;
-        for (uint32_t j=0;j<batch;++j) p.given[offset+j]=true;
+        for (uint32_t j=0;j<batch;++j) p.mark_given(offset+j);
         p.owned+=batch; offset+=batch;
     }
     startup_page_step=0;
@@ -72,10 +72,10 @@ bool Hca::reclaim(Pool &p) {
             for (Pool *candidate:pools)
                 if (candidate->function==p.function && dma>=candidate->buffer.dma &&
                     dma-candidate->buffer.dma<uint64_t(candidate->count)*4096 && !(dma&4095)) owner=candidate;
-            if (!owner || !owner->given[(dma-owner->buffer.dma)/4096]) {
+            if (!owner || !owner->take_given(uint32_t((dma-owner->buffer.dma)/4096))) {
                 transport.quarantined=true; return false;
             }
-            owner->given[(dma-owner->buffer.dma)/4096]=false; --owner->owned;
+            --owner->owned;
         }
     }
     return p.owned==0;

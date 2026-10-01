@@ -67,7 +67,7 @@ void issue_9_page_query_without_firmware_error() {
 
     // QUERY_PAGES succeeded, then a local validation or allocation failed.
     // The issue's last-opcode/firmware fields alone cannot distinguish them.
-    reset(); sim.query_pages_count=8193;
+    reset(); sim.query_pages_count=16385;
     Hca invalid_count;
     assert(!invalid_count.start());
     assert(invalid_count.transport.last.opcode==0x107 &&
@@ -75,7 +75,7 @@ void issue_9_page_query_without_firmware_error() {
     assert(invalid_count.startup_error==kIOReturnBadArgument);
     assert(invalid_count.startup_page_phase==1 &&
            invalid_count.startup_page_step==2 &&
-           invalid_count.startup_page_count==8193);
+           invalid_count.startup_page_count==16385);
     assert(invalid_count.stop() && !sim.buffers);
 
     reset(); sim.query_pages_count=-1;
@@ -95,6 +95,32 @@ void issue_9_page_query_without_firmware_error() {
            no_memory.startup_page_step==3 &&
            no_memory.startup_page_count==2);
     assert(no_memory.stop() && !sim.buffers);
+}
+void issue_9_large_initial_page_request() {
+    reset(); sim.query_initial_pages_count=8828;
+    Hca hca;
+    assert(hca.start());
+    assert(hca.startup_error==kIOReturnSuccess && hca.startup_page_count==8828);
+    assert(sim.pages.size()==8830);
+    assert(hca.stop() && sim.pages.empty() && !sim.buffers);
+
+    reset(); sim.query_initial_pages_count=8828;
+    sim.fail_buffer_allocate_bytes=uint64_t(8828)*4096;
+    Hca allocation_failure;
+    assert(!allocation_failure.start());
+    assert(allocation_failure.startup_error==kIOReturnNoMemory &&
+           allocation_failure.startup_page_phase==2 &&
+           allocation_failure.startup_page_step==3 &&
+           allocation_failure.startup_page_count==8828);
+    assert(allocation_failure.stop() && sim.pages.empty() && !sim.buffers);
+
+    reset(); sim.query_initial_pages_count=16385;
+    Hca over_limit;
+    assert(!over_limit.start());
+    assert(over_limit.startup_error==kIOReturnBadArgument &&
+           over_limit.startup_page_phase==2 && over_limit.startup_page_step==2 &&
+           over_limit.startup_page_count==16385);
+    assert(over_limit.stop() && sim.pages.empty() && !sim.buffers);
 }
 void transport_access_guards() {
     reset(); Transport transport;
@@ -568,6 +594,7 @@ int main() {
     mtu_configuration();
     driver_startup();
     issue_9_page_query_without_firmware_error();
+    issue_9_large_initial_page_request();
     pcie_counters();
     lifecycle(); failed_create(false); failed_create(true); corrupt_completion(); corrupt_page_return();
     native_data_callbacks();

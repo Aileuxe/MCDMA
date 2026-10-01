@@ -10,7 +10,7 @@
 
 namespace cx5_native {
 IOReturn Buffer::allocate(IOMapper *mapper, uint64_t bytes) {
-    if (memory || mapping || !mapper || !bytes || bytes > 64 * 1024 * 1024)
+    if (memory || mapping || !mapper || !bytes || bytes > max_allocation_bytes)
         return kIOReturnBadArgument;
     size = (bytes + 16383) & ~uint64_t(16383);
     memory = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut, size, 16384);

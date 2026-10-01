@@ -113,12 +113,21 @@ public:
     uint64_t relaxed_ordering_keys=0;
     bool ack_request_every_packet=false;
 private:
-    static constexpr uint32_t max_pages = 8192;
+    static constexpr uint32_t max_pages = uint32_t(Buffer::max_allocation_bytes / 4096);
     struct Pool {
         Buffer buffer{};
         uint32_t count = 0, owned = 0;
         uint16_t function = 0;
-        bool given[max_pages]{};
+        uint64_t given[(max_pages + 63) / 64]{};
+        void mark_given(uint32_t page) { given[page / 64] |= uint64_t(1) << (page % 64); }
+        bool take_given(uint32_t page) {
+            if (page >= count) return false;
+            const uint64_t mask = uint64_t(1) << (page % 64);
+            auto &word = given[page / 64];
+            if (!(word & mask)) return false;
+            word &= ~mask;
+            return true;
+        }
     } boot_, initial_;
     HardwareObject uar_{}, eq_{}, skipped_uars_[4]{};
     Buffer eq_buffer_{};
