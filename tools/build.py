@@ -73,6 +73,8 @@ if len(sys.argv)>1 and sys.argv[1]=='test':
          'tests/test_rpcd_socket.c','rpc/rpcd_common.c','-o',BUILD/'test-rpcd-socket'])
     run([BUILD/'test-rpcd-socket'])
     run([sys.executable,'-B','tests/test_rpcd_daemon.py'])
+    # Optional Linux GPU imports (rpc/gpu): CUDA through API stubs, so no GPU or CUDA SDK is needed.
+    run(['make','-C','rpc/gpu','test'])
     run([sys.executable,'-B','tests/test_kv_handoff.py'])
     run(['clang','-std=c11','-O2','-Wall','-Wextra','-Werror',*RPCD_SOURCES,'-lrdma','-o',BUILD/'mcdma-rpcd'])
     run([BUILD/'mcdma-rpcd','version'])
