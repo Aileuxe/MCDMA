@@ -5,8 +5,9 @@ is the base for collectives an engine runs itself: barriers, plan broadcasts, al
 and bulk copies. Unlike `mcdma-rpcd`, the library opens the verbs device inside the application, so an engine posts
 writes with no daemon hop. Peers meet through the same Thunderbolt-only exchange as the daemons; there is no TCP.
 
-Status: ABI 1, compiled and offline-tested against a stub verbs library that enforces RoCE keys and Apple's TN3205
-rules for Thunderbolt RDMA. It has not run on hardware yet; `fabric-check` below is the qualification tool.
+Status: ABI 1, compiled and offline-tested against a stub verbs library that enforces RoCE keys and models Thunderbolt
+RDMA as two Studios on macOS 27.0 measured it. It has not run on hardware yet; `fabric-check`, `mesh-check` and
+`metal-poll` below are the qualification tools.
 
 ## The calls
 
@@ -72,40 +73,64 @@ Mac `via` must be the Thunderbolt port of a Thunderbolt device, or a Thunderbolt
 
 ## Thunderbolt links
 
-TN3205 sets what Apple's RDMA over Thunderbolt can do, and the library is built around it:
+Apple's TN3205 describes RDMA over Thunderbolt as SEND and RECV on UC queue pairs, with receives that match their
+sends' frame counts. Two M3 Ultra Studios on macOS 27.0 (build 26A428) behaved differently in a qualification on
+3 October 2026, and the library follows what they did:
 
-| Thunderbolt RDMA | What the library does |
+| Measured on macOS 27.0 | What the library does |
 | --- | --- |
-| SEND and RECV only, `IBV_WR_SEND` | A write becomes a send that the receiver places; there is no READ |
-| UC queue pairs, at most 10 a device | Two per peer |
-| A receive must match its send's frame count, in 4 KiB frames | The receiver posts a receive of exactly the announced length |
-| Credit flow: a send waits for a matching receive | The receiving side must make progress |
-| No hardware acknowledgement: a completed send was sent, not received | `flush` is a fence that the peer answers |
-| Queue depth up to 4,095 frames, possibly less as granted | Messages shrink to fit both sides' granted depth |
+| UC queue pairs only, three a device; RC creation fails | One queue pair a link, so a port holds a fabric link and a daemon link with one spare |
+| Every request is a SEND; WRITE bytes land in the peer's next posted receive | A write is a SEND that the receiver places; there is no READ and no atomic |
+| A SEND crosses as 4 KiB packets, each filling the next posted receive in order | Every receive is one 4 KiB packet, kept posted in a ring |
+| Every packet but a message's last completes with `IBV_WC_LOC_LEN_ERR` and 4,096 bytes; a receive over 4,096 bytes fails | The ring reads a message's end from the one clean completion |
+| A packet with no receive posted waits; a zero-length SEND is lost and never completes | Senders wait for the ring; no message is ever empty |
+| The send queue counts packets, at most 4,095 in flight | Packets in flight are counted against the granted depth |
+| A completed send has left the host, not reached the peer; `ibv_query_qp_data_in_order` is 0 | `flush` is a fence the peer answers; nothing relies on byte order inside a packet |
 
 How a write lands:
 
-1. Each peer pair has a control ring of 64 one-frame messages and a data queue. Control messages always fill a whole
-   4 KiB frame, so every receive matches its send byte for byte.
-2. A write of up to 4,064 bytes travels inside one control message and is copied into place.
-3. A larger write is cut into pieces of at most 4 MiB that never cross a registration on either side. Each piece
-   sends a control message with its offset and length, then its bytes on the data queue. The receiver posts a receive
-   of exactly that length at that offset, so the bytes land in place without a copy.
-4. Signals and fences are control messages. The receiver applies control messages in arrival order, each only after
-   every earlier data receive has completed, and posts no data receive past an inline write or signal still waiting on
-   the same bytes. So signals follow their writes, and later writes to the same bytes win, as RC ordering gives on
-   RoCE.
-5. Every control message carries a sequence number. A lost or reordered control message, a data message whose length
-   differs from its announcement, a write outside the window or any failed completion fails the link instead of
-   landing anywhere else.
+1. Each link keeps a ring of 2,048 one-packet receives (8 MiB) posted, so a message lands at once whatever the
+   receiver is doing.
+2. A write of up to 4,064 bytes travels inside one header message, a single packet.
+3. A larger write is a header message with its offset and length, then its bytes as a message of their own, sent
+   straight from the window with no copy, in pieces of at most 4 MiB that never cross a registration.
+4. The receiver takes whole messages from the ring in arrival order and copies each write's bytes into place. A signal
+   is applied when its header is taken, so it lands after the writes before it, and later writes to the same bytes
+   win, as RC ordering gives on RoCE.
+5. Every header carries a sequence number. A lost or reordered message, bytes whose length differs from their header,
+   a write outside the window or any unexpected completion fails the link instead of landing anywhere else.
 
-Because Thunderbolt has no hardware acknowledgement, a data message lost whole with the next one exactly the same
-length would land one slot early unnoticed. TN3205 gives no rate for that, and `fabric-check` checks every byte on
-hardware to measure it.
+Only one copy is paid, on the receiving CPU. An engine that reads partials where they land could skip it; that needs
+the ring exposed, which this ABI does not do yet.
 
-Incoming writes land only when the receiving library posts receives for them. Open with
-`MCDMA_FABRIC_PROGRESS_THREAD`, or call `mcdma_fabric_progress` or `mcdma_fabric_wait` while waiting. A rank that has
-finished its own work keeps progressing until its peers have flushed, because their flushes need its answer.
+Incoming writes land only when the receiving library takes them from the ring. Open with
+`MCDMA_FABRIC_PROGRESS_THREAD`, or call `mcdma_fabric_progress` or `mcdma_fabric_wait` while waiting. A node with
+several links needs a progress thread on each: a node blocked sending on one link must keep taking what the others
+bring, or three nodes waiting on each other in a ring deadlock. A rank that has finished its own work keeps
+progressing until its peers have flushed, because their flushes need its answer.
+
+## Writes from several peers
+
+Nothing orders writes that arrive over different links. If two peers write the same bytes, a late write from one can
+land after a newer write from the other, even past a flag. Give each sender its own region at every receiver, as the
+all-reduce slots below do, and let each step's flag cover only that sender's region.
+
+## GPU hand-off
+
+A collective step pays a hand-off between the GPU and the host on each side. Waking the host from a Metal event costs
+about 100 µs; a host thread spinning on a word the GPU writes, and a resident kernel spinning on a word the host or the
+NIC writes, should cost a few microseconds. Whether a resident Metal kernel sees those words while it runs is not
+documented, so `metal-poll` measures it:
+
+- `metal-poll cpu ROUNDS` runs on any Apple silicon Mac. A host thread writes a 4 KiB packet whose every 16-byte line
+  is three data words and a round tag, and a resident kernel polls the tags, checks the data and answers through a
+  word the host spins on. It prints the round trip and counts lines that never appeared or appeared torn.
+- `metal-poll nic-gpu` and `metal-poll nic-send`, on two Macs cabled port to port, send the same packets by Thunderbolt
+  RDMA into a ring that the GPU polls directly, with no host copy and no completion read first. The sender times each
+  round trip. Comparing it with `fabric-check`'s host-only round trip at 4 KiB gives the GPU's share.
+
+Every line carries its own tag because the provider reports no byte order inside a packet. Spins are capped and a
+late round stops the kernel, so no command buffer runs long.
 
 ## Mapping an engine's one-sided interface
 
@@ -126,6 +151,26 @@ A Mac listen end of `mcdma-rpcd` keeps its mailbox in POSIX shared memory `/mcdm
 mailbox client opens it with `shm_open` on macOS.
 
 ## Qualifying on hardware
+
+`build/rpc/mesh-check` qualifies four nodes cabled as a full mesh, one Thunderbolt port to each peer:
+
+```bash
+mesh-check NODE GID_INDEX BASE_PORT SECONDS ROWS LINK LINK LINK
+```
+
+`NODE` is 0 to 3 and fixes the reduction order. Each `LINK` is `DEVICE:IFACE:PEER`, for example `rdma_en3:en3:3`.
+Every node opens one fabric a port over the same window and meets its three peers at once. Then:
+
+1. One-shot all-reduces at each row count in `ROWS`, of 14,336-byte bf16 rows. Each node writes its partial to its
+   slot at all three peers at once, signals, and sums the four partials in fp32 in node order 0, 1, 2, 3, rounding
+   once to bf16. Every partial that crossed a link and every sum is checked against partials the node computes
+   itself. Each size prints the communication and sum times and a running hash of every sum.
+2. All three links stream at once and each node prints its rate.
+3. A long run of random sizes for `SECONDS`, reporting each minute; the nodes stop together on the first step any of
+   their clocks asks to stop.
+
+Every node must print `wrong=0`, `stalls=0` and the same hash; each ends with `PASS` and exit 0 only then.
+
 
 `build/rpc/fabric-check` runs on both machines of one link:
 

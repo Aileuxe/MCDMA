@@ -128,6 +128,10 @@ if len(sys.argv)>1 and sys.argv[1]=='native':
          'rpc/link_verbs.c','rpc/link_tb.c','-lrdma','-o',BUILD/'rpc-echo'])
     run(['clang','-std=c11','-O2','-Wall','-Wextra','-Werror','-isysroot',ms,'rpc/fabric_check.c',
          'rpc/libmcdma_fabric.c',*LINK_SOURCES,'-lrdma','-o',BUILD/'fabric-check'])
+    run(['clang','-std=c11','-O2','-Wall','-Wextra','-Werror','-isysroot',ms,'rpc/mesh_check.c',
+         'rpc/libmcdma_fabric.c',*LINK_SOURCES,'-lrdma','-o',BUILD/'mesh-check'])
+    run(['clang','-std=c11','-O2','-Wall','-Wextra','-Werror','-isysroot',ms,'-fobjc-arc','rpc/metal_poll.m',
+         *LINK_SOURCES,'-framework','Metal','-framework','Foundation','-lrdma','-o',BUILD/'metal-poll'])
     # GPU keep-alive: holds the platform out of its idle power state during
     # latency-critical RDMA (see docs/gpu-keepalive.md).
     run(['xcrun','swiftc','-O','-sdk',ms,'client/fabric_keepalive.swift','-o',BUILD/'fabric-keepalive'])

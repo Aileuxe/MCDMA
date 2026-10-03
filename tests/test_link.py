@@ -46,6 +46,8 @@ class LinkTests(unittest.TestCase):
             'fabric': ['-DMCDMA_FABRIC_TEST_DMABUF', 'rpc/libmcdma_fabric.c', *LINK, *STUB, 'tests/test_fabric.c'],
             'fabric-check': ['-DFABRIC_CHECK_NO_MAIN', 'rpc/fabric_check.c', 'rpc/libmcdma_fabric.c', *LINK, *STUB,
                              'tests/test_fabric_check.c'],
+            'mesh-check': ['-DMESH_CHECK_NO_MAIN', 'rpc/mesh_check.c', 'rpc/libmcdma_fabric.c', *LINK, *STUB,
+                           'tests/test_mesh_check.c'],
         }
         for name, sources in builds.items():
             subprocess.run([*flags, *sources, '-lpthread', '-o', os.path.join(cls.work, name)], cwd=ROOT, check=True)
@@ -111,6 +113,10 @@ class LinkTests(unittest.TestCase):
     def test_fabric_check_passes_on_both_link_kinds(self):
         self.run_case('fabric-check', 'tb', STUB_SEED='3', STUB_LAZY='1')
         self.run_case('fabric-check', 'roce', STUB_STRICT='1')
+
+    def test_four_node_mesh_all_reduces_in_node_order(self):
+        self.run_case('mesh-check', '1,16,300', '1', STUB_SEED='4', timeout=600)
+        self.run_case('mesh-check', '1,4', '2', STUB_SEED='7', STUB_LAZY='1', timeout=600)
 
     @unittest.skipUnless(os.environ.get('MCDMA_VERBS_SMOKE') == '1', 'set MCDMA_VERBS_SMOKE=1 to list real devices')
     def test_verbs_smoke_lists_real_devices(self):

@@ -32,7 +32,7 @@ struct mcdma_fabric {
     struct region win;
     pthread_mutex_t lock;
     pthread_t thread;
-    int threaded;
+    int threaded, wanted;           /* callers waiting for the lock; the progress thread steps aside for them */
     volatile int stop;
     uint64_t serviced;
     struct mcdma_fabric_peer *peers[MAX_PEERS];
@@ -171,11 +171,18 @@ static int progress_all(struct mcdma_fabric *f) {
     return handled;
 }
 
+/* Callers take the lock through this, so the progress thread's tight loop never starves them. */
+static void enter(struct mcdma_fabric *f) {
+    __atomic_add_fetch(&f->wanted, 1, __ATOMIC_ACQ_REL);
+    pthread_mutex_lock(&f->lock);
+    __atomic_sub_fetch(&f->wanted, 1, __ATOMIC_ACQ_REL);
+}
+
 static void *progress_main(void *arg) {
     struct mcdma_fabric *f = arg;
     uint64_t active = link_now_ns();
     while (!f->stop) {
-        pthread_mutex_lock(&f->lock);
+        if (__atomic_load_n(&f->wanted, __ATOMIC_ACQUIRE) || pthread_mutex_trylock(&f->lock)) continue;
         int handled = progress_all(f);
         pthread_mutex_unlock(&f->lock);
         if (handled) active = link_now_ns();
@@ -292,7 +299,7 @@ int mcdma_fabric_connect(struct mcdma_fabric *f, const char *via, int port, int 
             status = MCDMA_FABRIC_DEVICE;
     }
     if (!status) status = exchange(p, timeout_ns);
-    pthread_mutex_lock(&f->lock);
+    enter(f);
     if (!status && f->npeers == MAX_PEERS) status = MCDMA_FABRIC_NOMEM;
     if (!status) f->peers[f->npeers++] = p;
     pthread_mutex_unlock(&f->lock);
@@ -353,9 +360,9 @@ int mcdma_fabric_write(struct mcdma_fabric_peer *p, uint64_t local_offset, uint6
     if (!p) return MCDMA_FABRIC_INVALID;
     if (!in(local_offset, length, p->f->win.length) || !in(remote_offset, length, p->remote_length))
         return MCDMA_FABRIC_BOUNDS;
-    pthread_mutex_lock(&p->f->lock);
+    enter(p->f);
     int failed = p->down || (length && (p->e.kind == LINK_TB ? tb_write(&p->e, &p->f->win, local_offset, remote_offset,
-                                                                         length, p->remote.seg, OP_NS)
+                                                                         length, OP_NS)
                                                              : roce_range(p, IBV_WR_RDMA_WRITE, local_offset,
                                                                           remote_offset, length)));
     return settle(p, failed);
@@ -364,7 +371,7 @@ int mcdma_fabric_write(struct mcdma_fabric_peer *p, uint64_t local_offset, uint6
 int mcdma_fabric_signal(struct mcdma_fabric_peer *p, uint64_t remote_offset, uint64_t value) {
     if (!p) return MCDMA_FABRIC_INVALID;
     if (remote_offset % 8 || !in(remote_offset, 8, p->remote_length)) return MCDMA_FABRIC_BOUNDS;
-    pthread_mutex_lock(&p->f->lock);
+    enter(p->f);
     int failed = p->down || (p->e.kind == LINK_TB ? tb_signal(&p->e, remote_offset, value, OP_NS)
                                                   : roce_signal(p, remote_offset, value));
     return settle(p, failed);
@@ -375,7 +382,7 @@ int mcdma_fabric_read(struct mcdma_fabric_peer *p, uint64_t local_offset, uint64
     if (p->e.kind == LINK_TB) return MCDMA_FABRIC_UNSUPPORTED;
     if (!in(local_offset, length, p->f->win.length) || !in(remote_offset, length, p->remote_length))
         return MCDMA_FABRIC_BOUNDS;
-    pthread_mutex_lock(&p->f->lock);
+    enter(p->f);
     return settle(p, p->down || roce_range(p, IBV_WR_RDMA_READ, local_offset, remote_offset, length));
 }
 
@@ -387,7 +394,7 @@ int mcdma_fabric_fetch_add(struct mcdma_fabric_peer *p, uint64_t remote_offset, 
 
 int mcdma_fabric_flush(struct mcdma_fabric_peer *p, uint64_t timeout_ns) {
     if (!p) return MCDMA_FABRIC_INVALID;
-    pthread_mutex_lock(&p->f->lock);
+    enter(p->f);
     int failed = p->down || (p->e.kind == LINK_TB ? tb_fence(&p->e, timeout_ns)
                                                   : ep_reap(&p->e, p->e.outstanding, timeout_ns) < 0);
     return settle(p, failed);
@@ -395,7 +402,7 @@ int mcdma_fabric_flush(struct mcdma_fabric_peer *p, uint64_t timeout_ns) {
 
 int mcdma_fabric_progress(struct mcdma_fabric *f) {
     if (!f) return MCDMA_FABRIC_INVALID;
-    pthread_mutex_lock(&f->lock);
+    enter(f);
     progress_all(f);
     pthread_mutex_unlock(&f->lock);
     return MCDMA_FABRIC_OK;
@@ -417,7 +424,7 @@ void mcdma_fabric_disconnect(struct mcdma_fabric_peer **pp) {
     if (!pp || !*pp) return;
     struct mcdma_fabric_peer *p = *pp;
     struct mcdma_fabric *f = p->f;
-    pthread_mutex_lock(&f->lock);
+    enter(f);
     for (int i = 0; i < f->npeers; ++i)
         if (f->peers[i] == p) f->peers[i] = f->peers[--f->npeers];
     pthread_mutex_unlock(&f->lock);

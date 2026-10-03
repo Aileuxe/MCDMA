@@ -1,6 +1,6 @@
-/* Offline test of the Thunderbolt placement protocol under the stub's TN3205 rules, one scenario per run:
- *   order     every signal lands after the writes before it, from 1 byte to past a registration boundary
- *   overlap   later writes to the same bytes win, whichever path (inline or data queue) each one took
+/* Offline test of the Thunderbolt write protocol under the stub's model of the measured provider, one scenario a run:
+ *   order     every signal lands after the writes before it, from 1 byte through packet and message boundaries
+ *   overlap   later writes to the same bytes win, whether each rode inside its header or as a message of its own
  *   random    thousands of random writes and signals both ways at once match a replayed mirror
  *   bounds    a write outside what the receiver accepts fails the link instead of landing
  *   teardown  queue pairs with sends still waiting for credit are torn down without misuse
@@ -82,7 +82,8 @@ static void join_pair(struct side *a, struct side *b) {
     struct xinfo ia, ib;
     ep_info(&a->e, &a->r, &ia);
     ep_info(&b->e, &b->r, &ib);
-    CHECK(ia.transport == LINK_TB && ia.qpn2 && ia.frames && ia.table.n == 0, "a thunderbolt offer carries no keys");
+    CHECK(ia.transport == LINK_TB && ia.qpn && !ia.qpn2 && ia.frames >= 4 && ia.frames <= TB_RING && ia.table.n == 0,
+          "a thunderbolt offer is one queue pair, its ring as granted and no keys");
     CHECK(!ep_connect(&a->e, &ib) && !ep_connect(&b->e, &ia), "both sides reach RTS");
 }
 
@@ -130,7 +131,8 @@ static void wait_word(struct side *s, uint64_t off, uint64_t want) {
 }
 
 static void scenario_order(struct side *a, struct side *b) {
-    const uint64_t sizes[] = {1, 7, 4064, 4065, 8192, 65536 + 3, (1ull << 20) + 5, (5ull << 20) + 1, 13ull << 20};
+    const uint64_t sizes[] = {1,         7,          4064,     4065,          4096,          8192,   65536 + 3,
+                              (1ull << 20) + 5, 4ull << 20, (4ull << 20) + 1, (5ull << 20) + 1, 13ull << 20};
     const uint64_t flag = WINDOW - 64;
     for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
         uint64_t len = sizes[i], src = (rnd() % 64) * 8 + 1;
@@ -138,7 +140,7 @@ static void scenario_order(struct side *a, struct side *b) {
         uint64_t dst = i % 2 ? TB_SEG - len / 2 - 3 : 4096 * (uint64_t)i;
         g_watch.dst = dst, g_watch.len = len, g_watch.src = a->mem + src;
         __atomic_store_n(&g_watch.value, 1000 + i, __ATOMIC_RELEASE);
-        CHECK(!tb_write(&a->e, &a->r, src, dst, len, TB_SEG, TIMEOUT), "a write is posted");
+        CHECK(!tb_write(&a->e, &a->r, src, dst, len, TIMEOUT), "a write is posted");
         CHECK(!tb_signal(&a->e, flag, 1000 + i, TIMEOUT), "a signal is posted");
         /* this thread stays out of the verbs layer until the receiver has judged the signal */
         uint64_t deadline = link_now_ns() + TIMEOUT;
@@ -160,11 +162,11 @@ static void scenario_overlap(struct side *a, struct side *b) {
         uint64_t s1 = (rnd() % 256) * 4096, s2 = (rnd() % 256) * 4096 + 7, s3 = (rnd() % 256) * 4096 + 11;
         memcpy(expect, a->mem + s1, big);
         memcpy(expect + mid, a->mem + s2, small);
-        CHECK(!tb_write(&a->e, &a->r, s1, at, big, TB_SEG, TIMEOUT), "a data write");
-        CHECK(!tb_write(&a->e, &a->r, s2, at + mid, small, TB_SEG, TIMEOUT), "an inline write over it");
+        CHECK(!tb_write(&a->e, &a->r, s1, at, big, TIMEOUT), "a data write");
+        CHECK(!tb_write(&a->e, &a->r, s2, at + mid, small, TIMEOUT), "an inline write over it");
         if (round % 2) {
             memcpy(expect, a->mem + s3, big);
-            CHECK(!tb_write(&a->e, &a->r, s3, at, big, TB_SEG, TIMEOUT), "a data write over both");
+            CHECK(!tb_write(&a->e, &a->r, s3, at, big, TIMEOUT), "a data write over both");
         }
         CHECK(!tb_signal(&a->e, flag, 77 + round, TIMEOUT), "a signal");
         wait_word(b, flag, 77 + round);
@@ -176,7 +178,7 @@ static void *writer(void *arg) {
     struct job *j = arg;
     for (int i = 0; i < OPS && !j->me->failed; ++i) {
         const struct op *o = &j->ops[i];
-        if (o->len ? tb_write(&j->me->e, &j->me->r, o->src, o->dst, o->len, TB_SEG, TIMEOUT)
+        if (o->len ? tb_write(&j->me->e, &j->me->r, o->src, o->dst, o->len, TIMEOUT)
                    : tb_signal(&j->me->e, o->dst, o->value, TIMEOUT))
             j->me->failed = 1;
     }
@@ -224,7 +226,7 @@ static void scenario_random(struct side *a, struct side *b) {
 }
 
 static void scenario_bounds(struct side *a, struct side *b) {
-    CHECK(!tb_write(&a->e, &a->r, 0, HALF + 4096, 100, TB_SEG, TIMEOUT), "the sender cannot see the receiver's limit");
+    CHECK(!tb_write(&a->e, &a->r, 0, HALF + 4096, 100, TIMEOUT), "the sender cannot see the receiver's limit");
     uint64_t deadline = link_now_ns() + TIMEOUT;
     while (!b->failed) CHECK(link_now_ns() < deadline, "a write past the accepted range did not fail the link");
     stop(b);
@@ -233,8 +235,8 @@ static void scenario_bounds(struct side *a, struct side *b) {
 
 static void scenario_teardown(struct side *a, struct side *b) {
     stop(b);
-    for (uint64_t i = 0; i < 20; ++i)
-        CHECK(!tb_write(&a->e, &a->r, 0, i * 16384, 8192 + 100, TB_SEG, TIMEOUT), "a write is queued");
+    /* 12 MiB is more than the receiver's 8 MiB ring, so some packets must wait for receives */
+    for (uint64_t i = 0; i < 12; ++i) CHECK(!tb_write(&a->e, &a->r, 0, i << 20, 1u << 20, TIMEOUT), "a write is queued");
     CHECK(tb_busy(&a->e), "sends wait for the receiver's credit");
     ep_destroy_qp(&a->e);
     ep_destroy_qp(&b->e);

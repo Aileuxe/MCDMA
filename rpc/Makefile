@@ -14,6 +14,7 @@ SHARED_HELPER := -dynamiclib -install_name $(PREFIX)/lib/$(HELPER)
 SHARED_FABRIC := -dynamiclib -install_name $(PREFIX)/lib/$(FABRIC)
 # Metal buffers over mailbox memory, for GPUs that read what the NIC wrote.
 HELPER_EXTRA := libmcdma_rpc_metal.m -fobjc-arc -framework Metal -framework Foundation
+GPU_TOOLS := $(OUT)/metal-poll
 else
 # shm_open lives in librt before glibc 2.34; dlsym finds ibv_reg_dmabuf_mr where libibverbs has it
 VERBS := -libverbs -lrt
@@ -27,7 +28,8 @@ endif
 LINK := link_verbs.c link_tb.c link_xchg.c
 DAEMON := mcdma-rpcd.c rpcd_common.c rpcd_verbs.c rpcd_listen.c rpcd_connect.c $(LINK)
 
-all: $(OUT)/mcdma-rpcd $(OUT)/$(HELPER) $(OUT)/$(FABRIC) $(OUT)/rpc-echo $(OUT)/fabric-check
+all: $(OUT)/mcdma-rpcd $(OUT)/$(HELPER) $(OUT)/$(FABRIC) $(OUT)/rpc-echo $(OUT)/fabric-check $(OUT)/mesh-check \
+     $(GPU_TOOLS)
 
 $(OUT):
 	mkdir -p $(OUT)
@@ -49,6 +51,13 @@ $(OUT)/rpc-echo: rpc_echo.c rpcd_common.c rpcd.h link.h | $(OUT)
 # fabric-check carries the library's code itself, so it runs from the build directory with nothing installed.
 $(OUT)/fabric-check: fabric_check.c libmcdma_fabric.c mcdma_fabric.h $(LINK) link.h | $(OUT)
 	$(CC) $(CFLAGS) -o $@ fabric_check.c libmcdma_fabric.c $(LINK) $(VERBS) -lpthread $(FABRIC_EXTRA)
+
+# Four-node mesh qualification, and on a Mac the GPU hand-off check (docs/fabric.md).
+$(OUT)/mesh-check: mesh_check.c libmcdma_fabric.c mcdma_fabric.h $(LINK) link.h | $(OUT)
+	$(CC) $(CFLAGS) -o $@ mesh_check.c libmcdma_fabric.c $(LINK) $(VERBS) -lpthread $(FABRIC_EXTRA)
+
+$(OUT)/metal-poll: metal_poll.m $(LINK) link.h | $(OUT)
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ metal_poll.m $(LINK) -framework Metal -framework Foundation $(VERBS) -lpthread
 
 test: ../tests/test_rpc_helper.c ../tests/test_rpcd_socket.c libmcdma_rpc.c mcdma_rpc.h rpcd_common.c rpcd.h | $(OUT)
 	$(CC) $(CFLAGS) -o $(OUT)/test-rpc-helper ../tests/test_rpc_helper.c libmcdma_rpc.c $(HELPER_EXTRA) -lpthread

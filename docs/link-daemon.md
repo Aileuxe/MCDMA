@@ -10,16 +10,17 @@ A link runs over one of two kinds of RDMA:
 - **RoCE.** A Mac's ConnectX-5 through MCDMA's provider (`rdma_mcrdmaN`) and a Linux peer, or two Linux hosts with
   rdma-core. RC queue pairs carry RDMA WRITE and READ.
 - **Thunderbolt.** Two Macs cabled port to port, using Apple's RDMA over Thunderbolt (`rdma_enN`, macOS 26.2 and
-  later). Apple's [TN3205](https://developer.apple.com/documentation/technotes/tn3205-low-latency-communication-with-rdma-over-thunderbolt)
-  allows only SEND and RECV on UC queue pairs, so the daemons place each other's writes themselves; the
-  [fabric guide](fabric.md#thunderbolt-links) describes how.
+  later; see Apple's [TN3205](https://developer.apple.com/documentation/technotes/tn3205-low-latency-communication-with-rdma-over-thunderbolt)).
+  It carries only SENDs on UC queue pairs, three a device on macOS 27.0, so the daemons place each other's writes
+  themselves over one queue pair a link; the [fabric guide](fabric.md#thunderbolt-links) describes how.
 
 Either end of a link can be a Mac or a Linux host. The daemons set a link up with a short exchange of IPv6 link-local
 datagrams on a Thunderbolt cable. There is no TCP anywhere, and every payload byte moves by RDMA.
 
-Status: compiled and offline-tested with this repository's checks, including a stub verbs library that enforces
-TN3205's rules. Neither link kind has run on hardware in this form. The RoCE transfer and teardown logic is carried
-over from an earlier, hardware-tested version; the setup exchange and Thunderbolt links are new.
+Status: compiled and offline-tested with this repository's checks, including a stub verbs library that models
+Thunderbolt RDMA as two Studios on macOS 27.0 measured it. Neither link kind has run on hardware in this form. The
+RoCE transfer and teardown logic is carried over from an earlier, hardware-tested version; the setup exchange and
+Thunderbolt links are new.
 
 ## Build and install
 
@@ -55,9 +56,10 @@ mcdma-rpcd listen kv-a rdma_en2 1 4096 en2:18620 4 64
 mcdma-rpcd connect kv-a,en3,18620,rdma_en3,1,4096,4,64
 ```
 
-The GID index selects one of the port's addresses: in TN3205's table, index 0 is the MAC-derived link-local address,
-1 the IPv4 link-local one (`::ffff:169.254.x.y`) and 2 the interface's own link-local address. TN3205's example uses 1;
-use the same index on both Macs. Thunderbolt links reply directly only; `MCDMA_RPC_PULL=1` needs RDMA READ and is
+The GID index selects one of the port's addresses. TN3205's table for macOS 26 lists the MAC-derived link-local
+address at index 0 and the IPv4 link-local one at 1; on macOS 27.0 index 1 was the interface's EUI-64 link-local
+address and index 0 the Thunderbolt domain's UUID. Read the table with `ibv_devinfo -v` and use the same index on
+both Macs; the qualification used 1. Thunderbolt links reply directly only; `MCDMA_RPC_PULL=1` needs RDMA READ and is
 refused.
 
 ### Mac to Linux over the ConnectX-5

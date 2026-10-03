@@ -60,7 +60,7 @@ void xchg_answer(struct xchg *x, const uint8_t to[16], int kind, int role, const
 int box_transfer(struct ep *e, struct box *b, const struct table *remote, uint64_t off, uint32_t len, uint64_t word_src,
                  uint64_t word_dst, uint64_t word, struct piece *pieces, int cap, int window) {
     if (e->kind == LINK_TB)
-        return tb_write(e, &b->r, off, off, len, remote->seg, XFER_NS) || tb_signal(e, word_dst, word, XFER_NS) ? -1 : 0;
+        return tb_write(e, &b->r, off, off, len, XFER_NS) || tb_signal(e, word_dst, word, XFER_NS) ? -1 : 0;
     int n = len ? cut(&b->r, off, len, remote, off, SEG, pieces, cap - 1) : 0;
     if (n < 0) return -1;
     pieces[n] = (struct piece){b->base + word_src, region_lkey(&b->r, word_src), remote->base + word_dst,

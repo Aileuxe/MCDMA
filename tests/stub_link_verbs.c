@@ -1,7 +1,8 @@
 /* Offline verbs for the link, daemon and fabric tests: RoCE devices roce0 and roce1 (RC, WRITE and READ, CX5 limits)
- * and Apple Thunderbolt devices tb0-tb3 (UC, SEND and RECV only, TN3205's limits). Every key and range is checked. A
- * Thunderbolt send completes only once the peer has posted a receive of the same frame count, and queue pairs are
- * delivered in a random order (STUB_SEED). Misuse prints STUB-VIOLATION and exits 86, never a crash report. */
+ * and Apple Thunderbolt devices tb0-tb11 as the 3 October qualification measured them on macOS 27.0: UC only, three
+ * queue pairs a device, SEND only, each SEND cut into 4 KiB packets that fill the peer's posted receives in order,
+ * every packet but the last completing with IBV_WC_LOC_LEN_ERR. Packets wait for receives, queue pairs are delivered
+ * in a random order (STUB_SEED), and every key and range is checked. Misuse prints STUB-VIOLATION and exits 86. */
 #ifdef __APPLE__
 #define _DARWIN_C_SOURCE 1
 #else
@@ -15,23 +16,25 @@
 #include <string.h>
 #include <unistd.h>
 
-#define NDEV 6
+#define NDEV 14
 #define TB_FIRST 2
 #define MAXQP 512
 #define MAXMR 8192
-#define FRAME 4096u
+#define PACKET 4096u
 #define TB_MR_MAX 0xfa0000u
 #define TB_MAX_MSG 16773120u
+#define TB_QPS 3
 
 struct sctx { struct ibv_context c; int dev; };
 struct spd { struct ibv_pd pd; int dev; };
 struct smr { struct ibv_mr mr; int dev, access, live; };
 struct scq { struct ibv_cq cq; struct ibv_wc *ring; int cap, head, count, destroyed; };
-struct swr { uint64_t id; unsigned char *addr; uint32_t len; };
-struct sq { struct swr *v; uint32_t cap, head, count, frames; };
+struct swr { uint64_t id; unsigned char *addr; uint32_t len, sent; };
+struct sq { struct swr *v; uint32_t cap, head, count, packets; };
 struct sqp { struct ibv_qp qp; int dev, destroyed; uint32_t dest, cap_send, cap_recv; struct sq send, recv; };
 
-static const char *g_names[NDEV] = {"roce0", "roce1", "tb0", "tb1", "tb2", "tb3"};
+static const char *g_names[NDEV] = {"roce0", "roce1", "tb0", "tb1", "tb2", "tb3", "tb4",
+                                    "tb5", "tb6", "tb7", "tb8", "tb9", "tb10", "tb11"};
 static struct ibv_device g_dev[NDEV];
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static struct smr *g_mr[MAXMR];
@@ -46,7 +49,7 @@ static void die(const char *what) {
 }
 
 static int is_tb(int dev) { return dev >= TB_FIRST; }
-static uint32_t frames(uint32_t len) { return len ? (len + FRAME - 1) / FRAME : 1; }
+static uint32_t packets(uint32_t len) { return len ? (len + PACKET - 1) / PACKET : 1; }
 
 static unsigned rnd(void) {
     if (!g_rand) {
@@ -94,13 +97,13 @@ static void push(struct ibv_cq *cq, uint64_t id, enum ibv_wc_status st, enum ibv
 }
 
 static void enqueue(struct sq *q, uint64_t id, uint64_t addr, uint32_t len) {
-    q->v[(q->head + q->count++) % q->cap] = (struct swr){id, (unsigned char *)(uintptr_t)addr, len};
-    q->frames += frames(len);
+    q->v[(q->head + q->count++) % q->cap] = (struct swr){id, (unsigned char *)(uintptr_t)addr, len, 0};
+    q->packets += packets(len);
 }
 
 static struct swr dequeue(struct sq *q) {
     struct swr w = q->v[q->head];
-    q->head = (q->head + 1) % q->cap, q->count--, q->frames -= frames(w.len);
+    q->head = (q->head + 1) % q->cap, q->count--, q->packets -= packets(w.len);
     return w;
 }
 
@@ -109,7 +112,7 @@ static void flush(struct sqp *q) {
     while (q->recv.count) push(q->qp.recv_cq, dequeue(&q->recv).id, IBV_WC_WR_FLUSH_ERR, IBV_WC_RECV, 0, q->qp.qp_num);
 }
 
-/* Thunderbolt delivery: queue pairs in random order, FIFO within each; STUB_LAZY delivers only while a CQ is polled. */
+/* Packet by packet, queue pairs in random order; all but a message's last complete with LOC_LEN_ERR. */
 static void pump(int polling) {
     static int lazy = -1;
     if (lazy < 0) lazy = getenv("STUB_LAZY") != NULL;
@@ -124,15 +127,20 @@ static void pump(int polling) {
     }
     for (int k = 0; k < n; ++k) {
         struct sqp *q = g_qp[order[k]], *d = q->dest >= 100 && q->dest - 100 < (uint32_t)g_nqp ? g_qp[q->dest - 100] : NULL;
-        for (unsigned burst = rnd() % 4; burst && q->send.count; --burst) {
+        for (unsigned burst = rnd() % 9; burst && q->send.count; --burst) {
             if (!d || d->destroyed || (d->qp.state != IBV_QPS_RTR && d->qp.state != IBV_QPS_RTS) || !d->recv.count) break;
-            struct swr s = q->send.v[q->send.head], r = d->recv.v[d->recv.head];
-            if (frames(s.len) != frames(r.len)) die("a receive of a different frame count from its send (TN3205)");
-            if (s.len > r.len) die("a receive buffer smaller than its message");
-            memcpy(r.addr, s.addr, s.len);
-            dequeue(&q->send), dequeue(&d->recv);
-            push(q->qp.send_cq, s.id, IBV_WC_SUCCESS, IBV_WC_SEND, s.len, q->qp.qp_num);
-            push(d->qp.recv_cq, r.id, IBV_WC_SUCCESS, IBV_WC_RECV, s.len, d->qp.qp_num);
+            struct swr *s = &q->send.v[q->send.head], r = d->recv.v[d->recv.head];
+            uint32_t len = s->len - s->sent < PACKET ? s->len - s->sent : PACKET;
+            int last = s->sent + len == s->len;
+            if (r.len < len) die("a receive smaller than the packet that fills it");
+            memcpy(r.addr, s->addr + s->sent, len);
+            s->sent += len;
+            dequeue(&d->recv);
+            push(d->qp.recv_cq, r.id, last ? IBV_WC_SUCCESS : IBV_WC_LOC_LEN_ERR, IBV_WC_RECV, len, d->qp.qp_num);
+            if (last) {
+                struct swr done = dequeue(&q->send);
+                push(q->qp.send_cq, done.id, IBV_WC_SUCCESS, IBV_WC_SEND, done.len, q->qp.qp_num);
+            }
         }
     }
 }
@@ -164,9 +172,13 @@ static int stub_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_
         check_local(s->lkey, s->addr, s->length, q->dev, 0);
         void *local = (void *)(uintptr_t)s->addr, *remote = (void *)(uintptr_t)wr->wr.rdma.remote_addr;
         if (is_tb(q->dev)) {
-            if (wr->opcode != IBV_WR_SEND) die("Thunderbolt RDMA supports only IBV_WR_SEND (TN3205)");
+            if (wr->opcode != IBV_WR_SEND) die("Thunderbolt RDMA lands every request in the next receive: only SEND");
+            if (!s->length) die("a zero-length SEND is lost on Thunderbolt and never completes");
             if (s->length > TB_MAX_MSG) die("a message larger than Thunderbolt allows");
-            if (q->send.frames + frames(s->length) > q->cap_send) die("a Thunderbolt send queue overrun in frames");
+            if (q->send.packets + packets(s->length) > q->cap_send || q->send.count == q->send.cap) {
+                pthread_mutex_unlock(&g_mu);
+                return ENOMEM;   /* Thunderbolt's send queue counts packets and refuses past its depth */
+            }
             enqueue(&q->send, wr->wr_id, s->addr, s->length);
         } else if (wr->opcode == IBV_WR_RDMA_WRITE) {
             if (check_remote(wr->wr.rdma.rkey, wr->wr.rdma.remote_addr, s->length, IBV_ACCESS_REMOTE_WRITE))
@@ -196,7 +208,8 @@ static int stub_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr, struct ibv_
         if (wr->num_sge != 1) die("a receive with other than one scatter entry");
         struct ibv_sge *s = &wr->sg_list[0];
         check_local(s->lkey, s->addr, s->length, q->dev, 1);
-        if (q->recv.frames + frames(s->length) > q->cap_recv) die("a Thunderbolt receive queue overrun in frames");
+        if (s->length > PACKET) die("a receive larger than 4096 bytes: Thunderbolt completes it with an error");
+        if (q->recv.count == q->recv.cap) die("a Thunderbolt receive queue overrun");
         enqueue(&q->recv, wr->wr_id, s->addr, s->length);
     }
     if (qp->state == IBV_QPS_ERR) flush(q);
@@ -332,7 +345,7 @@ struct ibv_qp *ibv_create_qp(struct ibv_pd *pd, struct ibv_qp_init_attr *init) {
     uint32_t limit = depth ? (uint32_t)atoi(depth) : 4095, send = init->cap.max_send_wr, recv = init->cap.max_recv_wr;
     pthread_mutex_lock(&g_mu);
     if (is_tb(dev) ? init->qp_type != IBV_QPT_UC || init->cap.max_send_sge > 1 || init->cap.max_recv_sge > 1 ||
-                         g_uc[dev] >= 10
+                         g_uc[dev] >= TB_QPS
                    : init->qp_type != IBV_QPT_RC || send > 31) {
         pthread_mutex_unlock(&g_mu);
         return NULL;

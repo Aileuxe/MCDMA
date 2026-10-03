@@ -19,15 +19,16 @@
 #include <stdint.h>
 
 #define LINK_ROCE 1                 /* RC queue pair with RDMA WRITE and READ: MCDMA's CX5 provider, Linux mlx5 */
-#define LINK_TB 2                   /* Apple Thunderbolt RDMA: UC queue pairs with SEND and RECV only (TN3205) */
+#define LINK_TB 2                   /* Apple Thunderbolt RDMA: UC queue pairs with SEND and RECV only */
 #define LINK_LAYER_TB 100           /* IBV_LINK_LAYER_THUNDERBOLT in Apple's verbs.h */
 #define LINK_SEG (4ull << 20)       /* RoCE registration unit on a Mac, the largest the CX5 provider has run */
 #define TB_SEG (12ull << 20)        /* Thunderbolt registration unit: a 4 MiB multiple under max_mr_size 0xfa0000 */
-#define TB_FRAME 4096u              /* Thunderbolt queues and messages count 4 KiB frames */
-#define TB_SLOTS 64                 /* control messages in flight each way */
-#define TB_MSG (4ull << 20)         /* largest data message */
-#define TB_DATA_WR 1024             /* data messages in flight each way */
-#define TB_DEPTH 4095               /* data queue depth in frames that Thunderbolt allows */
+#define TB_PACKET 4096u             /* a SEND crosses as packets of this size, each filling one posted receive */
+#define TB_RING 2048                /* one-packet receives each link keeps posted: 8 MiB */
+#define TB_STAGE 64                 /* header messages in flight */
+#define TB_SEND_WR 1024             /* sends in flight */
+#define TB_MSG (4ull << 20)         /* largest message */
+#define TB_DEPTH 4095               /* send queue depth in packets that Thunderbolt allows */
 #define LINK_REGION_MAX 128         /* registrations per region, and keys per exchange datagram */
 #define LINK_MRS (LINK_REGION_MAX + 4)
 #define LINK_RC_DEPTH 31            /* RoCE CQ and send queue: the CX5 provider refuses 63 */
@@ -53,8 +54,8 @@ struct table {
 struct xinfo {
     uint8_t transport, mode;
     uint16_t lid;
-    uint32_t qpn, qpn2, psn;    /* RoCE: qpn; Thunderbolt: control qpn and data qpn2 */
-    uint32_t frames;            /* Thunderbolt: data receive depth in frames, which bounds the peer's messages */
+    uint32_t qpn, qpn2, psn;    /* qpn2 is reserved and zero */
+    uint32_t frames;            /* Thunderbolt: receives kept posted, which bound the peer's messages */
     uint8_t gid[16];
     uint64_t req, rep;          /* mailbox halves; a fabric window sends its length as req and rep 0 */
     struct table table;
@@ -96,8 +97,8 @@ struct ep {
     struct ibv_context *ctx;
     struct ibv_pd *pd;
     struct ibv_cq *cq;
-    struct ibv_qp *qp;          /* RoCE RC queue pair, or the Thunderbolt control queue pair */
-    struct tb *tb;              /* Thunderbolt: data queue pair, control ring and placement state */
+    struct ibv_qp *qp;          /* the link's one queue pair: RC on RoCE, UC on Thunderbolt */
+    struct tb *tb;              /* Thunderbolt: receive ring, header staging and ordering state */
     struct ibv_mr *mr[LINK_MRS];
     int nmr;
     union ibv_gid gid;
@@ -142,8 +143,7 @@ int tb_connect(struct ep *e, const struct xinfo *peer);
 void tb_info(const struct ep *e, struct xinfo *out);
 void tb_destroy(struct ep *e);
 void tb_accept(struct ep *e, const struct region *rx, uint64_t lo, uint64_t hi);
-int tb_write(struct ep *e, const struct region *src, uint64_t off, uint64_t roff, uint64_t len, uint64_t rseg,
-             uint64_t timeout_ns);
+int tb_write(struct ep *e, const struct region *src, uint64_t off, uint64_t roff, uint64_t len, uint64_t timeout_ns);
 int tb_signal(struct ep *e, uint64_t roff, uint64_t value, uint64_t timeout_ns);
 int tb_fence(struct ep *e, uint64_t timeout_ns);
 int tb_progress(struct ep *e);
