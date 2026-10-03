@@ -1,7 +1,8 @@
 /* Offline stand-in for the verbs library, used only by the link-daemon tests: no device is touched.
  * WRITE and READ are memcpy within the test process (skipped with STUB_NOCOPY=1, for peers that exist only as
- * addresses), every work request completes successfully, and misuse aborts loudly: posting before RTS, posting
- * or polling on a destroyed object, and destroying a QP or CQ twice. STUB_DESTROY_US slows QP destruction. */
+ * addresses), every work request completes successfully, and misuse fails loudly: posting before RTS, posting
+ * or polling on a destroyed object, and destroying a QP or CQ twice. STUB_DESTROY_US slows QP destruction. A
+ * violation exits 86 rather than aborting, so no crash report is raised. */
 #ifdef __APPLE__
 #define _DARWIN_C_SOURCE 1
 #else
@@ -24,7 +25,7 @@ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static void die(const char *what) {
     fprintf(stderr, "STUB-VIOLATION: %s\n", what);
     fflush(stderr);
-    abort();
+    _exit(86);
 }
 
 static int stub_poll(struct ibv_cq *cq, int n, struct ibv_wc *wc) {
@@ -156,3 +157,10 @@ int ibv_destroy_qp(struct ibv_qp *qp) {
     q->destroyed = 1;
     return 0;
 }
+int ibv_query_qp(struct ibv_qp *qp, struct ibv_qp_attr *a, int mask, struct ibv_qp_init_attr *init) {
+    (void)qp; (void)mask;
+    a->cap.max_send_wr = init->cap.max_send_wr = 31;
+    a->cap.max_recv_wr = init->cap.max_recv_wr = 1;
+    return 0;
+}
+const char *ibv_wc_status_str(enum ibv_wc_status status) { return status == IBV_WC_SUCCESS ? "success" : "failure"; }

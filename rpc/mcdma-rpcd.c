@@ -1,97 +1,66 @@
-/* mcdma-rpcd: request/reply transport between applications on a Mac and a Linux peer over MCDMA RDMA.
+/* mcdma-rpcd: request/reply transport between applications on two machines over MCDMA RDMA.
  *
  * Applications never open a verbs context. Each talks to its local daemon through a shared-memory mailbox, and
  * only the daemons hold queue pairs, so an application that crashes or is killed cannot leave a QP behind. One
- * source builds on both ends: Linux libibverbs on the peer, Apple librdma plus the MCDMA provider on the Mac.
+ * source builds on Linux (libibverbs) and macOS (Apple's librdma, with MCDMA's CX5 provider or Thunderbolt RDMA).
  *
- *   mcdma-rpcd listen [--owner USER] NAME DEVICE GID_INDEX PATH_MTU [ADDR:]PORT [REQ_MIB REP_MIB]
- *       The Linux end of one link. Mailbox /dev/shm/mcdma-rpc.NAME; TCP PORT takes one control connection from the
- *       connect end at a time, on every address unless ADDR names one; the Unix socket /tmp/mcdma-rpcd.NAME.sock
- *       takes one service ("MODE poll") and also answers STATUS and SHUTDOWN. Whoever reaches the control port can
- *       write into the mailbox, so bind it to the address the Mac connects to and let only the Mac through the
- *       firewall. Started as root, --owner gives the mailbox and socket to USER, whose services then attach without
- *       root.
+ *   mcdma-rpcd listen [--owner USER] NAME DEVICE GID_INDEX PATH_MTU VIA:PORT [REQ_MIB REP_MIB]
+ *       One end of one link. Mailbox /dev/shm/mcdma-rpc.NAME on Linux, POSIX shared memory /mcdma-rpc.NAME on a
+ *       Mac. The setup exchange listens on UDP PORT of the Thunderbolt IP interface VIA and admits only link-local
+ *       datagrams that arrive there with hop limit 255, so only the machine at the other end of that cable gets in;
+ *       VIA = IFACE/fe80::ADDR admits only that address. The Unix socket /tmp/mcdma-rpcd.NAME.sock takes one service
+ *       ("MODE poll") and answers STATUS and SHUTDOWN. Started as root on Linux, --owner gives the mailbox and socket
+ *       to USER, whose services then attach without root.
  *   mcdma-rpcd connect PEER...
- *       The Mac end. PEER = name,host,port,device,gid_index,path_mtu[,req_mib,rep_mib]
- *       e.g. worker-a,192.0.2.21,18620,rdma_mcrdma0,0,4096,4,64
- *       One POSIX shared memory mailbox /mcdma-rpc.NAME and one thread per peer. The Unix socket
+ *       PEER = name,via,port,device,gid_index,path_mtu[,req_mib,rep_mib]
+ *       e.g. worker-a,en2,18620,rdma_en2,1,4096,4,64
+ *       One POSIX shared memory mailbox /mcdma-rpc.NAME and one thread per peer; each finds its listen end by
+ *       multicast on VIA (or at VIA's pinned address) and offers from an ephemeral port to PORT. The Unix socket
  *       /tmp/mcdma-rpcd.sock answers STATUS and SHUTDOWN (tears every verbs object down, then exits).
  *   mcdma-rpcd version
  *
- * MCDMA_RPCD_SOCKET replaces the Unix socket path. Mailboxes and sockets are owner-only: run the daemon as the user
- * whose applications use it. NAME is 1-20 characters of [A-Za-z0-9_-].
+ * There is no TCP anywhere: the exchange is a few hundred bytes of IPv6 link-local datagrams on the Thunderbolt
+ * cable, and every payload byte moves by RDMA. MCDMA_RPCD_SOCKET replaces the Unix socket path. Mailboxes and
+ * sockets are owner-only: run the daemon as the user whose applications use it. NAME is 1-20 characters of
+ * [A-Za-z0-9_-]. docs/link-daemon.md describes the mailbox (protocol 1), the exchange and both link kinds.
  *
- * Mailbox (protocol 1): request half [0, R), reply half [R, R + P); R and P are whole multiples of 4 MiB (default
- * 4 MiB each) and must match on both ends. Each half starts with a 4 KiB control page. A word is (seq << 32 | len);
- * seq 0 means empty. Payloads are written before their word.
- *   request half +0    connect end: client -> daemon, a request is staged. listen end: the request has landed
- *                +64   connect end: daemon -> client, 1 while the link to the peer is up
- *                +72   connect end: link generation, bumped each time the link comes up; a request staged before a
- *                      reconnect is lost, and a changed generation tells the waiting client so
- *                +256  R and P (u64 each), so applications know the layout
- *   reply half   +0    connect end: the peer's ready word (pull mode). listen end: the word it sends
- *                +64   connect end: the client's done word (written by the peer in direct mode)
- *                +128  listen end: service -> daemon, a reply is staged
- * The Mac registers each 4 MiB of its mailbox as its own MR (the largest registration the MCDMA provider has been
- * validated with) and hands the peer the table of its reply-half segments; every transfer is cut at those
- * boundaries.
- *
- * One call: the client stages the request and sets its word; the connect daemon WRITEs payload, then word, into the
- * peer's request half; the peer's service sees the word, computes and stages its reply; in direct mode (the
- * default) the listen daemon WRITEs the reply and then the client's done word straight into the Mac's reply half.
- * That relies on the Mac's NIC not reordering its PCIe writes (MCDMARelaxedOrdering = No, the default);
- * MCDMA_RPC_PULL=1 makes the peer send only a ready word and the connect daemon READ the payload instead.
- *
- * Services: a connection to the listen socket sends one line within five seconds. "MODE poll" registers the service,
- * answered "OK", or "ERR busy" while another service is registered; after "OK" the daemon sends nothing until the
- * registration ends, then "BYE" or a closed socket. The registration ends when the link drops, because requests in
- * flight are lost with it. "STATUS" and "SHUTDOWN" work on both sockets.
- *
- * STATUS answers "VERSION mcdma-rpcd 1 RELEASE", one line per peer and "END". The connect end reports
- *   PEER NAME up|down calls N failures N MiB N host=HOST port=PORT device=DEVICE req_mib=R rep_mib=P since=EPOCH
- * and the listen end reports its one link with device=, req_mib=, rep_mib=, since= and service=attached|none.
- *
- * Safety. The connect end takes its QP past INIT only after the listen end has answered HELLO from RTS, posts
- * nothing before its own RTS, gives up on a peer by destroying the QP inside a live process (never by exiting),
- * waits out every posted work request before destroying anything, and tears every object down on every exit path.
- * Every socket wait is bounded, so shutdown never hangs on a silent peer. One daemon serves each link name: a lock
- * file in /tmp is taken before any device or mailbox is touched, and a second daemon refuses to start. SHUTDOWN,
- * SIGINT and SIGTERM all stop it the same orderly way; SIGHUP is ignored, and SIGKILL, which skips the teardown,
- * must never be used. Stop the connect end before restarting any listen end.
+ * Safety. The connect end takes its queue pairs past INIT only after the listen end has answered from RTS, posts
+ * nothing before its own RTS, gives up on a peer by destroying its queue pairs inside a live process (never by
+ * exiting), waits out or flushes every posted work request before destroying anything, and tears every object down
+ * on every exit path. Every wait is bounded, so shutdown never hangs on a silent peer. One daemon serves each link
+ * name: a lock file in /tmp is taken before any device or mailbox is touched, and a second daemon refuses to start.
+ * SHUTDOWN, SIGINT and SIGTERM all stop it the same orderly way; SIGHUP is ignored, and SIGKILL, which skips the
+ * teardown, must never be used.
  */
 #include "rpcd.h"
 
-#include <arpa/inet.h>
 #include <pwd.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* PORT or ADDR:PORT for the listen end's control socket; ADDR must be a dotted IPv4 address. */
-static int parse_bind(const char *text, struct in_addr *addr, int *port) {
+/* VIA:PORT, where VIA is IFACE or IFACE/fe80::ADDR; the port follows the last colon. */
+static int parse_via(const char *text, char *via, size_t n, int *port) {
     const char *colon = strrchr(text, ':');
-    addr->s_addr = htonl(INADDR_ANY);
-    if (colon) {
-        char host[INET_ADDRSTRLEN];
-        size_t n = (size_t)(colon - text);
-        if (n == 0 || n >= sizeof(host)) return -1;
-        memcpy(host, text, n);
-        host[n] = 0;
-        if (inet_pton(AF_INET, host, addr) != 1) return -1;
-        text = colon + 1;
-    }
+    char ifname[32];
+    struct in6_addr pin;
+    int pinned = 0;
+    if (!colon || colon == text || (size_t)(colon - text) >= n) return -1;
+    memcpy(via, text, (size_t)(colon - text));
+    via[colon - text] = 0;
     char *end = NULL;
-    long value = strtol(text, &end, 10);
-    if (!*text || *end || value <= 0 || value > 65535) return -1;
+    long value = strtol(colon + 1, &end, 10);
+    if (!colon[1] || *end || value <= 0 || value > 65535) return -1;
     *port = (int)value;
-    return 0;
+    return via_parse(via, ifname, sizeof(ifname), &pin, &pinned);
 }
 
 static int usage(void) {
-    fprintf(stderr, "usage: mcdma-rpcd listen [--owner USER] NAME DEVICE GID_INDEX PATH_MTU [ADDR:]PORT [REQ_MIB REP_MIB]\n"
-                    "       mcdma-rpcd connect name,host,port,device,gid_index,path_mtu[,req_mib,rep_mib] ...\n"
-                    "       mcdma-rpcd version\n");
+    fprintf(stderr, "usage: mcdma-rpcd listen [--owner USER] NAME DEVICE GID_INDEX PATH_MTU VIA:PORT [REQ_MIB REP_MIB]\n"
+                    "       mcdma-rpcd connect name,via,port,device,gid_index,path_mtu[,req_mib,rep_mib] ...\n"
+                    "       mcdma-rpcd version\n"
+                    "VIA is a Thunderbolt IP interface, optionally /fe80::ADDR of the one peer to admit.\n");
     return 2;
 }
 
@@ -114,6 +83,10 @@ int main(int argc, char **argv) {
         char **arg = argv + 2;
         int left = argc - 2;
         if (left >= 2 && !strcmp(arg[0], "--owner")) {
+#ifndef MCDMA_RPC_BOX_DIR
+            fprintf(stderr, "--owner is for Linux listen ends; run the daemon as the mailbox's user\n");
+            return 2;
+#endif
             struct passwd *user = getpwnam(arg[1]);
             if (!user) {
                 fprintf(stderr, "unknown user %s\n", arg[1]);
@@ -134,10 +107,10 @@ int main(int argc, char **argv) {
             fprintf(stderr, "mailbox halves must be multiples of 4 MiB up to %d MiB\n", 4 * MAX_SEGS);
             return 2;
         }
-        struct in_addr bind_addr;
+        char via[96];
         int port = 0;
-        if (parse_bind(arg[4], &bind_addr, &port)) return usage();
-        return run_listen(arg[0], arg[1], atoi(arg[2]), atoi(arg[3]), bind_addr, port, req, rep, &owner);
+        if (parse_via(arg[4], via, sizeof(via), &port)) return usage();
+        return run_listen(arg[0], arg[1], atoi(arg[2]), atoi(arg[3]), via, port, req, rep, &owner);
     }
     if (argc >= 3 && !strcmp(argv[1], "connect")) {
         const char *pull = getenv("MCDMA_RPC_PULL");

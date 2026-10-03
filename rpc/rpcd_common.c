@@ -1,11 +1,8 @@
-/* mcdma-rpcd: time, logging, names, locks and line I/O on control and service sockets. */
+/* mcdma-rpcd: logging, names, locks and line I/O on the local control and service sockets. */
 #include "rpcd.h"
 
 #include <errno.h>
 #include <fcntl.h>
-#include <netdb.h>
-#include <netinet/tcp.h>
-#include <poll.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,22 +17,24 @@
 
 volatile sig_atomic_t g_stop;
 
-uint64_t now_ns(void) {
-#ifdef __APPLE__
-    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-#else
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC_RAW, &t);
-    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
-#endif
+static void vlog(const char *fmt, va_list ap) {
+    fprintf(stderr, "mcdma-rpcd: ");
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
 }
 
 void logf_(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "mcdma-rpcd: ");
-    vfprintf(stderr, fmt, ap);
-    fputc('\n', stderr);
+    vlog(fmt, ap);
+    va_end(ap);
+}
+
+/* The shared link code logs through the daemon's own log. */
+void link_log(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vlog(fmt, ap);
     va_end(ap);
 }
 
@@ -45,9 +44,9 @@ void log_rate(const char *name, const char *what, uint64_t bytes, uint64_t ns) {
 }
 
 /* Hold an exclusive lock on MCDMA_RPC_LOCK_DIR/mcdma-rpc.NAME.lock until exit, so one daemon serves each link. */
-int hold_link_lock(const char *name) {
+int hold_link_lock(const char *name, const char *suffix) {
     char path[192];
-    snprintf(path, sizeof(path), "%s/mcdma-rpc.%s.lock", MCDMA_RPC_LOCK_DIR, name);
+    snprintf(path, sizeof(path), "%s/mcdma-rpc.%s%s.lock", MCDMA_RPC_LOCK_DIR, name, suffix);
     /* open before create: in a sticky directory, O_CREAT over another user's file is refused */
     int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0 && errno == ENOENT) {
@@ -67,55 +66,11 @@ int hold_link_lock(const char *name) {
     return fd;
 }
 
-/* Connect to host:port within `seconds`, or return -1. */
-int tcp_connect(const char *host, int port, int seconds) {
-    struct addrinfo hints, *res = NULL;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    char service[16];
-    snprintf(service, sizeof(service), "%d", port);
-    if (getaddrinfo(host, service, &hints, &res) || !res) return -1;
-    int fd = socket(res->ai_family, res->ai_socktype, 0), ok = 0;
-    if (fd >= 0) {
-        int flags = fcntl(fd, F_GETFL, 0);
-        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-        if (!connect(fd, res->ai_addr, res->ai_addrlen)) {
-            ok = 1;
-        } else if (errno == EINPROGRESS) {
-            struct pollfd wait = {.fd = fd, .events = POLLOUT};
-            int err = 0;
-            socklen_t len = sizeof(err);
-            ok = poll(&wait, 1, seconds * 1000) == 1 && !getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) && !err;
-        }
-        fcntl(fd, F_SETFL, flags);
-    }
-    freeaddrinfo(res);
-    if (!ok && fd >= 0) {
-        close(fd);
-        fd = -1;
-    }
-    return fd;
-}
-
 /* Bound every blocking send and receive on `fd`, so no silent peer can hold a thread forever. */
 void set_io_timeout(int fd, int seconds) {
     struct timeval limit = {seconds, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &limit, sizeof(limit));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &limit, sizeof(limit));
-}
-
-/* TCP keepalive that notices a peer which crashed or rebooted without closing, within about half a minute. */
-void set_keepalive(int fd) {
-    int one = 1, idle = 15, interval = 5, count = 3;
-    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
-#ifdef __APPLE__
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof(idle));
-#else
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
-#endif
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
 }
 
 int valid_name(const char *name) {

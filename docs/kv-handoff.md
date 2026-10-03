@@ -11,7 +11,8 @@ run on hardware or inside vLLM.
 
 1. Install `mcdma-rpcd` and `libmcdma-rpc` on the vLLM host (see [link daemon](link-daemon.md)) and start one listen
    daemon per tensor-parallel rank, owned by the user vLLM runs as. Give each link a reply half large enough for
-   several page rows of one layer; 64 MiB suits most models.
+   several page rows of one layer; 64 MiB suits most models. The daemons set each link up over a Thunderbolt or USB4
+   network cable between the two hosts, so the vLLM host needs one to the Mac as well as the RDMA link.
 2. Put `integrations/vllm` on vLLM's `PYTHONPATH`, or copy `mcdma_kv` into its environment.
 3. Start vLLM with the connector as a producer, naming the links in rank order:
 

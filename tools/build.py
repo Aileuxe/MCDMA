@@ -11,7 +11,8 @@ parser.add_argument('mode',choices=['test','native'])
 args=parser.parse_args()
 BUILD=ROOT/'build'
 BUILD.mkdir(exist_ok=True)
-RPCD_SOURCES=['rpc/mcdma-rpcd.c','rpc/rpcd_common.c','rpc/rpcd_verbs.c','rpc/rpcd_listen.c','rpc/rpcd_connect.c']
+LINK_SOURCES=['rpc/link_verbs.c','rpc/link_tb.c','rpc/link_xchg.c']
+RPCD_SOURCES=['rpc/mcdma-rpcd.c','rpc/rpcd_common.c','rpc/rpcd_verbs.c','rpc/rpcd_listen.c','rpc/rpcd_connect.c',*LINK_SOURCES]
 def run(args):
     subprocess.run([str(x) for x in args],check=True,cwd=ROOT)
 def sdk(name):
@@ -73,6 +74,8 @@ if len(sys.argv)>1 and sys.argv[1]=='test':
          'tests/test_rpcd_socket.c','rpc/rpcd_common.c','-o',BUILD/'test-rpcd-socket'])
     run([BUILD/'test-rpcd-socket'])
     run([sys.executable,'-B','tests/test_rpcd_daemon.py'])
+    # Link layer: the Thunderbolt-only exchange, Thunderbolt placement, the daemon over Thunderbolt, libmcdma-fabric.
+    run([sys.executable,'-B','tests/test_link.py'])
     # Optional Linux GPU imports (rpc/gpu): CUDA through API stubs, so no GPU or CUDA SDK is needed.
     run(['make','-C','rpc/gpu','test'])
     run([sys.executable,'-B','tests/test_kv_handoff.py'])
@@ -116,6 +119,15 @@ if len(sys.argv)>1 and sys.argv[1]=='native':
     run(['clang','-std=c11','-O2','-Wall','-Wextra','-Werror','-isysroot',ms,'-dynamiclib',
          '-install_name','/usr/local/lib/libmcdma-rpc.dylib','rpc/libmcdma_rpc.c','rpc/libmcdma_rpc_metal.m',
          '-fobjc-arc','-framework','Metal','-framework','Foundation','-o',BUILD/'libmcdma-rpc.dylib'])
+    # One-sided writes for engines' own collectives (docs/fabric.md); only mcdma_fabric_* is exported.
+    run(['clang','-std=c11','-O2','-Wall','-Wextra','-Werror','-isysroot',ms,'-dynamiclib','-fvisibility=hidden',
+         '-install_name','/usr/local/lib/libmcdma-fabric.dylib','rpc/libmcdma_fabric.c',*LINK_SOURCES,'-lrdma',
+         '-o',BUILD/'libmcdma-fabric.dylib'])
+    # Hardware qualification tools for a daemon link and a fabric link (docs/link-daemon.md, docs/fabric.md).
+    run(['clang','-std=c11','-O2','-Wall','-Wextra','-Werror','-isysroot',ms,'rpc/rpc_echo.c','rpc/rpcd_common.c',
+         'rpc/link_verbs.c','rpc/link_tb.c','-lrdma','-o',BUILD/'rpc-echo'])
+    run(['clang','-std=c11','-O2','-Wall','-Wextra','-Werror','-isysroot',ms,'rpc/fabric_check.c',
+         'rpc/libmcdma_fabric.c',*LINK_SOURCES,'-lrdma','-o',BUILD/'fabric-check'])
     # GPU keep-alive: holds the platform out of its idle power state during
     # latency-critical RDMA (see docs/gpu-keepalive.md).
     run(['xcrun','swiftc','-O','-sdk',ms,'client/fabric_keepalive.swift','-o',BUILD/'fabric-keepalive'])

@@ -1,12 +1,13 @@
 # Optional GPU memory for RPC mailboxes
 
-These Linux libraries let an application use its existing `mcdma-rpcd` mailbox
-as CUDA mapped host memory or a Vulkan storage buffer. The wrapping APIs import
-the caller's allocation; they never replace it, copy payload bytes or free it.
-Vulkan also has an explicit allocation API for a mapped buffer exportable as
-DMA_BUF when importing a preexisting mailbox is unsupported. None of these
-operations opens a verbs context. The daemon remains responsible for RDMA
-registration and queue pairs.
+These Linux libraries let an application use its existing `mcdma-rpcd` mailbox,
+or a `libmcdma-fabric` window, as CUDA mapped host memory or a Vulkan storage
+buffer. The wrapping APIs import the caller's allocation; they never replace it,
+copy payload bytes or free it. Vulkan also has an explicit allocation API for a
+mapped buffer exportable as DMA_BUF when importing a preexisting mailbox is
+unsupported. None of these operations opens a verbs context. The daemon, or
+`libmcdma-fabric` for a window, remains responsible for RDMA registration and
+queue pairs.
 
 The ordinary RPC library and macOS Metal helper do not depend on either library.
 Applications opt in explicitly and must handle errors; there is no implicit
@@ -145,8 +146,10 @@ See the Vulkan specification's
 
 Some drivers cannot import a POSIX shared-memory mailbox as a host pointer but
 can export their own coherent allocation. Applications can choose that allocation
-path before starting the daemon. `mcdma_rpc_vulkan_allocate_export` creates one
-storage buffer, allocates its memory, and maps a CPU view of that same allocation:
+path and register it as a `libmcdma-fabric` window: `mcdma_fabric_open` takes the
+DMA-BUF descriptor and the CPU mapping and registers the allocation itself, with no
+fallback. `mcdma_rpc_vulkan_allocate_export` creates one storage buffer, allocates
+its memory, and maps a CPU view of that same allocation:
 
 ```c
 struct mcdma_rpc_vulkan *window = NULL;
@@ -158,11 +161,11 @@ if (status == MCDMA_RPC_GPU_OK) {
     void *mailbox = mcdma_rpc_vulkan_host_pointer(window);
     VkBuffer buffer = mcdma_rpc_vulkan_buffer(window);
     status = mcdma_rpc_vulkan_export_fd(window, &dma_buf_fd, &error);
-    /* Pass the fd to a daemon that maps it and registers this DMA_BUF for RDMA.
-     * GPU descriptors refer to buffer; CPU control words use mailbox.
-     * Do not proceed with a failed export or failed NIC registration. */
+    /* mcdma_fabric_open(device, gid, mtu, mailbox, mailbox_bytes, dma_buf_fd, 0, 0, &fabric)
+     * registers this DMA_BUF for RDMA. GPU descriptors refer to buffer; CPU control
+     * words use mailbox. Do not proceed with a failed export or failed NIC registration. */
 }
-/* Stop new GPU submissions, finish NIC work, and deregister every NIC MR first. */
+/* Stop new GPU submissions, finish NIC work, and mcdma_fabric_close first. */
 if (dma_buf_fd >= 0) close(dma_buf_fd);
 if (window != NULL) status = mcdma_rpc_vulkan_release(&window, &error);
 ```
@@ -201,8 +204,8 @@ The allocation handle must remain alive until all GPU/NIC accesses and NIC
 registrations have ended. Release waits for GPU work, destroys the buffer, unmaps
 its owned CPU view and frees the Vulkan memory object. A failed GPU wait leaves
 all of those resources and the handle intact for recovery. Creating an allocation
-and exporting its fd do not prove that a particular NIC can register it; the
-daemon must verify that separately without silently substituting another buffer.
+and exporting its fd do not prove that a particular NIC can register it;
+`mcdma_fabric_open` verifies that separately and never substitutes another buffer.
 The same GPU/RDMA execution and memory-ordering requirements apply as for imported
 memory. See the Vulkan specification's
 [DMA_BUF export allocation requirements](https://docs.vulkan.org/refpages/latest/refpages/source/VkExportMemoryAllocateInfo.html)

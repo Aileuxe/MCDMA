@@ -1,11 +1,9 @@
-/* mcdma-rpcd listen: the Linux end of one link, serving one registered service through its mailbox. */
+/* mcdma-rpcd listen: one end of one link, on Linux or a Mac, serving one registered service through its mailbox. */
 #include "rpcd.h"
 
-#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
-#include <netinet/tcp.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,22 +14,23 @@
 #include <time.h>
 #include <unistd.h>
 
-#define HANDSHAKE_NS ((uint64_t)MCDMA_RPC_HANDSHAKE_S * 1000000000ull)
 #define PENDING_NS ((uint64_t)PENDING_S * 1000000000ull)
+#define PIECES (4 * MAX_SEGS + 4)
 
 struct listen_state {
     const char *name;
     struct ep e;
     struct box b;
-    int ctl, svc, direct, nrseg;
-    int hello;                     /* our QP reached RTS for the current control connection */
-    int armed;                     /* the connect end reported READY: replies may be written */
-    uint64_t ctl_since;
-    uint32_t rseg_rkey[MAX_SEGS];
-    uint64_t rseg_addr[MAX_SEGS];
+    struct xchg x;
+    struct table remote;           /* the connect end's mailbox, from its offer */
+    struct xmsg answer;            /* our offer for the current session, sent again until it is confirmed */
+    int svc, direct;
+    int hello;                     /* our queue pairs are at RTS for the current session */
+    int armed;                     /* the connect end confirmed its RTS: replies may be written */
+    uint64_t hello_since, offered, heard;
     uint64_t served, failures, bytes;
     long long since;
-    struct piece pieces[4 * MAX_SEGS + 4];
+    struct piece pieces[PIECES];
 };
 
 static void listen_status(struct listen_state *s, int fd) {
@@ -40,95 +39,16 @@ static void listen_status(struct listen_state *s, int fd) {
     send_line(fd, out);
     snprintf(out, sizeof(out),
              "PEER %s %s calls %" PRIu64 " failures %" PRIu64 " MiB %" PRIu64
-             " device=%s req_mib=%" PRIu64 " rep_mib=%" PRIu64 " since=%lld service=%s",
-             s->name, s->armed ? "up" : "down", s->served, s->failures, s->bytes >> 20, s->e.device, s->b.req >> 20,
-             s->b.rep >> 20, s->armed ? s->since : 0, s->svc >= 0 ? "attached" : "none");
+             " device=%s link=%s via=%s port=%d req_mib=%" PRIu64 " rep_mib=%" PRIu64 " since=%lld service=%s",
+             s->name, s->armed ? "up" : "down", s->served, s->failures, s->bytes >> 20, s->e.device,
+             link_kind_name(s->e.kind), s->x.ifname, s->x.port, s->b.req >> 20, s->b.rep >> 20,
+             s->armed ? s->since : 0, s->svc >= 0 ? "attached" : "none");
     send_line(fd, out);
     send_line(fd, "END");
 }
 
-/* HELLO PROTOCOL qpn psn gid mode R P n rkey addr ... : the connect end's QP is still in INIT. */
-static void listen_hello(struct listen_state *s, char *args) {
-    volatile uint64_t *req_word = (volatile uint64_t *)s->b.base;
-    volatile uint64_t *staged_word = (volatile uint64_t *)(s->b.base + s->b.req + 128);
-    /* a new HELLO replaces the old QP, so nothing may be written until this one completes and READY arrives */
-    s->armed = 0;
-    s->hello = 0;
-    char *save = NULL, *tok = strtok_r(args, " ", &save);
-    char *field[8] = {0};
-    for (int i = 0; i < 8 && tok; ++i) {
-        field[i] = tok;
-        tok = strtok_r(NULL, " ", &save);
-    }
-    if (!field[7]) {
-        send_line(s->ctl, "ERR bad hello");
-        return;
-    }
-    if (strtol(field[0], NULL, 10) != PROTOCOL) {
-        send_line(s->ctl, "ERR protocol");
-        return;
-    }
-    unsigned qpn = (unsigned)strtoul(field[1], NULL, 10), psn = (unsigned)strtoul(field[2], NULL, 10);
-    const char *gid = field[3], *mode = field[4];
-    uint64_t req = strtoull(field[5], NULL, 10), rep = strtoull(field[6], NULL, 10);
-    long n = strtol(field[7], NULL, 10);
-    if (req != s->b.req || rep != s->b.rep || n != (long)(s->b.rep / SEG)) {
-        send_line(s->ctl, "ERR mailbox sizes differ");
-        return;
-    }
-    for (long i = 0; i < n; ++i) {
-        char *rkey = tok;
-        char *addr = rkey ? strtok_r(NULL, " ", &save) : NULL;
-        if (!rkey || !addr) {
-            send_line(s->ctl, "ERR bad hello");
-            return;
-        }
-        s->rseg_rkey[i] = (uint32_t)strtoul(rkey, NULL, 10);
-        s->rseg_addr[i] = strtoull(addr, NULL, 10);
-        tok = strtok_r(NULL, " ", &save);
-    }
-    /* our QP goes all the way to RTS before we answer, so a failure here never leaves the other side holding a
-       live QP */
-    if (ep_create_qp(&s->e) || ep_connect(&s->e, qpn, psn, gid)) {
-        send_line(s->ctl, "ERR qp");
-        ep_destroy_qp(&s->e);
-        return;
-    }
-    s->nrseg = (int)n;
-    s->direct = !strcmp(mode, "DIRECT");
-    store_word(req_word, 0);
-    store_word(staged_word, 0);
-    char mine[80], reply[256];
-    gid_string(&s->e.gid, mine, sizeof(mine));
-    snprintf(reply, sizeof(reply), "HELLO %u %u %s %u %llu", s->e.qp->qp_num, PSN, mine, s->b.all->rkey,
-             (unsigned long long)(uintptr_t)s->b.base);
-    send_line(s->ctl, reply);
-    s->hello = 1;
-}
-
-/* Send the staged reply: direct mode writes it and the client's done word, pull mode only the ready word. */
-static int listen_reply(struct listen_state *s, uint32_t seq, uint32_t len) {
-    volatile uint64_t *ready_word = (volatile uint64_t *)(s->b.base + s->b.req);
-    store_word(ready_word, WORD(seq, len));
-    int n;
-    if (s->direct) {
-        n = cut(&s->b, s->b.req + CTRL, len, 0, 0, s->rseg_rkey, s->rseg_addr, CTRL, SEG, s->pieces, 4 * MAX_SEGS);
-        if (n < 0) return -1;
-        s->pieces[n] = (struct piece){(void *)ready_word, s->b.all->lkey, s->rseg_addr[0] + 64, s->rseg_rkey[0], 8};
-        n++;
-    } else {
-        s->pieces[0] = (struct piece){(void *)ready_word, s->b.all->lkey, s->rseg_addr[0], s->rseg_rkey[0], 8};
-        n = 1;
-    }
-    uint64_t began = now_ns();
-    if (post_pieces(&s->e, IBV_WR_RDMA_WRITE, s->pieces, n, WINDOW_PEER, 10000000000ull)) return -1;
-    if (len >= BULK) log_rate(s->name, "reply", len, now_ns() - began);
-    s->served++;
-    s->bytes += len;
-    return 0;
-}
-
 static void listen_drop(struct listen_state *s, const char *why) {
+    static const uint8_t zero[16];
     if (s->armed) logf_("%s: link down (%s)", s->name, why);
     /* the service's requests died with the link: ending its registration lets it fail fast instead of waiting */
     if (s->svc >= 0 && (s->armed || s->hello)) {
@@ -136,22 +56,106 @@ static void listen_drop(struct listen_state *s, const char *why) {
         close(s->svc);
         s->svc = -1;
     }
-    if (s->ctl >= 0) {
-        close(s->ctl);
-        s->ctl = -1;
-    }
+    if (memcmp(s->x.peer_session, zero, 16)) xchg_answer(&s->x, s->x.peer_session, X_BYE, ROLE_LISTEN, NULL);
+    memset(s->x.peer_session, 0, 16);
     s->armed = 0;
     s->hello = 0;
     ep_destroy_qp(&s->e);
 }
 
-/* Open the link's mailbox without following links, creating it only when absent, and size it to `total`. */
+/* A new session: our queue pairs reach RTS before we answer, so a failure never leaves the peer holding a live one. */
+static void listen_offer(struct listen_state *s, const struct xmsg *m) {
+    volatile uint64_t *req_word = (volatile uint64_t *)s->b.base;
+    volatile uint64_t *staged_word = (volatile uint64_t *)(s->b.base + s->b.req + 128);
+    if (s->hello) listen_drop(s, "the connect end started a new session");
+    const char *why = box_refuse(&s->e, &s->b, &m->info);
+    if (why) {
+        logf_("%s: refusing an offer: %s", s->name, why);
+        xchg_answer(&s->x, m->from, X_ERR, ROLE_LISTEN, why);
+        return;
+    }
+    if (ep_create_qp(&s->e)) {
+        xchg_answer(&s->x, m->from, X_ERR, ROLE_LISTEN, "qp");
+        return;
+    }
+    if (s->e.kind == LINK_TB) tb_accept(&s->e, &s->b.r, 0, s->b.req);
+    if (ep_connect(&s->e, &m->info)) {
+        xchg_answer(&s->x, m->from, X_ERR, ROLE_LISTEN, "qp");
+        ep_destroy_qp(&s->e);
+        return;
+    }
+    xchg_session(&s->x);
+    memcpy(s->x.peer_session, m->from, 16);
+    s->remote = m->info.table;
+    s->direct = m->info.mode == MODE_DIRECT;
+    store_word(req_word, 0);
+    store_word(staged_word, 0);
+    box_offer(&s->x, &s->e, &s->b, ROLE_LISTEN, m->info.mode, X_HAVE, &s->answer);
+    (void)xchg_send(&s->x, &s->answer);
+    s->hello = 1;
+    s->hello_since = s->offered = s->heard = now_ns();
+}
+
+/* 1 when the datagram began a new session, so the caller forgets the last staged reply. */
+static int listen_datagram(struct listen_state *s, const struct xmsg *m) {
+    if (m->role != ROLE_CONNECT) return 0;
+    int current = s->hello && !memcmp(m->from, s->x.peer_session, 16);
+    if (m->kind == X_OFFER && !current && !(m->flags & X_HAVE)) {
+        listen_offer(s, m);
+        return 1;
+    }
+    if (!current) {
+        /* a connect end that lost its session hears so at once, instead of after its liveness timeout */
+        if (m->kind == X_PING || m->kind == X_OFFER) xchg_answer(&s->x, m->from, X_BYE, ROLE_LISTEN, NULL);
+        return 0;
+    }
+    s->heard = now_ns();
+    if (m->kind == X_OFFER) {
+        if ((m->flags & X_HAVE) && !s->armed) {
+            s->armed = 1;
+            s->since = (long long)time(NULL);
+            logf_("%s: peer ready over %s (%s replies, exchange on %s)", s->name, link_kind_name(s->e.kind),
+                  s->direct ? "direct" : "pull", s->x.ifname);
+        }
+        if (!s->armed) (void)xchg_send(&s->x, &s->answer);
+    } else if (m->kind == X_PING) {
+        xchg_answer(&s->x, s->x.peer_session, X_PONG, ROLE_LISTEN, NULL);
+    } else if (m->kind == X_BYE || m->kind == X_ERR) {
+        listen_drop(s, m->kind == X_ERR ? m->text : "the connect end said goodbye");
+    }
+    return 0;
+}
+
+/* Send the staged reply: direct mode writes it and the client's done word, pull mode only the ready word. */
+static int listen_reply(struct listen_state *s, uint32_t seq, uint32_t len) {
+    uint64_t req = s->b.req;
+    store_word((volatile uint64_t *)(s->b.base + req), WORD(seq, len));
+    uint64_t began = now_ns();
+    int bad = s->direct ? box_transfer(&s->e, &s->b, &s->remote, req + CTRL, len, req, req + 64, WORD(seq, len),
+                                       s->pieces, PIECES, WINDOW_PEER)
+                        : box_transfer(&s->e, &s->b, &s->remote, req, 0, req, req, WORD(seq, len), s->pieces, PIECES,
+                                       WINDOW_PEER);
+    if (bad) return -1;
+    if (len >= BULK && s->e.kind == LINK_ROCE) log_rate(s->name, "reply", len, now_ns() - began);
+    s->served++;
+    s->bytes += len;
+    return 0;
+}
+
+/* The link's mailbox: a file under MCDMA_RPC_BOX_DIR (Linux /dev/shm, or a test directory), else POSIX shm. */
 static int open_box(const char *path, uint64_t total, const struct owner *owner) {
+#ifdef MCDMA_RPC_BOX_DIR
     /* open before create: root may not O_CREAT over the service user's file in sticky /dev/shm */
     int fd = open(path, O_RDWR | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0 && errno == ENOENT) fd = open(path, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd < 0 || fchmod(fd, 0600) || (owner->set && fchown(fd, owner->uid, owner->gid)) || ftruncate(fd, 0) ||
         ftruncate(fd, (off_t)total)) {
+#else
+    (void)owner;
+    shm_unlink(path);
+    int fd = shm_open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd < 0 || ftruncate(fd, (off_t)total)) {
+#endif
         logf_("mailbox %s errno=%d", path, errno);
         if (fd >= 0) close(fd);
         return -1;
@@ -159,61 +163,53 @@ static int open_box(const char *path, uint64_t total, const struct owner *owner)
     return fd;
 }
 
-/* Open the control port and the service socket before any device or mailbox, so a clash costs nothing. */
-static int open_sockets(struct in_addr bind_addr, int port, const char *sock_path, const struct owner *owner,
-                        int *ls_out, int *us_out) {
-    int ls = socket(AF_INET, SOCK_STREAM, 0), one = 1;
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)port);
-    addr.sin_addr = bind_addr;
-    if (ls < 0 || setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) ||
-        bind(ls, (struct sockaddr *)&addr, sizeof(addr)) || listen(ls, 2)) {
-        logf_("control port %d errno=%d", port, errno);
-        if (ls >= 0) close(ls);
-        return -1;
+static void remove_box(const char *path) {
+#ifdef MCDMA_RPC_BOX_DIR
+    unlink(path);
+#else
+    shm_unlink(path);
+#endif
+}
+
+int run_listen(const char *name, const char *device, int gid_index, int mtu, const char *via, int port,
+               uint64_t req_bytes, uint64_t rep_bytes, const struct owner *owner) {
+    static struct listen_state s;
+    static struct reader srd, prd[MAX_PENDING];
+    uint64_t pending_since[MAX_PENDING] = {0};
+    s.name = name;
+    s.svc = -1;
+    s.x.fd = -1;
+    char default_sock[128], box_path[160];
+    snprintf(default_sock, sizeof(default_sock), "%s/mcdma-rpcd.%s.sock", MCDMA_RPC_SOCK_DIR, name);
+#ifdef MCDMA_RPC_BOX_DIR
+    snprintf(box_path, sizeof(box_path), "%s/mcdma-rpc.%s", MCDMA_RPC_BOX_DIR, name);
+#else
+    snprintf(box_path, sizeof(box_path), "/mcdma-rpc.%s", name);
+#endif
+    const char *sock_path = socket_path(default_sock);
+    /* the lock comes first: a second daemon for this link must leave the live mailbox alone */
+    if (hold_link_lock(name, MCDMA_RPC_LISTEN_LOCK) < 0) return 2;
+    if (socket_in_use(sock_path)) {
+        logf_("another mcdma-rpcd is serving %s; stop it with SHUTDOWN first", sock_path);
+        return 2;
     }
     int us = unix_listen(sock_path);
     if (us >= 0 && owner->set && chown(sock_path, owner->uid, owner->gid)) {
         logf_("chown %s errno=%d", sock_path, errno);
         close(us);
-        unlink(sock_path);
         us = -1;
     }
-    if (us < 0) {
-        close(ls);
-        return -1;
-    }
-    *ls_out = ls;
-    *us_out = us;
-    return 0;
-}
-
-int run_listen(const char *name, const char *device, int gid_index, int mtu, struct in_addr bind_addr, int port,
-               uint64_t req_bytes, uint64_t rep_bytes, const struct owner *owner) {
-    static struct listen_state s;
-    static struct reader crd, srd, prd[MAX_PENDING];
-    uint64_t pending_since[MAX_PENDING] = {0};
-    s.name = name;
-    s.ctl = s.svc = -1;
-    char default_sock[128], box_path[160];
-    snprintf(default_sock, sizeof(default_sock), "/tmp/mcdma-rpcd.%s.sock", name);
-    snprintf(box_path, sizeof(box_path), "%s/mcdma-rpc.%s", MCDMA_RPC_BOX_DIR, name);
-    const char *sock_path = socket_path(default_sock);
-    /* the lock comes first: a second daemon for this link must leave the live mailbox alone */
-    if (hold_link_lock(name) < 0) return 2;
-    if (socket_in_use(sock_path)) {
-        logf_("another mcdma-rpcd is serving %s; stop it with SHUTDOWN first", sock_path);
+    if (us < 0 || xchg_open(&s.x, via, port, 0, name)) {
+        if (us >= 0) close(us);
+        unlink(sock_path);
         return 2;
     }
-    int ls = -1, us = -1;
-    if (open_sockets(bind_addr, port, sock_path, owner, &ls, &us)) return 2;
     s.b.req = req_bytes;
     s.b.rep = rep_bytes;
     uint64_t total = s.b.req + s.b.rep;
     int bf = -1;
-    if (ep_open(&s.e, device, gid_index, mtu) || (bf = open_box(box_path, total, owner)) < 0) goto fail;
+    if (ep_open(&s.e, device, gid_index, mtu) || via_check(via, &s.e) || (bf = open_box(box_path, total, owner)) < 0)
+        goto fail;
     s.b.base = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, bf, 0);
     close(bf);
     if (s.b.base == MAP_FAILED) {
@@ -223,51 +219,33 @@ int run_listen(const char *name, const char *device, int gid_index, int mtu, str
     }
     memset(s.b.base, 0, total);
     write_sizes(&s.b);
-    if (!(s.b.all = ep_reg(&s.e, s.b.base, total, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
-                                                     IBV_ACCESS_REMOTE_READ))) {
+    if (box_register(&s.e, &s.b, 1)) {
         logf_("register mailbox");
         goto fail;
     }
     volatile uint64_t *staged_word = (volatile uint64_t *)(s.b.base + s.b.req + 128);
-    char where[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &bind_addr, where, sizeof(where));
-    logf_("listen %s: %s gid %d mtu %d, control %s:%d, socket %s, mailbox %s (%" PRIu64 " + %" PRIu64 " MiB)", name,
-          device, gid_index, mtu, where, port, sock_path, box_path, s.b.req >> 20, s.b.rep >> 20);
+    logf_("listen %s: %s (%s) gid %d mtu %d, exchange %s port %d, socket %s, mailbox %s (%" PRIu64 " + %" PRIu64 " MiB)",
+          name, device, link_kind_name(s.e.kind), gid_index, mtu, via, s.x.port, sock_path, box_path, s.b.req >> 20,
+          s.b.rep >> 20);
 
     uint32_t last_staged = 0;
     uint64_t active = now_ns();
-    int one = 1;
     char *line = malloc(LINE);
     for (int i = 0; i < MAX_PENDING; ++i) prd[i].fd = -1;
     while (!g_stop && line) {
-        struct pollfd fds[4 + MAX_PENDING];
+        struct pollfd fds[3 + MAX_PENDING];
         int nf = 0;
-        fds[nf++] = (struct pollfd){.fd = ls, .events = POLLIN};
+        fds[nf++] = (struct pollfd){.fd = s.x.fd, .events = POLLIN};
         fds[nf++] = (struct pollfd){.fd = us, .events = POLLIN};
-        fds[nf++] = (struct pollfd){.fd = s.ctl, .events = POLLIN};
         fds[nf++] = (struct pollfd){.fd = s.svc, .events = POLLIN};
         for (int i = 0; i < MAX_PENDING; ++i) fds[nf++] = (struct pollfd){.fd = prd[i].fd, .events = POLLIN};
-        int waited = poll(fds, (nfds_t)nf, (s.armed && s.svc >= 0) ? 0 : 200);
+        int busy = s.armed && s.svc >= 0, waited = poll(fds, (nfds_t)nf, busy ? 0 : s.hello && !s.armed ? 20 : 200);
         if (waited < 0 && errno != EINTR) break;
+        struct xmsg m;
+        while (xchg_recv(&s.x, &m, 0) == 1)
+            if (listen_datagram(&s, &m)) last_staged = 0;
+        /* read after the datagrams, which may have started a session or heard the peer just now */
         uint64_t now = now_ns();
-        if (fds[0].revents & POLLIN) {
-            int fd = accept(ls, NULL, NULL);
-            if (fd >= 0) {
-                if (s.ctl >= 0) {
-                    send_line(fd, "ERR busy");
-                    close(fd);
-                } else {
-                    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-                    set_io_timeout(fd, IO_TIMEOUT_S);
-                    set_keepalive(fd);
-                    s.ctl = fd;
-                    s.ctl_since = now;
-                    memset(&crd, 0, sizeof(crd));
-                    crd.fd = fd;
-                    logf_("listen %s: control connection", name);
-                }
-            }
-        }
         if (fds[1].revents & POLLIN) {
             int fd = accept(us, NULL, NULL);
             int slot = -1;
@@ -318,35 +296,30 @@ int run_listen(const char *name, const char *device, int gid_index, int mtu, str
                 close(fd);
             }
         }
-        if (s.ctl >= 0) {
-            int got;
-            while ((got = take_line(&crd, line, LINE, 0)) == 1) {
-                if (!strncmp(line, "HELLO ", 6)) {
-                    listen_hello(&s, line + 6);
-                    last_staged = 0;
-                } else if (!strcmp(line, "READY") && s.hello && !s.armed) {
-                    s.armed = 1;
-                    s.since = (long long)time(NULL);
-                    logf_("listen %s: peer ready (%s replies, %d reply segments)", name,
-                          s.direct ? "direct" : "pull", s.nrseg);
-                } else if (!strcmp(line, "PING")) {
-                    send_line(s.ctl, "PONG");
-                }
-            }
-            if (got < 0) {
-                logf_("listen %s: control connection closed after %" PRIu64 " calls", name, s.served);
-                listen_drop(&s, "control closed");
-            } else if (!s.armed && now - s.ctl_since > HANDSHAKE_NS) {
-                /* an idle or half-open connection must not lock the real connect end out */
-                logf_("listen %s: no HELLO and READY within %d s; dropping the control connection", name,
-                      MCDMA_RPC_HANDSHAKE_S);
-                listen_drop(&s, "handshake timeout");
-            }
+        if (s.hello && !s.armed && now - s.hello_since > HANDSHAKE_NS) {
+            /* a session that never confirms must not hold the link */
+            logf_("listen %s: no confirmation within %d s; dropping the session", name, MCDMA_RPC_HANDSHAKE_S);
+            listen_drop(&s, "handshake timeout");
+        } else if (s.hello && !s.armed && now - s.offered > RESEND_NS) {
+            (void)xchg_send(&s.x, &s.answer);
+            s.offered = now;
+        } else if (s.armed && now - s.heard > LIVENESS_NS) {
+            listen_drop(&s, "the connect end is silent");
         }
         if (s.svc >= 0 && take_line(&srd, line, LINE, 0) < 0) {
             logf_("listen %s: service detached", name);
             close(s.svc);
             s.svc = -1;
+        }
+        /* Thunderbolt requests land only when this end posts receives for them */
+        if (s.hello && s.e.kind == LINK_TB) {
+            int handled = tb_progress(&s.e);
+            if (handled < 0) {
+                s.failures++;
+                listen_drop(&s, "thunderbolt link failed");
+            } else if (handled) {
+                active = now_ns();
+            }
         }
         if (s.svc >= 0 && s.armed) {
             uint64_t sw = load_word(staged_word);
@@ -356,12 +329,12 @@ int run_listen(const char *name, const char *device, int gid_index, int mtu, str
                 active = now_ns();
                 if (len > s.b.rep - CTRL || listen_reply(&s, seq, len)) {
                     s.failures++;
-                    logf_("listen %s: reply write failed; dropping the connection", name);
+                    logf_("listen %s: reply write failed; dropping the link", name);
                     listen_drop(&s, "reply write");
                 }
             }
         }
-        if (s.armed && s.svc >= 0 && !waited) {
+        if (busy && !waited) {
             if (now_ns() - active > 50000000ull)
                 usleep(20);
             else
@@ -376,22 +349,22 @@ int run_listen(const char *name, const char *device, int gid_index, int mtu, str
     for (int i = 0; i < MAX_PENDING; ++i)
         if (prd[i].fd >= 0) close(prd[i].fd);
     free(line);
-    close(ls);
+    xchg_close(&s.x);
     close(us);
     unlink(sock_path);
-    teardown_all();
+    ep_close(&s.e);
     munmap(s.b.base, total);
-    unlink(box_path);
+    remove_box(box_path);
     logf_("listen %s: every verbs object destroyed, exiting", name);
     return 0;
 
 fail:
-    close(ls);
+    xchg_close(&s.x);
     close(us);
     unlink(sock_path);
-    teardown_all();
+    ep_close(&s.e);
     if (s.b.base) munmap(s.b.base, total);
-    /* the link lock is ours, so whatever mailbox file exists belongs to this failed start */
-    unlink(box_path);
+    /* the link lock is ours, so whatever mailbox exists belongs to this failed start */
+    remove_box(box_path);
     return 2;
 }

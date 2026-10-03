@@ -25,4 +25,16 @@ the attached card's actual identity. Offline tests cover both identities,
 the checker predicate and CLI classification, not hardware equivalence.
 
 Apple Thunderbolt RDMA peer selection from PR #3 is deferred pending
-separate end-to-end validation; this source still requires an Ethernet link.
+separate end-to-end validation; the CX5 setup still requires an Ethernet link.
+
+## Thunderbolt links between Macs
+
+`mcdma-rpcd` and `libmcdma-fabric` also run over Apple's RDMA over Thunderbolt
+between two Macs, without the MCDMA kernel extension. That path is offline-tested
+only, against a stub that enforces TN3205's rules: SEND and RECV on UC queue
+pairs, frame-matched receives and Apple's registration limits. Qualify it on two
+Macs with `rdma_ctl enable` and the Thunderbolt Bridge inactive: `rpc-echo`
+through a daemon link ([link daemon](link-daemon.md#qualifying-a-link-on-hardware))
+and `fabric-check` on the one-sided path ([fabric](fabric.md#qualifying-on-hardware)),
+both of which check every byte. Until then, no Thunderbolt latency, bandwidth or
+ordering result is claimed.
