@@ -145,6 +145,8 @@ void tb_destroy(struct ep *e);
 void tb_accept(struct ep *e, const struct region *rx, uint64_t lo, uint64_t hi);
 int tb_write(struct ep *e, const struct region *src, uint64_t off, uint64_t roff, uint64_t len, uint64_t timeout_ns);
 int tb_signal(struct ep *e, uint64_t roff, uint64_t value, uint64_t timeout_ns);
+int tb_write_signal(struct ep *e, const struct region *src, uint64_t off, uint64_t roff, uint64_t len, uint64_t soff,
+                    uint64_t value, uint64_t timeout_ns);
 int tb_fence(struct ep *e, uint64_t timeout_ns);
 int tb_progress(struct ep *e);
 int tb_busy(const struct ep *e);

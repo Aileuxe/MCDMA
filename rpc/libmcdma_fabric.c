@@ -171,10 +171,15 @@ static int progress_all(struct mcdma_fabric *f) {
     return handled;
 }
 
-/* Callers take the lock through this, so the progress thread's tight loop never starves them. */
+/* Callers take the lock through this, so the progress thread's tight loop never starves them. They spin: the progress
+ * thread holds it for a microsecond or two, and a caller put to sleep on it pays the kernel's wake (~4 us). */
 static void enter(struct mcdma_fabric *f) {
     __atomic_add_fetch(&f->wanted, 1, __ATOMIC_ACQ_REL);
-    pthread_mutex_lock(&f->lock);
+    while (pthread_mutex_trylock(&f->lock)) {
+#if defined(__aarch64__)
+        __asm__ volatile("isb");
+#endif
+    }
     __atomic_sub_fetch(&f->wanted, 1, __ATOMIC_ACQ_REL);
 }
 
@@ -365,6 +370,20 @@ int mcdma_fabric_write(struct mcdma_fabric_peer *p, uint64_t local_offset, uint6
                                                                          length, OP_NS)
                                                              : roce_range(p, IBV_WR_RDMA_WRITE, local_offset,
                                                                           remote_offset, length)));
+    return settle(p, failed);
+}
+
+int mcdma_fabric_write_signal(struct mcdma_fabric_peer *p, uint64_t local_offset, uint64_t remote_offset,
+                              uint64_t length, uint64_t signal_offset, uint64_t value) {
+    if (!p) return MCDMA_FABRIC_INVALID;
+    if (local_offset < MCDMA_FABRIC_WS_ROOM || !in(local_offset - MCDMA_FABRIC_WS_ROOM, length + MCDMA_FABRIC_WS_ROOM,
+                                                 p->f->win.length) ||
+        !in(remote_offset, length, p->remote_length) || signal_offset % 8 || !in(signal_offset, 8, p->remote_length))
+        return MCDMA_FABRIC_BOUNDS;
+    if (p->e.kind != LINK_TB) return MCDMA_FABRIC_UNSUPPORTED;
+    enter(p->f);
+    int failed = p->down || tb_write_signal(&p->e, &p->f->win, local_offset, remote_offset, length, signal_offset,
+                                             value, OP_NS);
     return settle(p, failed);
 }
 

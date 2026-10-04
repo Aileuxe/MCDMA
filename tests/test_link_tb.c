@@ -1,5 +1,6 @@
 /* Offline test of the Thunderbolt write protocol under the stub's model of the measured provider, one scenario a run:
  *   order     every signal lands after the writes before it, from 1 byte through packet and message boundaries
+ *   joined    the same with each write and its signal as one message (or two, across a registration)
  *   overlap   later writes to the same bytes win, whether each rode inside its header or as a message of its own
  *   random    thousands of random writes and signals both ways at once match a replayed mirror
  *   bounds    a write outside what the receiver accepts fails the link instead of landing
@@ -154,6 +155,29 @@ static void scenario_order(struct side *a, struct side *b) {
     CHECK(!tb_fence(&a->e, TIMEOUT), "a fence returns");
 }
 
+static void scenario_joined(struct side *a, struct side *b) {
+    const uint64_t sizes[] = {1, 7, 4016, 4048, 4049, 8192, 65536 + 3, (1ull << 20) + 5, (4ull << 20) - 48,
+                              (4ull << 20) + 1, 13ull << 20};
+    const uint64_t flag = WINDOW - 64;
+    for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+        uint64_t len = sizes[i], src = 64 + (rnd() % 64) * 8 + 1;
+        /* even steps start past a registration boundary at the source, so their head would span two */
+        if (i % 2 == 0 && len < TB_SEG - 4096) src = TB_SEG + 16;
+        uint64_t dst = i % 2 ? TB_SEG - len / 2 - 3 : 4096 * (uint64_t)i;
+        g_watch.dst = dst, g_watch.len = len, g_watch.src = a->mem + src;
+        __atomic_store_n(&g_watch.value, 2000 + i, __ATOMIC_RELEASE);
+        CHECK(!tb_write_signal(&a->e, &a->r, src, dst, len, flag, 2000 + i, TIMEOUT), "a joined write is posted");
+        uint64_t deadline = link_now_ns() + TIMEOUT;
+        while (__atomic_load_n(&g_watch.judged, __ATOMIC_ACQUIRE) != 2000 + i) {
+            CHECK(!b->failed, "the receiver's link failed");
+            CHECK(link_now_ns() < deadline, "a joined signal never landed");
+        }
+        CHECK(!g_watch.wrong, "a joined signal landed before its bytes");
+        CHECK(!memcmp(b->mem + dst, a->mem + src, len), "a joined write landed wrong");
+    }
+    CHECK(!tb_fence(&a->e, TIMEOUT), "a fence returns");
+}
+
 static void scenario_overlap(struct side *a, struct side *b) {
     const uint64_t at = 3ull << 20, flag = WINDOW - 64;
     static unsigned char expect[256 << 10];
@@ -257,6 +281,7 @@ int main(int argc, char **argv) {
     start(&b);
     if (!strcmp(g_mode, "order")) scenario_order(&a, &b);
     else if (!strcmp(g_mode, "overlap")) scenario_overlap(&a, &b);
+    else if (!strcmp(g_mode, "joined")) scenario_joined(&a, &b);
     else if (!strcmp(g_mode, "random")) scenario_random(&a, &b);
     else if (bounds) g_quiet = 1, scenario_bounds(&a, &b);
     else if (!strcmp(g_mode, "teardown")) scenario_teardown(&a, &b);

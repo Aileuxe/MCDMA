@@ -66,6 +66,12 @@ MCDMA_FABRIC_API int mcdma_fabric_write(struct mcdma_fabric_peer *p, uint64_t lo
 /* Store `value` at the peer's 8-byte-aligned remote_offset, after every earlier write to that peer has landed. */
 MCDMA_FABRIC_API int mcdma_fabric_signal(struct mcdma_fabric_peer *p, uint64_t remote_offset, uint64_t value);
 
+/* mcdma_fabric_write, then mcdma_fabric_signal, as one message on Thunderbolt (one send, not three). The library may
+ * overwrite the MCDMA_FABRIC_WS_ROOM bytes before local_offset; both ends need a library that has this call. */
+#define MCDMA_FABRIC_WS_ROOM 64u
+MCDMA_FABRIC_API int mcdma_fabric_write_signal(struct mcdma_fabric_peer *p, uint64_t local_offset, uint64_t remote_offset,
+                                               uint64_t length, uint64_t signal_offset, uint64_t value);
+
 /* Copy the peer's window at remote_offset into this window; RoCE only, returns once the bytes are here. */
 MCDMA_FABRIC_API int mcdma_fabric_read(struct mcdma_fabric_peer *p, uint64_t local_offset, uint64_t remote_offset,
                                        uint64_t length);

@@ -72,6 +72,12 @@ class LinkTests(unittest.TestCase):
                 with self.subTest(seed=seed, lazy=bool(lazy)):
                     self.run_case('link-tb', 'order', STUB_SEED=seed, **lazy)
 
+    def test_a_write_and_its_signal_as_one_message_land_in_order(self):
+        for seed in ('1', '2'):
+            for lazy in ({}, {'STUB_LAZY': '1'}):
+                with self.subTest(seed=seed, lazy=bool(lazy)):
+                    self.run_case('link-tb', 'joined', STUB_SEED=seed, **lazy)
+
     def test_overlapping_writes_land_in_posting_order(self):
         for seed in ('1', '4'):
             with self.subTest(seed=seed):

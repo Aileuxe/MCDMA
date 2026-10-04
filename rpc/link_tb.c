@@ -3,7 +3,8 @@
  * but a message's last completes with IBV_WC_LOC_LEN_ERR. One queue pair a link. The receiver keeps a ring of
  * one-packet receives posted, so every message lands there without waiting on the receiver. A write is a header
  * message, then its bytes as a message of their own, which the receiver copies into place; small writes ride inside
- * the header. Messages take effect in arrival order, so a signal lands after the writes before it, as on RoCE. */
+ * the header. Messages take effect in arrival order, so a signal lands after the writes before it, as on RoCE. A write
+ * and its signal can also travel as one message: head, signal offset, bytes. */
 #include "link.h"
 
 #include <stdio.h>
@@ -14,7 +15,8 @@
 #define HEAD 32
 #define INLINE_MAX (TB_PACKET - HEAD)
 #define TAG(kind, index) (((uint64_t)(kind) << 56) | (uint64_t)(index))
-enum { C_WRITE = 1, C_INLINE, C_SIGNAL, C_FENCE, C_FENCE_ACK };
+enum { C_WRITE = 1, C_INLINE, C_SIGNAL, C_FENCE, C_FENCE_ACK, C_WRITE_SIGNAL };
+#define WS_HEAD 48                /* a write-and-signal message's head and signal offset, before its bytes */
 enum { T_SEND = 1, T_RECV };
 
 struct head {
@@ -249,6 +251,25 @@ int tb_signal(struct ep *e, uint64_t roff, uint64_t value, uint64_t timeout_ns) 
     return send_head(e, C_SIGNAL, roff, 8, value, NULL);
 }
 
+/* A write and then a signal as one message from the window, its head in the WS_HEAD bytes before `off`; a message
+ * that would span two registrations or outgrow the peer's ring goes as the write, then the signal. */
+int tb_write_signal(struct ep *e, const struct region *src, uint64_t off, uint64_t roff, uint64_t len, uint64_t soff,
+                    uint64_t value, uint64_t timeout_ns) {
+    struct tb *t = e->tb;
+    if (off < WS_HEAD || off > src->length || len > src->length - off || !len) return -1;
+    if (len + WS_HEAD > msg_max(t) || (off - WS_HEAD) / src->seg != (off + len - 1) / src->seg)
+        return tb_write(e, src, off, roff, len, timeout_ns) || tb_signal(e, soff, value, timeout_ns) ? -1 : 0;
+    if (room(e, packets(WS_HEAD + len), 1, link_now_ns() + timeout_ns)) return -1;
+    unsigned char *m = src->base + off - WS_HEAD;
+    struct head h = {MAGIC, t->tx_seq, C_WRITE_SIGNAL, 0, (uint32_t)len, roff, value};
+    memset(m, 0, WS_HEAD);
+    memcpy(m, &h, sizeof(h));
+    memcpy(m + HEAD, &soff, sizeof(soff));
+    if (post_send(e, m, (uint32_t)(WS_HEAD + len), region_lkey(src, off - WS_HEAD), 0)) return -1;
+    t->tx_seq++;
+    return 0;
+}
+
 /* Returns once the peer has applied every write and signal posted before this call. */
 int tb_fence(struct ep *e, uint64_t timeout_ns) {
     struct tb *t = e->tb;
@@ -273,6 +294,14 @@ static void copy_out(const struct tb *t, uint64_t first, unsigned char *dst, uin
     if (len > head) memcpy(dst + head, t->ring, len - head);
 }
 
+/* Copy `len` bytes from `skip` bytes into the message at slot counter `first`; the ring may wrap once. */
+static void copy_skip(const struct tb *t, uint64_t first, uint64_t skip, unsigned char *dst, uint64_t len) {
+    uint64_t ring = (uint64_t)t->slots * TB_PACKET, at = ((first % t->slots) * TB_PACKET + skip) % ring;
+    uint64_t head = len < ring - at ? len : ring - at;
+    memcpy(dst, t->ring + at, head);
+    if (len > head) memcpy(dst + head, t->ring, len - head);
+}
+
 static int inside(const struct tb *t, uint64_t off, uint64_t len) {
     return off >= t->lo && off <= t->hi && len <= t->hi - off;
 }
@@ -290,11 +319,28 @@ static int take(struct ep *e, uint64_t first, uint64_t count, uint64_t bytes) {
         return 1;
     }
     struct head h;
-    if (count != 1 || bytes < HEAD) {
+    if (bytes < HEAD) {
         poison(e, "a malformed header message");
         return -1;
     }
     memcpy(&h, t->ring + (first % t->slots) * TB_PACKET, sizeof(h));
+    if (h.magic == MAGIC && h.kind == C_WRITE_SIGNAL && h.seq == t->rx_seq && t->rx) {
+        /* its bytes, then its signal: the signal lands after them, as after a write of their own */
+        uint64_t soff = 0;
+        if (bytes >= WS_HEAD) memcpy(&soff, t->ring + (first % t->slots) * TB_PACKET + HEAD, sizeof(soff));
+        if (bytes != WS_HEAD + (uint64_t)h.len || !h.len || soff % 8 || !inside(t, h.off, h.len) || !inside(t, soff, 8)) {
+            poison(e, "a malformed write-and-signal message");
+            return -1;
+        }
+        t->rx_seq++;
+        copy_skip(t, first, WS_HEAD, t->rx->base + h.off, h.len);
+        __atomic_store_n((uint64_t *)(void *)(t->rx->base + soff), h.value, __ATOMIC_RELEASE);
+        return 1;
+    }
+    if (count != 1) {
+        poison(e, "a malformed header message");
+        return -1;
+    }
     const char *why = h.magic != MAGIC                                     ? "a malformed header message"
                       : h.seq != t->rx_seq                                 ? "a message was lost or reordered"
                       : !t->rx && h.kind != C_FENCE_ACK                    ? "the peer wrote before this end accepted"

@@ -17,6 +17,7 @@ RDMA as two Studios on macOS 27.0 measured it. It has not run on hardware yet; `
 | `mcdma_fabric_connect` | Meets one peer over a Thunderbolt IP interface; both sides call it with the same name |
 | `mcdma_fabric_write` | Copies a range of this window to an offset in the peer's window |
 | `mcdma_fabric_signal` | Stores an 8-byte word in the peer's window after every earlier write to that peer |
+| `mcdma_fabric_write_signal` | A write and then a signal as one message on Thunderbolt; both ends need a library with it |
 | `mcdma_fabric_flush` | Returns once everything posted to the peer has landed |
 | `mcdma_fabric_read` | Copies from the peer's window into this one; RoCE only |
 | `mcdma_fabric_fetch_add` | Always `MCDMA_FABRIC_UNSUPPORTED`: no MCDMA link has atomics |
@@ -40,7 +41,8 @@ RDMA as two Studios on macOS 27.0 measured it. It has not run on hardware yet; `
   posts nothing.
 - Any failed operation, refused exchange or goodbye from the peer leaves that peer down: every later call on it
   returns `MCDMA_FABRIC_PEER`. Disconnect it and connect again.
-- Calls on one fabric are serialized by a lock, so several threads may share it.
+- Calls on one fabric are serialized by a lock, so several threads may share it. Callers spin for it rather than sleep:
+  the progress thread holds it for a microsecond or two, and a sleeping caller pays the kernel's wake.
 
 ## Windows
 
@@ -94,10 +96,13 @@ How a write lands:
 2. A write of up to 4,064 bytes travels inside one header message, a single packet.
 3. A larger write is a header message with its offset and length, then its bytes as a message of their own, sent
    straight from the window with no copy, in pieces of at most 4 MiB that never cross a registration.
-4. The receiver takes whole messages from the ring in arrival order and copies each write's bytes into place. A signal
+4. `mcdma_fabric_write_signal` sends the head, the signal's offset and the bytes as one message from the window, its
+   head written into the 64 bytes before the source, so a write and its flag cost one send instead of three. One that
+   would span two registrations or outgrow the peer's ring goes as a write, then a signal.
+5. The receiver takes whole messages from the ring in arrival order and copies each write's bytes into place. A signal
    is applied when its header is taken, so it lands after the writes before it, and later writes to the same bytes
    win, as RC ordering gives on RoCE.
-5. Every header carries a sequence number. A lost or reordered message, bytes whose length differs from their header,
+6. Every header carries a sequence number. A lost or reordered message, bytes whose length differs from their header,
    a write outside the window or any unexpected completion fails the link instead of landing anywhere else.
 
 Only one copy is paid, on the receiving CPU. An engine that reads partials where they land could skip it; that needs
