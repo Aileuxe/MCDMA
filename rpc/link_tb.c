@@ -64,6 +64,24 @@ static int post_recv(struct ep *e, uint64_t slot) {
     return -1;
 }
 
+/* Post receives for `n` slots from slot counter `first` in one call (each post into the provider costs ~0.4 us). */
+static int post_recvs(struct ep *e, uint64_t first, uint32_t n) {
+    struct tb *t = e->tb;
+    struct ibv_sge sge[64];
+    struct ibv_recv_wr wr[64], *bad = NULL;
+    if (n > 64) n = 64;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint64_t slot = (first + i) % t->slots;
+        sge[i] = (struct ibv_sge){(uintptr_t)(t->ring + slot * TB_PACKET), TB_PACKET, t->ring_mr->lkey};
+        memset(&wr[i], 0, sizeof(wr[i]));
+        wr[i].wr_id = TAG(T_RECV, slot), wr[i].sg_list = &sge[i], wr[i].num_sge = 1;
+        wr[i].next = i + 1 < n ? &wr[i + 1] : NULL;
+    }
+    if (!n || !ibv_post_recv(e->qp, wr, &bad)) return (int)n;
+    poison(e, "posting a receive failed");
+    return -1;
+}
+
 /* Post one SEND of a message that is never empty: zero-length SENDs are lost on Thunderbolt. */
 static int post_send(struct ep *e, void *addr, uint32_t len, uint32_t lkey, int staged) {
     struct tb *t = e->tb;
@@ -381,7 +399,11 @@ static void drain(struct ep *e) {
         if (take(e, t->used, count, bytes) <= 0) break;
         t->used = end + 1;
     }
-    while (!t->poisoned && t->posted < t->used + t->slots && !post_recv(e, t->posted % t->slots)) t->posted++;
+    while (!t->poisoned && t->posted < t->used + t->slots) {
+        int n = post_recvs(e, t->posted, (uint32_t)(t->used + t->slots - t->posted));
+        if (n <= 0) break;
+        t->posted += (uint64_t)n;
+    }
 }
 
 static void complete(struct ep *e, const struct ibv_wc *wc) {

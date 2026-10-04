@@ -5,6 +5,9 @@
 
 #include <errno.h>
 #include <pthread.h>
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -185,6 +188,11 @@ static void enter(struct mcdma_fabric *f) {
 
 static void *progress_main(void *arg) {
     struct mcdma_fabric *f = arg;
+#ifdef __APPLE__
+    /* MCDMA_FABRIC_QOS=1: the progress thread runs as user-interactive work (a performance core) */
+    if (getenv("MCDMA_FABRIC_QOS") && !strcmp(getenv("MCDMA_FABRIC_QOS"), "1"))
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     uint64_t active = link_now_ns();
     while (!f->stop) {
         if (__atomic_load_n(&f->wanted, __ATOMIC_ACQUIRE) || pthread_mutex_trylock(&f->lock)) continue;
