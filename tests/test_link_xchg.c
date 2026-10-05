@@ -88,7 +88,10 @@ static void parsing(void) {
     check(!via_parse("en2/fe80::1021:1bac:fe1:b5e3", ifname, sizeof(ifname), &peer, &pinned) && pinned &&
               peer.s6_addr[0] == 0xfe && peer.s6_addr[15] == 0xe3,
           "IFACE/fe80::ADDR pins the peer");
-    const char *bad[] = {"", "/fe80::1", "en2/::1", "en2/192.0.2.1", "en2/fe80::1%en2", "en2/2001:db8::1",
+    check(!via_parse("en2/192.0.2.1", ifname, sizeof(ifname), &peer, &pinned) && pinned &&
+              IN6_IS_ADDR_V4MAPPED(&peer) && peer.s6_addr[12] == 192 && peer.s6_addr[15] == 1,
+          "IFACE/IPv4 pins the peer");
+    const char *bad[] = {"", "/fe80::1", "en2/::1", "en2/192.0.2.999", "en2/fe80::1%en2", "en2/2001:db8::1",
                          "an-interface-name-far-too-long-for-any-system"};
     for (size_t k = 0; k < sizeof(bad) / sizeof(bad[0]); ++k)
         check(via_parse(bad[k], ifname, sizeof(ifname), &peer, &pinned) != 0, bad[k]);

@@ -15,8 +15,10 @@
 #define HEAD 32
 #define INLINE_MAX (TB_PACKET - HEAD)
 #define TAG(kind, index) (((uint64_t)(kind) << 56) | (uint64_t)(index))
-enum { C_WRITE = 1, C_INLINE, C_SIGNAL, C_FENCE, C_FENCE_ACK, C_WRITE_SIGNAL };
+enum { C_WRITE = 1, C_INLINE, C_SIGNAL, C_FENCE, C_FENCE_ACK, C_WRITE_SIGNAL, C_BOND_SIGNAL, C_BOND_WRITE_SIGNAL };
 #define WS_HEAD 48                /* a write-and-signal message's head and signal offset, before its bytes */
+#define BOND_SIGNAL_HEAD 56
+#define BOND_WS_HEAD 64
 enum { T_SEND = 1, T_RECV };
 
 struct head {
@@ -25,6 +27,7 @@ struct head {
     uint32_t len;
     uint64_t off, value;
 };
+_Static_assert(sizeof(struct head) == HEAD, "Thunderbolt wire header size");
 
 struct tb {
     unsigned char *ring;          /* TB_RING receive slots, then TB_STAGE send slots, one packet each */
@@ -35,6 +38,13 @@ struct tb {
     uint64_t tx_posted, tx_done, staged, unstaged;
     uint16_t tx_packets[TB_SEND_WR];
     uint8_t tx_staged[TB_SEND_WR];
+    uint32_t tx_bytes[TB_SEND_WR];
+    uint32_t tx_payload[TB_SEND_WR];
+    uint64_t sent_bytes, completed_bytes, writes_posted, writes_placed;
+    uint64_t sent_payload, completed_payload;
+    void *bond_arg;
+    void (*bond_placed)(void *arg, uint64_t count);
+    int (*bond_signal)(void *arg, uint64_t seq, const uint64_t need[2], uint64_t off, uint64_t value);
     /* receiving: slots whose completion arrived, slots consumed, slots posted */
     uint64_t filled, used, posted;
     uint16_t rx_len[TB_RING];
@@ -83,7 +93,7 @@ static int post_recvs(struct ep *e, uint64_t first, uint32_t n) {
 }
 
 /* Post one SEND of a message that is never empty: zero-length SENDs are lost on Thunderbolt. */
-static int post_send(struct ep *e, void *addr, uint32_t len, uint32_t lkey, int staged) {
+static int post_send(struct ep *e, void *addr, uint32_t len, uint32_t lkey, int staged, uint32_t payload) {
     struct tb *t = e->tb;
     uint32_t i = (uint32_t)(t->tx_posted % TB_SEND_WR), n = packets(len);
     struct ibv_sge sge = {(uintptr_t)addr, len, lkey};
@@ -97,6 +107,8 @@ static int post_send(struct ep *e, void *addr, uint32_t len, uint32_t lkey, int 
         return -1;
     }
     t->tx_packets[i] = (uint16_t)n, t->tx_staged[i] = (uint8_t)staged;
+    t->tx_bytes[i] = len, t->sent_bytes += len;
+    t->tx_payload[i] = payload, t->sent_payload += payload;
     t->packets += n, t->tx_posted++;
     return 0;
 }
@@ -207,6 +219,25 @@ void tb_accept(struct ep *e, const struct region *rx, uint64_t lo, uint64_t hi) 
     e->tb->hi = hi < rx->length ? hi : rx->length;
 }
 
+void tb_bond_hooks(struct ep *e, void *arg, void (*placed)(void *arg, uint64_t count),
+                   int (*signal)(void *arg, uint64_t seq, const uint64_t need[2], uint64_t off, uint64_t value)) {
+    e->tb->bond_arg = arg;
+    e->tb->bond_placed = placed;
+    e->tb->bond_signal = signal;
+}
+
+uint64_t tb_writes_posted(const struct ep *e) { return e->tb ? e->tb->writes_posted : 0; }
+uint64_t tb_writes_placed(const struct ep *e) { return e->tb ? e->tb->writes_placed : 0; }
+uint64_t tb_posted_bytes(const struct ep *e) { return e->tb ? e->tb->sent_bytes : 0; }
+uint64_t tb_completed_bytes(const struct ep *e) { return e->tb ? e->tb->completed_bytes : 0; }
+uint64_t tb_posted_payload(const struct ep *e) { return e->tb ? e->tb->sent_payload : 0; }
+uint64_t tb_completed_payload(const struct ep *e) { return e->tb ? e->tb->completed_payload : 0; }
+
+static void placed(struct tb *t) {
+    t->writes_placed++;
+    if (t->bond_placed) t->bond_placed(t->bond_arg, t->writes_placed);
+}
+
 /* Room for `n` more packets in `sends` more sends, holding back one header for a fence's answer unless `reply`. */
 static int has_room(const struct tb *t, uint32_t n, uint32_t sends, int reply) {
     uint32_t spare = reply ? 0 : 1;
@@ -221,7 +252,7 @@ static int send_head(struct ep *e, uint16_t kind, uint64_t off, uint32_t len, ui
     struct head h = {MAGIC, t->tx_seq, kind, 0, len, off, value};
     memcpy(slot, &h, sizeof(h));
     if (bytes) memcpy(slot + HEAD, bytes, len);
-    if (post_send(e, slot, HEAD + (bytes ? len : 0), t->ring_mr->lkey, 1)) return -1;
+    if (post_send(e, slot, HEAD + (bytes ? len : 0), t->ring_mr->lkey, 1, kind == C_INLINE ? len : 0)) return -1;
     t->tx_seq++, t->staged++;
     return 0;
 }
@@ -246,6 +277,11 @@ static uint64_t msg_max(const struct tb *t) {
     return max > TB_MSG ? TB_MSG : max;
 }
 
+uint64_t tb_write_limit(const struct ep *e) {
+    uint64_t max = e->tb ? msg_max(e->tb) : 0;
+    return max < TB_TRY_MAX ? max : TB_TRY_MAX;
+}
+
 int tb_write(struct ep *e, const struct region *src, uint64_t off, uint64_t roff, uint64_t len, uint64_t timeout_ns) {
     struct tb *t = e->tb;
     uint64_t deadline = link_now_ns() + timeout_ns, max = msg_max(t);
@@ -256,9 +292,52 @@ int tb_write(struct ep *e, const struct region *src, uint64_t off, uint64_t roff
         if (take <= INLINE_MAX) {
             if (room(e, 1, 1, deadline) || send_head(e, C_INLINE, roff, (uint32_t)take, 0, src->base + off)) return -1;
         } else if (room(e, 1 + packets(take), 2, deadline) || send_head(e, C_WRITE, roff, (uint32_t)take, 0, NULL) ||
-                   post_send(e, src->base + off, (uint32_t)take, region_lkey(src, off), 0)) {
+                   post_send(e, src->base + off, (uint32_t)take, region_lkey(src, off), 0, (uint32_t)take)) {
             return -1;
         }
+        t->writes_posted++;
+        off += take, roff += take, len -= take;
+    }
+    return 0;
+}
+
+/* Reserve the whole bounded operation, including every header at registration/message boundaries. The regular
+ * room check reserves only one header, whereas this preflight must reserve all of them without making progress. */
+int tb_can_write(const struct ep *e, const struct region *src, uint64_t off, uint64_t len) {
+    const struct tb *t = e->tb;
+    if (!t || t->poisoned || !src || !src->seg || off > src->length || len > src->length - off || len > TB_TRY_MAX)
+        return -1;
+    uint64_t max = msg_max(t);
+    if (!max) return -1;
+    uint32_t n = 0, sends = 0, stages = 0;
+    while (len) {
+        uint64_t take = len < max ? len : max, lroom = src->seg - off % src->seg;
+        take = take < lroom ? take : lroom;
+        n += take <= INLINE_MAX ? 1 : 1 + packets(take);
+        sends += take <= INLINE_MAX ? 1 : 2;
+        stages++;
+        /* An arbitrary region can have very small segments; stop counting once no possible room remains. */
+        if (n >= t->depth || sends >= TB_SEND_WR || stages >= TB_STAGE) return 0;
+        off += take, len -= take;
+    }
+    return t->packets + n + 1 <= t->depth && t->tx_posted - t->tx_done + sends + 1 <= TB_SEND_WR &&
+           t->staged - t->unstaged + stages + 1 <= TB_STAGE;
+}
+
+int tb_write_try(struct ep *e, const struct region *src, uint64_t off, uint64_t roff, uint64_t len) {
+    if (len > UINT64_MAX - roff) return -1;
+    int can = tb_can_write(e, src, off, len);
+    if (can <= 0) return can < 0 ? -1 : 1;
+    struct tb *t = e->tb;
+    uint64_t max = msg_max(t);
+    while (len) {
+        uint64_t take = len < max ? len : max, lroom = src->seg - off % src->seg;
+        take = take < lroom ? take : lroom;
+        if (take <= INLINE_MAX) {
+            if (send_head(e, C_INLINE, roff, (uint32_t)take, 0, src->base + off)) return -1;
+        } else if (send_head(e, C_WRITE, roff, (uint32_t)take, 0, NULL) ||
+                   post_send(e, src->base + off, (uint32_t)take, region_lkey(src, off), 0, (uint32_t)take)) return -1;
+        t->writes_posted++;
         off += take, roff += take, len -= take;
     }
     return 0;
@@ -283,8 +362,69 @@ int tb_write_signal(struct ep *e, const struct region *src, uint64_t off, uint64
     memset(m, 0, WS_HEAD);
     memcpy(m, &h, sizeof(h));
     memcpy(m + HEAD, &soff, sizeof(soff));
-    if (post_send(e, m, (uint32_t)(WS_HEAD + len), region_lkey(src, off - WS_HEAD), 0)) return -1;
+    if (post_send(e, m, (uint32_t)(WS_HEAD + len), region_lkey(src, off - WS_HEAD), 0, (uint32_t)len)) return -1;
     t->tx_seq++;
+    t->writes_posted++;
+    return 0;
+}
+
+int tb_can_bond_signal(const struct ep *e) {
+    const struct tb *t = e->tb;
+    return !t || t->poisoned || !t->peer_slots ? -1 : has_room(t, 1, 1, 0);
+}
+
+int tb_bond_signal(struct ep *e, uint64_t soff, uint64_t value, uint64_t seq, const uint64_t need[2],
+                    uint64_t timeout_ns) {
+    if (!e->tb || !need || !seq || soff % 8 || soff > UINT64_MAX - 8) return -1;
+    if (room(e, 1, 1, link_now_ns() + timeout_ns)) return -1;
+    struct tb *t = e->tb;
+    unsigned char *slot = t->ring + (size_t)(TB_RING + t->staged % TB_STAGE) * TB_PACKET;
+    struct head h = {MAGIC, t->tx_seq, C_BOND_SIGNAL, 0, 8, soff, value};
+    memcpy(slot, &h, HEAD);
+    memcpy(slot + HEAD, &seq, 8);
+    memcpy(slot + HEAD + 8, need, 16);
+    if (post_send(e, slot, BOND_SIGNAL_HEAD, t->ring_mr->lkey, 1, 0)) return -1;
+    t->tx_seq++, t->staged++;
+    return 0;
+}
+
+int tb_can_bond_write_signal(const struct ep *e, const struct region *src, uint64_t off, uint64_t len) {
+    const struct tb *t = e->tb;
+    if (!t || t->poisoned || !src || !src->seg || off > src->length || !len || len > src->length - off || !msg_max(t))
+        return -1;
+    if (off < BOND_WS_HEAD || len > msg_max(t) || BOND_WS_HEAD > msg_max(t) - len ||
+        (off - BOND_WS_HEAD) / src->seg != (off + len - 1) / src->seg) return 2;
+    /* The fused header lives in source memory, so it consumes no staging slot. Keep one slot/SEND/packet for ACKs. */
+    return t->packets + packets(BOND_WS_HEAD + len) + 1 <= t->depth &&
+           t->tx_posted - t->tx_done + 2 <= TB_SEND_WR && t->staged - t->unstaged + 1 <= TB_STAGE;
+}
+
+int tb_bond_write_signal(struct ep *e, const struct region *src, uint64_t off, uint64_t roff, uint64_t len,
+                          uint64_t soff, uint64_t value, uint64_t seq, const uint64_t need[2], uint64_t timeout_ns) {
+    struct tb *t = e->tb;
+    if (!t || t->poisoned || !src || !src->seg || !need || !seq || soff % 8 || soff > UINT64_MAX - 8 ||
+        off > src->length || !len || len > src->length - off || len > UINT64_MAX - roff) return -1;
+    int can = tb_can_bond_write_signal(e, src, off, len);
+    if (can < 0) return -1;
+    if (can == 2) return 1;
+    uint64_t deadline = link_now_ns() + timeout_ns;
+    while (!can) {
+        if (tb_progress(e) < 0) return -1;
+        if (link_now_ns() > deadline) {
+            poison(e, "no room for a bonded write-and-signal within the timeout");
+            return -1;
+        }
+        can = tb_can_bond_write_signal(e, src, off, len);
+        if (can < 0) return -1;
+    }
+    unsigned char *m = src->base + off - BOND_WS_HEAD;
+    struct head h = {MAGIC, t->tx_seq, C_BOND_WRITE_SIGNAL, 0, (uint32_t)len, roff, value};
+    memcpy(m, &h, HEAD);
+    memcpy(m + HEAD, &soff, 8);
+    memcpy(m + HEAD + 8, &seq, 8);
+    memcpy(m + HEAD + 16, need, 16);
+    if (post_send(e, m, (uint32_t)(BOND_WS_HEAD + len), region_lkey(src, off - BOND_WS_HEAD), 0, (uint32_t)len)) return -1;
+    t->tx_seq++, t->writes_posted++;
     return 0;
 }
 
@@ -334,6 +474,7 @@ static int take(struct ep *e, uint64_t first, uint64_t count, uint64_t bytes) {
         }
         copy_out(t, first, t->rx->base + t->want_off, bytes);
         t->want_len = 0;
+        placed(t);
         return 1;
     }
     struct head h;
@@ -342,17 +483,51 @@ static int take(struct ep *e, uint64_t first, uint64_t count, uint64_t bytes) {
         return -1;
     }
     memcpy(&h, t->ring + (first % t->slots) * TB_PACKET, sizeof(h));
-    if (h.magic == MAGIC && h.kind == C_WRITE_SIGNAL && h.seq == t->rx_seq && t->rx) {
+    if (h.magic == MAGIC && (h.kind == C_WRITE_SIGNAL || h.kind == C_BOND_WRITE_SIGNAL) && h.seq == t->rx_seq && t->rx) {
         /* its bytes, then its signal: the signal lands after them, as after a write of their own */
-        uint64_t soff = 0;
-        if (bytes >= WS_HEAD) memcpy(&soff, t->ring + (first % t->slots) * TB_PACKET + HEAD, sizeof(soff));
-        if (bytes != WS_HEAD + (uint64_t)h.len || !h.len || soff % 8 || !inside(t, h.off, h.len) || !inside(t, soff, 8)) {
+        uint64_t soff = 0, seq = 0, need[2] = {0, 0};
+        uint64_t head = h.kind == C_WRITE_SIGNAL ? WS_HEAD : BOND_WS_HEAD;
+        if (bytes >= head) {
+            const unsigned char *m = t->ring + (first % t->slots) * TB_PACKET;
+            memcpy(&soff, m + HEAD, sizeof(soff));
+            if (h.kind == C_BOND_WRITE_SIGNAL) {
+                memcpy(&seq, m + HEAD + 8, 8);
+                memcpy(need, m + HEAD + 16, 16);
+            }
+        }
+        if (bytes != head + (uint64_t)h.len || !h.len || soff % 8 || !inside(t, h.off, h.len) || !inside(t, soff, 8) ||
+            (h.kind == C_BOND_WRITE_SIGNAL && (!seq || !t->bond_signal || !t->bond_placed))) {
             poison(e, "a malformed write-and-signal message");
             return -1;
         }
         t->rx_seq++;
-        copy_skip(t, first, WS_HEAD, t->rx->base + h.off, h.len);
-        __atomic_store_n((uint64_t *)(void *)(t->rx->base + soff), h.value, __ATOMIC_RELEASE);
+        copy_skip(t, first, head, t->rx->base + h.off, h.len);
+        placed(t);
+        if (h.kind == C_WRITE_SIGNAL)
+            __atomic_store_n((uint64_t *)(void *)(t->rx->base + soff), h.value, __ATOMIC_RELEASE);
+        else if (t->bond_signal(t->bond_arg, seq, need, soff, h.value)) {
+            poison(e, "the bonded signal was refused");
+            return -1;
+        }
+        return 1;
+    }
+    if (h.magic == MAGIC && h.kind == C_BOND_SIGNAL && h.seq == t->rx_seq && t->rx) {
+        uint64_t seq = 0, need[2] = {0, 0};
+        if (bytes == BOND_SIGNAL_HEAD) {
+            const unsigned char *m = t->ring + (first % t->slots) * TB_PACKET;
+            memcpy(&seq, m + HEAD, 8);
+            memcpy(need, m + HEAD + 8, 16);
+        }
+        if (count != 1 || bytes != BOND_SIGNAL_HEAD || h.len != 8 || h.off % 8 || !inside(t, h.off, 8) ||
+            !seq || !t->bond_signal || !t->bond_placed) {
+            poison(e, "a malformed bonded signal message");
+            return -1;
+        }
+        t->rx_seq++;
+        if (t->bond_signal(t->bond_arg, seq, need, h.off, h.value)) {
+            poison(e, "the bonded signal was refused");
+            return -1;
+        }
         return 1;
     }
     if (count != 1) {
@@ -378,7 +553,10 @@ static int take(struct ep *e, uint64_t first, uint64_t count, uint64_t bytes) {
         if (send_head(e, C_FENCE_ACK, 0, 0, h.value, NULL)) return -1;
     }
     t->rx_seq++;
-    if (h.kind == C_INLINE) memcpy(t->rx->base + h.off, t->ring + (first % t->slots) * TB_PACKET + HEAD, h.len);
+    if (h.kind == C_INLINE) {
+        memcpy(t->rx->base + h.off, t->ring + (first % t->slots) * TB_PACKET + HEAD, h.len);
+        placed(t);
+    }
     if (h.kind == C_WRITE) t->want_off = h.off, t->want_len = h.len;
     if (h.kind == C_SIGNAL) __atomic_store_n((uint64_t *)(void *)(t->rx->base + h.off), h.value, __ATOMIC_RELEASE);
     if (h.kind == C_FENCE_ACK) t->fence_acked = (uint32_t)h.value;
@@ -421,6 +599,8 @@ static void complete(struct ep *e, const struct ibv_wc *wc) {
                t->tx_done < t->tx_posted) {
         t->packets -= t->tx_packets[index];
         t->unstaged += t->tx_staged[index];
+        t->completed_bytes += t->tx_bytes[index];
+        t->completed_payload += t->tx_payload[index];
         t->tx_done++;
     } else {
         char why[112];

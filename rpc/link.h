@@ -29,6 +29,7 @@
 #define TB_SEND_WR 1024             /* sends in flight */
 #define TB_MSG (4ull << 20)         /* largest message */
 #define TB_DEPTH 4095               /* send queue depth in packets that Thunderbolt allows */
+#define TB_TRY_MAX (256ull << 10)    /* largest bounded, nonblocking bonded write chunk */
 #define LINK_REGION_MAX 128         /* registrations per region, and keys per exchange datagram */
 #define LINK_MRS (LINK_REGION_MAX + 4)
 #define LINK_RC_DEPTH 31            /* RoCE CQ and send queue: the CX5 provider refuses 63 */
@@ -150,6 +151,31 @@ int tb_write_signal(struct ep *e, const struct region *src, uint64_t off, uint64
 int tb_fence(struct ep *e, uint64_t timeout_ns);
 int tb_progress(struct ep *e);
 int tb_busy(const struct ep *e);
+/* Bond hooks run under the endpoint's lock, after copying a complete write. The signal hook must copy `need`
+ * if retaining it, return 0 on success/-1 on failure, and arrange the final release-store itself. No hook may
+ * reenter this endpoint. Install both hooks before accepting bonded messages; ordinary wire messages are unchanged. */
+void tb_bond_hooks(struct ep *e, void *arg, void (*placed)(void *arg, uint64_t count),
+                   int (*signal)(void *arg, uint64_t seq, const uint64_t need[2], uint64_t off, uint64_t value));
+uint64_t tb_writes_posted(const struct ep *e);
+uint64_t tb_writes_placed(const struct ep *e);
+uint64_t tb_posted_bytes(const struct ep *e);
+uint64_t tb_completed_bytes(const struct ep *e);
+uint64_t tb_posted_payload(const struct ep *e);
+uint64_t tb_completed_payload(const struct ep *e);
+uint64_t tb_write_limit(const struct ep *e); /* cap a scheduler's piece by this and its source-registration room */
+/* Caller serializes with progress. can_write: 1 room, 0 no room, -1 invalid/failed. write_try: 0 posted,
+ * 1 no room, -1 invalid/failed; no progress, waits or partial posting on insufficient room. len <= TB_TRY_MAX. */
+int tb_can_write(const struct ep *e, const struct region *src, uint64_t off, uint64_t len);
+int tb_write_try(struct ep *e, const struct region *src, uint64_t off, uint64_t roff, uint64_t len);
+int tb_bond_signal(struct ep *e, uint64_t soff, uint64_t value, uint64_t seq, const uint64_t need[2],
+                    uint64_t timeout_ns);
+int tb_can_bond_signal(const struct ep *e); /* -1 invalid/failed, 0 no staged-header room, 1 ready */
+/* -1 invalid/failed, 0 no room, 1 fused ready, 2 not representable; no progress or source changes. */
+int tb_can_bond_write_signal(const struct ep *e, const struct region *src, uint64_t off, uint64_t len);
+/* Fused only: 1 means not representable (nothing posted), 0 posted, -1 invalid/failed. need includes this write
+ * on the selected lane, whose posted count increases by exactly one. The source reserves 64 bytes before off. */
+int tb_bond_write_signal(struct ep *e, const struct region *src, uint64_t off, uint64_t roff, uint64_t len,
+                          uint64_t soff, uint64_t value, uint64_t seq, const uint64_t need[2], uint64_t timeout_ns);
 
 /* link_xchg.c */
 int xchg_open(struct xchg *x, const char *via, int port, int peer_port, const char *name);

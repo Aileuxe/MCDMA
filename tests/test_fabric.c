@@ -5,7 +5,18 @@
  *   dmabuf    a DMA-BUF window registers through ibv_reg_dmabuf_mr with no fallback; Thunderbolt refuses one
  *   mismatch  a Thunderbolt rank and a RoCE rank refuse each other
  *   args      bad windows, flags, names and interfaces are refused
- * Exit 0 means pass, 77 that loopback has no link-local address. */
+ *   bond      two Thunderbolt links carry one peer's byte-checked collective
+ *   bond-args strict device/via parsing, and local lane counts agree
+ *   bond-mismatch a one-link peer cannot be mistaken for the first child of a bond
+ *   bond-order signals wait for placement on a delayed link
+ *   bond-schedule a delayed link does not stop nonoverlapping work on the faster link
+ *   bond-overlap a later overlapping call cannot overtake a delayed earlier write
+ *   bond-fail one failed child poisons the whole bonded peer
+ *   bond-credit a bounded receiver's pending-signal queue backpressures the sender
+ *   bond-small tiny queue depths and registration boundaries keep a small write on one link
+ *   bond-wait a failed peer does not poison an unrelated live peer's flag wait
+ *   bond-names public 19- and 20-character names fit the internal lane names
+ * Exit 0 means pass, 77 that loopback has no usable IPv6 link-local or IPv4 address. */
 #include "../rpc/mcdma_fabric.h"
 
 #ifdef __APPLE__
@@ -32,6 +43,8 @@
 
 struct rank {
     const char *device;
+    const char *via;
+    const char *name;
     uint32_t flags;
     unsigned char *mem;
     struct mcdma_fabric *f;
@@ -40,7 +53,13 @@ struct rank {
 };
 
 static const char *g_mode;
-static char g_lo[16];
+static char g_lo[64], g_bond_via[128];
+
+void stub_tb_hold(const char *name, int hold);
+void stub_tb_hold_completions(const char *name, int hold);
+uint64_t stub_tb_sent_bytes(const char *name);
+uint64_t stub_tb_received_bytes(const char *name);
+void stub_tb_fail(const char *name);
 
 static void fail(const char *what) {
     fprintf(stderr, "test_fabric %s: %s\n", g_mode, what);
@@ -52,16 +71,39 @@ static void fail(const char *what) {
         if (!(c)) fail(what); \
     } while (0)
 
-static int free_port(void) {
-    int fd = socket(AF_INET6, SOCK_DGRAM, 0);
-    struct sockaddr_in6 a;
-    socklen_t len = sizeof(a);
+static int free_ports(int count) {
+    int family = strchr(g_lo, '/') ? AF_INET : AF_INET6;
+    int fd = socket(family, SOCK_DGRAM, 0), second = -1;
+    union { struct sockaddr_in v4; struct sockaddr_in6 v6; } a;
+    socklen_t len = family == AF_INET ? sizeof(a.v4) : sizeof(a.v6);
     memset(&a, 0, sizeof(a));
-    a.sin6_family = AF_INET6;
-    if (fd < 0 || bind(fd, (struct sockaddr *)&a, sizeof(a)) || getsockname(fd, (struct sockaddr *)&a, &len)) return -1;
+    if (family == AF_INET) a.v4.sin_family = AF_INET;
+    else a.v6.sin6_family = AF_INET6;
+    if (fd < 0) return -1;
+    if (bind(fd, (struct sockaddr *)&a, len) || getsockname(fd, (struct sockaddr *)&a, &len)) {
+        close(fd);
+        return -1;
+    }
+    int port = ntohs(family == AF_INET ? a.v4.sin_port : a.v6.sin6_port);
+    if (count == 2) {
+        if (port == 65535 || (second = socket(family, SOCK_DGRAM, 0)) < 0) {
+            close(fd);
+            return -1;
+        }
+        if (family == AF_INET) a.v4.sin_port = htons((uint16_t)(port + 1));
+        else a.v6.sin6_port = htons((uint16_t)(port + 1));
+        if (bind(second, (struct sockaddr *)&a, len)) {
+            close(second);
+            close(fd);
+            return -1;
+        }
+        close(second);
+    }
     close(fd);
-    return ntohs(a.sin6_port);
+    return port;
 }
+
+static int free_port(void) { return free_ports(1); }
 
 static unsigned char *window(void) {
     unsigned char *m = mmap(NULL, WINDOW, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -75,19 +117,25 @@ static unsigned char pattern(int rank, uint64_t step, uint64_t i) {
 
 static void *connect_rank(void *arg) {
     struct rank *r = arg;
-    r->status = mcdma_fabric_connect(r->f, g_lo, r->port, r->peer_port, "pair", 5 * SECOND, &r->p);
+    r->status = mcdma_fabric_connect(r->f, r->via, r->port, r->peer_port, r->name, 5 * SECOND, &r->p);
     return NULL;
 }
 
 static void open_rank(struct rank *r, int me, const char *device, uint32_t flags) {
+    memset(r, 0, sizeof(*r));
     r->me = me, r->device = device, r->flags = flags, r->mem = window();
+    r->via = strchr(device, '+') ? g_bond_via : g_lo;
+    r->name = "pair";
     CHECK(!mcdma_fabric_open(device, 0, 4096, r->mem, WINDOW, -1, 0, flags, &r->f), "a window registers");
 }
 
 /* Both ranks call connect at once, as two machines would. */
 static void meet(struct rank *a, struct rank *b) {
-    a->port = b->peer_port = free_port();
-    b->port = a->peer_port = free_port();
+    int lanes = strchr(a->device, '+') || strchr(b->device, '+') ? 2 : 1;
+    do { a->port = free_ports(lanes); } while (a->port < 0);
+    do { b->port = free_ports(lanes); } while (b->port < 0 || abs(a->port - b->port) < lanes);
+    b->peer_port = a->port;
+    a->peer_port = b->port;
     pthread_t t;
     CHECK(!pthread_create(&t, NULL, connect_rank, b), "thread");
     connect_rank(a);
@@ -144,6 +192,7 @@ static void scenario_tb(void) {
     open_rank(&b, 1, "tb1", MCDMA_FABRIC_PROGRESS_THREAD);
     meet(&a, &b);
     CHECK(!a.status && !b.status, "both ranks connect");
+    CHECK(mcdma_fabric_link_count(a.p) == 1, "a single link still reports one physical link");
     CHECK(mcdma_fabric_link(a.p) == MCDMA_FABRIC_THUNDERBOLT && mcdma_fabric_peer_length(a.p) == WINDOW, "link facts");
     uint64_t old = 1;
     CHECK(mcdma_fabric_read(a.p, 0, 0, 8) == MCDMA_FABRIC_UNSUPPORTED, "Thunderbolt has no READ");
@@ -228,6 +277,336 @@ static void scenario_args(void) {
     munmap(mem, WINDOW);
 }
 
+static void open_bond_pair(struct rank *a, struct rank *b) {
+    open_rank(a, 0, "tb0+tb2", 0);
+    open_rank(b, 1, "tb1+tb3", 0);
+    meet(a, b);
+    CHECK(!a->status && !b->status, "both bonded ranks connect");
+    CHECK(mcdma_fabric_link_count(a->p) == 2 && mcdma_fabric_link_count(b->p) == 2,
+          "a bond reports both physical links");
+    CHECK(mcdma_fabric_link(a->p) == MCDMA_FABRIC_THUNDERBOLT && mcdma_fabric_peer_length(a->p) == WINDOW,
+          "bonded link facts");
+}
+
+static void scenario_bond(void) {
+    struct rank a, b;
+    open_bond_pair(&a, &b);
+    uint64_t bytes0 = stub_tb_sent_bytes("tb0"), bytes2 = stub_tb_sent_bytes("tb2");
+    collective(&a, &b);
+    CHECK(stub_tb_sent_bytes("tb0") > bytes0 + 4096 && stub_tb_sent_bytes("tb2") > bytes2 + 4096,
+          "both physical links carry data");
+    CHECK(mcdma_fabric_read(a.p, 0, 0, 8) == MCDMA_FABRIC_UNSUPPORTED, "bonded Thunderbolt has no READ");
+    unsigned char *src = a.mem + WINDOW / 2 + MCDMA_FABRIC_WS_ROOM;
+    for (size_t i = 0; i < 257; ++i) src[i] = pattern(0, 101, i);
+    CHECK(!mcdma_fabric_write_signal(a.p, WINDOW / 2 + MCDMA_FABRIC_WS_ROOM, 0, 257, FLAG, STEPS + 1),
+          "a bonded small write and signal");
+    CHECK(!mcdma_fabric_wait(b.f, FLAG, STEPS + 1, 5 * SECOND), "a bonded joined signal arrives");
+    CHECK(!memcmp(src, b.mem, 257), "the joined signal follows its bytes");
+    CHECK(!mcdma_fabric_flush(a.p, 5 * SECOND), "the bonded joined write flushes");
+    struct mcdma_fabric_link_stats stats[2];
+    CHECK(!mcdma_fabric_link_stats(a.p, 0, &stats[0]) && !mcdma_fabric_link_stats(a.p, 1, &stats[1]),
+          "both physical links expose counters");
+    uint64_t total = 257;
+    for (uint64_t step = 1; step <= STEPS; ++step) total += (1 + (step * 37) % 300) * 12288 + step % 3;
+    CHECK(stats[0].posted_bytes && stats[1].posted_bytes && stats[0].posted_bytes + stats[1].posted_bytes == total,
+          "payload counters exclude framing and signals");
+    CHECK(stats[0].completed_bytes == stats[0].posted_bytes && stats[1].completed_bytes == stats[1].posted_bytes,
+          "flush completes every physical link's payload");
+    CHECK(mcdma_fabric_link_stats(a.p, 2, &stats[0]) == MCDMA_FABRIC_INVALID,
+          "an out-of-range physical link is refused");
+    CHECK(mcdma_fabric_link_stats(a.p, 0, NULL) == MCDMA_FABRIC_INVALID, "a counter output is required");
+    close_pair(&a, &b);
+}
+
+static void scenario_bond_args(void) {
+    unsigned char *mem = window();
+    struct mcdma_fabric *f = NULL;
+    struct mcdma_fabric_peer *p = NULL;
+    const char *bad[] = {"+tb0", "tb0+", "tb0++tb2", "tb0+tb2+tb4", "tb0+tb0", "tb0 +tb2", "tb0+ tb2"};
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i)
+        CHECK(mcdma_fabric_open(bad[i], 0, 4096, mem, WINDOW, -1, 0, 0, &f) == MCDMA_FABRIC_INVALID && !f,
+              "a malformed bond device list");
+    CHECK(mcdma_fabric_open("tb0+roce0", 0, 4096, mem, WINDOW, -1, 0, 0, &f) == MCDMA_FABRIC_UNSUPPORTED && !f,
+          "a mixed transport bond is unsupported");
+    CHECK(mcdma_fabric_open("roce0+roce1", 0, 4096, mem, WINDOW, -1, 0, 0, &f) == MCDMA_FABRIC_UNSUPPORTED && !f,
+          "a RoCE pair is unsupported");
+    CHECK(!mcdma_fabric_open("tb0+tb2", 0, 4096, mem, WINDOW, -1, 0, 0, &f), "a valid bond opens");
+    CHECK(mcdma_fabric_connect(f, g_lo, 18000, 18002, "pair", SECOND, &p) == MCDMA_FABRIC_INVALID && !p,
+          "a bond requires two via entries");
+    const char *bad_via[] = {"+lo", "lo+", "lo++lo", "lo+lo+lo", "lo +lo", "lo+ lo"};
+    for (size_t i = 0; i < sizeof(bad_via) / sizeof(bad_via[0]); ++i)
+        CHECK(mcdma_fabric_connect(f, bad_via[i], 18000, 18002, "pair", SECOND, &p) == MCDMA_FABRIC_INVALID && !p,
+              "a malformed bond via list");
+    CHECK(mcdma_fabric_connect(f, g_bond_via, 65535, 18002, "pair", SECOND, &p) == MCDMA_FABRIC_INVALID && !p,
+          "two lanes cannot bind past port 65535");
+    CHECK(mcdma_fabric_connect(f, g_bond_via, 18000, 65535, "pair", SECOND, &p) == MCDMA_FABRIC_INVALID && !p,
+          "two peer lanes cannot run past port 65535");
+    mcdma_fabric_close(&f);
+    CHECK(!mcdma_fabric_open("tb0", 0, 4096, mem, WINDOW, -1, 0, 0, &f), "a single link still opens");
+    CHECK(mcdma_fabric_connect(f, g_bond_via, 18000, 18002, "pair", SECOND, &p) == MCDMA_FABRIC_INVALID && !p,
+          "a single device refuses two via entries");
+    mcdma_fabric_close(&f);
+    munmap(mem, WINDOW);
+}
+
+static void scenario_bond_mismatch(void) {
+    struct rank a, b;
+    open_rank(&a, 0, "tb0+tb2", 0);
+    open_rank(&b, 1, "tb1", MCDMA_FABRIC_PROGRESS_THREAD);
+    b.name = "pair-0"; /* match the first child's exchange name so its mode, not a name miss, refuses admission */
+    meet(&a, &b);
+    CHECK(a.status == MCDMA_FABRIC_PEER && b.status == MCDMA_FABRIC_PEER && !a.p && !b.p,
+          "a single peer cannot satisfy a bond's first-child exchange");
+    close_pair(&a, &b);
+}
+
+/* Deliver the fast child's bytes while the other child's receive completions are held. */
+static void scenario_bond_order(void) {
+    struct rank a, b;
+    open_bond_pair(&a, &b);
+    const uint64_t bytes = 3ull << 20;
+    for (uint64_t i = 0; i < bytes; ++i) a.mem[WINDOW / 2 + i] = pattern(0, 23, i);
+    uint64_t before = stub_tb_received_bytes("tb3");
+    stub_tb_hold_completions("tb1", 1);
+    CHECK(!mcdma_fabric_write(a.p, WINDOW / 2, 0, bytes), "a striped write posts while one receiver is delayed");
+    CHECK(!mcdma_fabric_signal(a.p, FLAG, 1) && !mcdma_fabric_signal(a.p, FLAG, 2), "two later signals post");
+    for (int i = 0; i < 1000 && stub_tb_received_bytes("tb3") <= before + 4096; ++i) {
+        CHECK(!mcdma_fabric_progress(b.f), "the fast child keeps progressing");
+        usleep(1000);
+    }
+    CHECK(stub_tb_received_bytes("tb3") > before + 4096, "the fast link delivers beside the delayed link");
+    usleep(30000);
+    CHECK(flag_of(&b) == 0, "signals do not use send or receive-fill counts as placement watermarks");
+    stub_tb_hold_completions("tb1", 0);
+    CHECK(!mcdma_fabric_wait(b.f, FLAG, 2, 5 * SECOND), "both pending signals resolve after placement");
+    CHECK(!mcdma_fabric_flush(a.p, 5 * SECOND), "the ordered bond flushes both links");
+    for (uint64_t i = 0; i < bytes; ++i) CHECK(b.mem[i] == pattern(0, 23, i), "all striped bytes precede the signal");
+    close_pair(&a, &b);
+}
+
+static void scenario_bond_schedule(void) {
+    struct rank a, b;
+    open_bond_pair(&a, &b);
+    const uint64_t bytes = 1ull << 20;
+    for (uint64_t i = 0; i < bytes; ++i) a.mem[WINDOW / 2 + i] = pattern(0, 37, i);
+    uint64_t slow = stub_tb_sent_bytes("tb0"), fast = stub_tb_sent_bytes("tb2");
+    stub_tb_hold("tb1", 1);
+    for (uint64_t i = 0; i < 4; ++i) {
+        CHECK(!mcdma_fabric_write(a.p, WINDOW / 2, i * bytes, bytes), "a later disjoint write posts beside a slow link");
+        usleep(30000); /* let the healthy child's completions drain, leaving only the delayed backlog */
+    }
+    slow = stub_tb_sent_bytes("tb0") - slow;
+    fast = stub_tb_sent_bytes("tb2") - fast;
+    CHECK(slow > 4096 && fast > 2 * slow, "new work favors the child whose backlog drained");
+    CHECK(!mcdma_fabric_signal(a.p, FLAG, 1), "the degraded bond's signal posts");
+    CHECK(flag_of(&b) == 0, "fast delivery cannot publish a partially placed collective");
+    stub_tb_hold("tb1", 0);
+    CHECK(!mcdma_fabric_wait(b.f, FLAG, 1, 5 * SECOND), "the slow child eventually releases the signal");
+    CHECK(!mcdma_fabric_flush(a.p, 5 * SECOND), "the degraded bond flushes");
+    for (uint64_t i = 0; i < 4 * bytes; ++i)
+        CHECK(b.mem[i] == pattern(0, 37, i % bytes), "degraded-link scheduling preserves every byte");
+    close_pair(&a, &b);
+}
+
+struct overlap_job {
+    struct mcdma_fabric_peer *p;
+    int started, done, status;
+};
+
+static void *post_overlap(void *arg) {
+    struct overlap_job *j = arg;
+    __atomic_store_n(&j->started, 1, __ATOMIC_RELEASE);
+    j->status = mcdma_fabric_write(j->p, WINDOW / 2 + SLOT, 0, 3ull << 20);
+    __atomic_store_n(&j->done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+static void scenario_bond_overlap(void) {
+    struct rank a, b;
+    open_bond_pair(&a, &b);
+    const uint64_t bytes = 3ull << 20;
+    for (uint64_t i = 0; i < bytes; ++i) {
+        a.mem[WINDOW / 2 + i] = pattern(0, 41, i);
+        a.mem[WINDOW / 2 + SLOT + i] = pattern(0, 42, i);
+    }
+    stub_tb_hold_completions("tb1", 1);
+    CHECK(!mcdma_fabric_write(a.p, WINDOW / 2, 0, bytes), "the first overlapping range posts");
+    struct overlap_job job = { .p = a.p };
+    pthread_t thread;
+    CHECK(!pthread_create(&thread, NULL, post_overlap, &job), "overlap posting thread");
+    while (!__atomic_load_n(&job.started, __ATOMIC_ACQUIRE)) usleep(1000);
+    usleep(30000);
+    CHECK(!__atomic_load_n(&job.done, __ATOMIC_ACQUIRE), "an overlapping call waits for the earlier placement");
+    stub_tb_hold_completions("tb1", 0);
+    pthread_join(thread, NULL);
+    CHECK(!job.status, "the overlapping call resumes after both links drain");
+    CHECK(!mcdma_fabric_signal(a.p, FLAG, 1) && !mcdma_fabric_wait(b.f, FLAG, 1, 5 * SECOND), "the later write signals");
+    for (uint64_t i = 0; i < bytes; ++i) CHECK(b.mem[i] == pattern(0, 42, i), "the later overlapping call wins");
+    CHECK(!mcdma_fabric_flush(a.p, 5 * SECOND), "the overlapping bond flushes");
+    close_pair(&a, &b);
+}
+
+static void scenario_bond_fail(void) {
+    struct rank a, b;
+    open_bond_pair(&a, &b);
+    CHECK(!mcdma_fabric_signal(a.p, FLAG, 1) && !mcdma_fabric_wait(b.f, FLAG, 1, 5 * SECOND), "the bond starts live");
+    CHECK(!mcdma_fabric_flush(a.p, 5 * SECOND), "the live bond flushes");
+    memset(a.mem + WINDOW / 2, 0x5a, 3ull << 20);
+    stub_tb_hold("tb1", 1);
+    CHECK(!mcdma_fabric_write(a.p, WINDOW / 2, 0, 3ull << 20) && !mcdma_fabric_signal(a.p, FLAG, 2),
+          "a signal waits behind a missing child's write");
+    usleep(30000);
+    CHECK(flag_of(&b) == 1, "the pending signal cannot publish incomplete writes");
+    stub_tb_fail("tb1");
+    stub_tb_hold("tb1", 0);
+    int status = MCDMA_FABRIC_OK;
+    for (int i = 0; i < 1000 && status == MCDMA_FABRIC_OK; ++i) {
+        status = mcdma_fabric_signal(b.p, FLAG, 2);
+        usleep(1000);
+    }
+    CHECK(status == MCDMA_FABRIC_PEER, "one failed receive link poisons the whole bond");
+    CHECK(flag_of(&b) == 1, "a failed bond does not apply a pending signal");
+    CHECK(mcdma_fabric_write(b.p, WINDOW / 2, 0, 8) == MCDMA_FABRIC_PEER &&
+          mcdma_fabric_signal(b.p, FLAG, 3) == MCDMA_FABRIC_PEER &&
+          mcdma_fabric_flush(b.p, SECOND) == MCDMA_FABRIC_PEER,
+          "later operations cannot silently use the surviving child");
+    close_pair(&a, &b);
+}
+
+struct signal_job {
+    struct mcdma_fabric_peer *p;
+    int started, done, status;
+    unsigned posted;
+};
+
+static void *post_many_signals(void *arg) {
+    struct signal_job *j = arg;
+    __atomic_store_n(&j->started, 1, __ATOMIC_RELEASE);
+    for (unsigned i = 1; i <= 5000; ++i) {
+        j->status = mcdma_fabric_signal(j->p, FLAG, i);
+        if (j->status) break;
+        __atomic_store_n(&j->posted, i, __ATOMIC_RELEASE);
+    }
+    __atomic_store_n(&j->done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+static void scenario_bond_credit(void) {
+    struct rank a, b;
+    open_bond_pair(&a, &b);
+    const uint64_t bytes = 3ull << 20;
+    for (uint64_t i = 0; i < bytes; ++i) a.mem[WINDOW / 2 + i] = pattern(0, 52, i);
+    stub_tb_hold_completions("tb1", 1);
+    CHECK(!mcdma_fabric_write(a.p, WINDOW / 2, 0, bytes), "the credit test's earlier write posts");
+    struct signal_job job = { .p = a.p };
+    pthread_t thread;
+    CHECK(!pthread_create(&thread, NULL, post_many_signals, &job), "the signal-credit writer starts");
+    for (int i = 0; i < 5000 && __atomic_load_n(&job.posted, __ATOMIC_ACQUIRE) < 4096 &&
+                        !__atomic_load_n(&job.done, __ATOMIC_ACQUIRE); ++i) usleep(1000);
+    CHECK(__atomic_load_n(&job.posted, __ATOMIC_ACQUIRE) == 4096, "the sender reaches the bounded signal credit");
+    CHECK(!__atomic_load_n(&job.done, __ATOMIC_ACQUIRE) && flag_of(&b) == 0,
+          "signal credit waits for placement instead of poisoning or publishing");
+    stub_tb_hold_completions("tb1", 0);
+    pthread_join(thread, NULL);
+    CHECK(!job.status && __atomic_load_n(&job.posted, __ATOMIC_ACQUIRE) == 5000,
+          "all signals post once receive placement releases credit");
+    CHECK(!mcdma_fabric_wait(b.f, FLAG, 5000, 5 * SECOND) && !mcdma_fabric_flush(a.p, 5 * SECOND),
+          "the last credited signal and both flushes finish");
+    for (uint64_t i = 0; i < bytes; ++i) CHECK(b.mem[i] == pattern(0, 52, i), "credited signals follow every byte");
+    close_pair(&a, &b);
+}
+
+static void small_one_lane(struct rank *a, struct rank *b, uint64_t off, uint64_t len, uint64_t value, int joined) {
+    struct mcdma_fabric_link_stats before[2], after[2];
+    for (unsigned k = 0; k < 2; ++k) CHECK(!mcdma_fabric_link_stats(a->p, k, &before[k]), "small-write counters before");
+    for (uint64_t i = 0; i < len; ++i) a->mem[off + i] = pattern(0, value, i);
+    if (joined) CHECK(!mcdma_fabric_write_signal(a->p, off, 0, len, FLAG, value), "a bounded small joined write");
+    else CHECK(!mcdma_fabric_write(a->p, off, 0, len) && !mcdma_fabric_signal(a->p, FLAG, value), "a bounded small write");
+    CHECK(!mcdma_fabric_wait(b->f, FLAG, value, 5 * SECOND) && !mcdma_fabric_flush(a->p, 5 * SECOND),
+          "a bounded small write reaches the peer and flushes");
+    CHECK(!memcmp(a->mem + off, b->mem, (size_t)len), "every byte of a bounded small write lands");
+    for (unsigned k = 0; k < 2; ++k) CHECK(!mcdma_fabric_link_stats(a->p, k, &after[k]), "small-write counters after");
+    uint64_t n0 = after[0].posted_bytes - before[0].posted_bytes;
+    uint64_t n1 = after[1].posted_bytes - before[1].posted_bytes;
+    CHECK((n0 == len && !n1) || (n1 == len && !n0), "all chunks of one small call use one physical link");
+    CHECK(after[0].completed_bytes == after[0].posted_bytes && after[1].completed_bytes == after[1].posted_bytes,
+          "bounded small writes leave no outstanding payload");
+}
+
+static void scenario_bond_small(void) {
+    struct rank a, b;
+    open_bond_pair(&a, &b);
+    small_one_lane(&a, &b, WINDOW / 2 + MCDMA_FABRIC_WS_ROOM, 16384, 1, 0);
+    small_one_lane(&a, &b, WINDOW / 2 + MCDMA_FABRIC_WS_ROOM, 16384, 2, 1);
+    small_one_lane(&a, &b, (12ull << 20) - 4096, 8192, 3, 0);
+    small_one_lane(&a, &b, (12ull << 20) - 4096, 8192, 4, 1);
+    close_pair(&a, &b);
+}
+
+struct wait_job {
+    struct mcdma_fabric *f;
+    uint64_t offset, value;
+    int started, done, status;
+};
+
+static void *wait_flag(void *arg) {
+    struct wait_job *j = arg;
+    __atomic_store_n(&j->started, 1, __ATOMIC_RELEASE);
+    j->status = mcdma_fabric_wait(j->f, j->offset, j->value, 5 * SECOND);
+    __atomic_store_n(&j->done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+static void scenario_bond_wait(void) {
+    struct rank a, bad, remote;
+    open_bond_pair(&a, &bad);
+    open_rank(&remote, 1, "tb4+tb5", 0);
+    struct rank shared = a; /* a second peer on the same window and the same two local devices */
+    shared.p = NULL;
+    shared.name = remote.name = "healthy";
+    meet(&shared, &remote);
+    CHECK(!shared.status && !remote.status, "the independent healthy peer connects");
+    stub_tb_fail("tb1");
+    mcdma_fabric_disconnect(&bad.p);
+    int status = MCDMA_FABRIC_OK;
+    for (int i = 0; i < 1000 && status == MCDMA_FABRIC_OK; ++i) {
+        status = mcdma_fabric_signal(a.p, FLAG, 1);
+        usleep(1000);
+    }
+    CHECK(status == MCDMA_FABRIC_PEER, "the unrelated bond is confirmed down");
+    struct wait_job job = { .f = a.f, .offset = FLAG + 8, .value = 77 };
+    pthread_t thread;
+    CHECK(!pthread_create(&thread, NULL, wait_flag, &job), "the healthy flag waiter starts");
+    while (!__atomic_load_n(&job.started, __ATOMIC_ACQUIRE)) usleep(1000);
+    usleep(30000);
+    CHECK(!__atomic_load_n(&job.done, __ATOMIC_ACQUIRE), "one dead peer does not fail a healthy flag wait");
+    unsigned char *src = remote.mem + WINDOW / 2 + MCDMA_FABRIC_WS_ROOM;
+    for (size_t i = 0; i < 257; ++i) src[i] = pattern(1, 77, i);
+    CHECK(!mcdma_fabric_write_signal(remote.p, WINDOW / 2 + MCDMA_FABRIC_WS_ROOM, 0, 257, FLAG + 8, 77),
+          "the live peer supplies the waited-for flag");
+    pthread_join(thread, NULL);
+    CHECK(!job.status && !memcmp(a.mem, src, 257), "the healthy flag wait observes its own completed payload");
+    CHECK(!mcdma_fabric_flush(remote.p, 5 * SECOND), "the healthy peer remains usable");
+    close_pair(&a, &bad);
+    mcdma_fabric_close(&remote.f);
+    munmap(remote.mem, WINDOW);
+}
+
+static void scenario_bond_names(void) {
+    const char *names[] = {"abcdefghijklmnopqrs", "abcdefghijklmnopqrst"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        struct rank a, b;
+        open_rank(&a, 0, "tb0+tb2", 0);
+        open_rank(&b, 1, "tb1+tb3", 0);
+        a.name = b.name = names[i];
+        meet(&a, &b);
+        CHECK(!a.status && !b.status, "a maximum public name fits each internal lane name");
+        CHECK(!mcdma_fabric_signal(a.p, FLAG, 1) && !mcdma_fabric_wait(b.f, FLAG, 1, 5 * SECOND) &&
+              !mcdma_fabric_flush(a.p, 5 * SECOND), "a long-name bond transfers a signal");
+        close_pair(&a, &b);
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
     g_mode = argv[1];
@@ -240,12 +619,30 @@ int main(int argc, char **argv) {
                 snprintf(g_lo, sizeof(g_lo), "%s", a->ifa_name);
         freeifaddrs(all);
     }
+    if (!g_lo[0] && !getifaddrs(&all)) {
+        for (struct ifaddrs *a = all; a && !g_lo[0]; a = a->ifa_next)
+            if (a->ifa_addr && a->ifa_addr->sa_family == AF_INET && (a->ifa_flags & IFF_LOOPBACK))
+                snprintf(g_lo, sizeof(g_lo), "%s/127.0.0.1", a->ifa_name);
+        freeifaddrs(all);
+    }
     if (!g_lo[0]) return 77;
+    snprintf(g_bond_via, sizeof(g_bond_via), "%s+%s", g_lo, g_lo);
     if (!strcmp(g_mode, "tb")) scenario_tb();
     else if (!strcmp(g_mode, "roce")) scenario_roce();
     else if (!strcmp(g_mode, "dmabuf")) scenario_dmabuf();
     else if (!strcmp(g_mode, "mismatch")) scenario_mismatch();
     else if (!strcmp(g_mode, "args")) scenario_args();
+    else if (!strcmp(g_mode, "bond")) scenario_bond();
+    else if (!strcmp(g_mode, "bond-args")) scenario_bond_args();
+    else if (!strcmp(g_mode, "bond-mismatch")) scenario_bond_mismatch();
+    else if (!strcmp(g_mode, "bond-order")) scenario_bond_order();
+    else if (!strcmp(g_mode, "bond-schedule")) scenario_bond_schedule();
+    else if (!strcmp(g_mode, "bond-overlap")) scenario_bond_overlap();
+    else if (!strcmp(g_mode, "bond-fail")) scenario_bond_fail();
+    else if (!strcmp(g_mode, "bond-credit")) scenario_bond_credit();
+    else if (!strcmp(g_mode, "bond-small")) scenario_bond_small();
+    else if (!strcmp(g_mode, "bond-wait")) scenario_bond_wait();
+    else if (!strcmp(g_mode, "bond-names")) scenario_bond_names();
     else return 2;
     printf("test_fabric %s: ok\n", g_mode);
     return 0;

@@ -5,15 +5,15 @@ is the base for collectives an engine runs itself: barriers, plan broadcasts, al
 and bulk copies. Unlike `mcdma-rpcd`, the library opens the verbs device inside the application, so an engine posts
 writes with no daemon hop. Peers meet through the same Thunderbolt-only exchange as the daemons; there is no TCP.
 
-Status: ABI 1, compiled and offline-tested against a stub verbs library that enforces RoCE keys and models Thunderbolt
-RDMA as two Studios on macOS 27.0 measured it. It has not run on hardware yet; `fabric-check`, `mesh-check` and
-`metal-poll` below are the qualification tools.
+Status: ABI 1. The single-port Thunderbolt path has hardware measurements; the bonded path needs the owner-run
+qualification below before its throughput or latency is established. Offline tests use a stub verbs library that
+enforces RoCE keys and models Thunderbolt RDMA as two Studios on macOS 27.0 measured it.
 
 ## The calls
 
 | Call | What it does |
 | --- | --- |
-| `mcdma_fabric_open` | Opens a device and registers one window for it, optionally starting a progress thread |
+| `mcdma_fabric_open` | Opens one device, or two Thunderbolt devices joined by `+`, and registers the same window on each |
 | `mcdma_fabric_connect` | Meets one peer over a Thunderbolt IP interface; both sides call it with the same name |
 | `mcdma_fabric_write` | Copies a range of this window to an offset in the peer's window |
 | `mcdma_fabric_signal` | Stores an 8-byte word in the peer's window after every earlier write to that peer |
@@ -23,14 +23,15 @@ RDMA as two Studios on macOS 27.0 measured it. It has not run on hardware yet; `
 | `mcdma_fabric_fetch_add` | Always `MCDMA_FABRIC_UNSUPPORTED`: no MCDMA link has atomics |
 | `mcdma_fabric_progress` | Places incoming Thunderbolt writes and answers the peers' exchange messages |
 | `mcdma_fabric_wait` | Waits until a word of this window reaches a value, making progress meanwhile |
+| `mcdma_fabric_link_count`, `mcdma_fabric_link_stats` | Report each physical link's posted and completed write-payload bytes |
 | `mcdma_fabric_disconnect`, `mcdma_fabric_close` | Say goodbye and tear down; the window stays the caller's |
 
-`rpc/mcdma_fabric.h` has the exact signatures and statuses. The library exports nothing else.
+`rpc/mcdma_fabric.h` has the exact signatures and statuses. These additions retain ABI 1 and the existing signatures.
 
 ## Guarantees
 
-- Writes to one peer land in posting order, and a later write to the same bytes wins. Writes to different peers are
-  unordered.
+- Overlapping writes to one peer retain posting order, and a later write to the same bytes wins. Disjoint bonded
+  chunks can land in different orders across the physical links. Writes to different peers are unordered.
 - A signal lands after every write posted to that peer before it. A barrier is one signal per sender into a flag word
   the receiver owns; that is how collectives work without atomics.
 - `write` and `signal` return once posted. Keep the source bytes unchanged until `flush` returns, as with any RDMA
@@ -41,14 +42,15 @@ RDMA as two Studios on macOS 27.0 measured it. It has not run on hardware yet; `
   posts nothing.
 - Any failed operation, refused exchange or goodbye from the peer leaves that peer down: every later call on it
   returns `MCDMA_FABRIC_PEER`. Disconnect it and connect again.
-- Calls on one fabric are serialized by a lock, so several threads may share it. Callers spin for it rather than sleep:
-  the progress thread holds it for a microsecond or two, and a sleeping caller pays the kernel's wake.
+- Calls on a single-link fabric are serialized by a lock, so several threads may share it. Callers spin for it rather
+  than sleep. A bond has an independent progress thread and placement lock for each physical link, so receiving one
+  link's payload does not hold the other link's placement lock.
 
 ## Windows
 
 A window is page aligned and a whole number of pages: 16 KiB pages on Apple silicon. `mcdma_fabric_open` registers it
-once per device, and every peer on that device shares the registration. Engines that talk over several ports open one
-fabric per port on the same memory.
+once per device, and every peer on that device shares the registration. A bonded fabric registers that same memory
+on both devices. Separate fabrics on the same memory still represent separate peers and have no cross-peer ordering.
 
 | Link | Registration |
 | --- | --- |
@@ -73,6 +75,48 @@ returns once it has heard that the other holds its own. Each side binds UDP `por
 which is the same port unless two ranks share one host. The same admission rules apply as for the daemons, and on a
 Mac `via` must be the Thunderbolt port of a Thunderbolt device, or a Thunderbolt port at all for a CX5 device.
 
+## Two Thunderbolt links as one peer
+
+Join two devices with `+` in `mcdma_fabric_open`, for example `rdma_en2+rdma_en3`, and join their corresponding
+interfaces in the same order in `mcdma_fabric_connect`, for example `en2/192.0.2.10+en3/198.51.100.10`.
+Those addresses are documentation examples. Supply the peer's actual IPv4 address on each cable, or its admitted
+IPv6 link-local address. A single device and interface keep their existing meaning; `+` is an explicit opt-in.
+Both endpoints must open two Thunderbolt devices and give two matching interface entries. A bond needs two
+consecutive UDP ports: physical link zero uses `port`/`peer_port`, and physical link one uses each port plus one.
+A zero `peer_port` still means the local base port. Reserve both ports on both endpoints.
+
+One bonded peer owns both physical links. Large writes are split into chunks and assigned using each link's posted
+but not yet completed wire bytes; small writes stay whole on the least-loaded link, except that an outstanding
+overlapping write retains its link affinity. Each link's bulk backlog is bounded to roughly 1 MiB, so posting a
+large burst cannot leave half its bytes queued behind a degraded link. The links need not run at the
+same speed. Each link has its own receive-placement thread, including when the caller did not request a progress
+thread. A caller can still explicitly request progress threads for a single-link fabric.
+
+A signal covers earlier writes on both links, not only the link carrying the signal. The receiver waits for the
+signal's per-link placement counts before publishing its word, and publishes later signals in order. A write with
+its signal has the same rule. Placement counters publish only after the payload copy; acquire/release word
+publication makes both links' earlier bytes visible to the waiting caller. The bounded signal reorder queue also
+has sender credit: after 4,096 signals without a fence, the sender fences both links before posting another, so a
+slow link cannot overflow that queue. Overlapping writes retain posting order across the bond. The library records the
+remote ranges and physical links of outstanding writes: an overwrite of a range confined to one link stays on that
+link and uses its own message order. Overwriting a range spread across both links first fences both, as does writing
+over a word whose earlier signal is still deferred. That prevents a late earlier write or signal from overwriting
+the later call without adding a cross-link fence to every repeated small fused write. `flush` completes both links
+and waits for the receiving side's placement fence; send completion alone is not proof of remote placement on
+Thunderbolt. A failed physical link fails the entire peer, so later writes, signals and flushes report failure rather
+than silently using only the surviving link. Disconnect and reconnect the peer after resolving the failed link.
+
+`mcdma_fabric_link_count(peer)` returns one or two. `mcdma_fabric_link_stats(peer, index, &stats)` reports payload
+bytes posted and completed on that physical link, excluding protocol headers and control signals. On RoCE the
+completed counter is published at successful flush. Snapshot before
+and after a workload to get its per-link bytes. Flush before taking the final snapshot. Completion counters measure
+send completion; the flush fence supplies the separate remote-placement guarantee.
+
+On macOS, `MCDMA_FABRIC_QOS=1` gives progress threads user-interactive QoS; `0` leaves the default QoS.
+`MCDMA_FABRIC_WAIT_POLL=1`, the default, lets a waiting caller poll completions cooperatively instead of waiting only
+for the progress thread's handoff; `0` selects the thread-only comparison when a progress thread exists.
+The qualification script compares both settings without changing system or interface configuration.
+
 ## Thunderbolt links
 
 Apple's TN3205 describes RDMA over Thunderbolt as SEND and RECV on UC queue pairs, with receives that match their
@@ -96,12 +140,12 @@ How a write lands:
 2. A write of up to 4,064 bytes travels inside one header message, a single packet.
 3. A larger write is a header message with its offset and length, then its bytes as a message of their own, sent
    straight from the window with no copy, in pieces of at most 4 MiB that never cross a registration.
-4. `mcdma_fabric_write_signal` sends the head, the signal's offset and the bytes as one message from the window, its
+4. On one physical link, `mcdma_fabric_write_signal` sends the head, the signal's offset and the bytes as one message from the window, its
    head written into the 64 bytes before the source, so a write and its flag cost one send instead of three. One that
    would span two registrations or outgrow the peer's ring goes as a write, then a signal.
-5. The receiver takes whole messages from the ring in arrival order and copies each write's bytes into place. A signal
-   is applied when its header is taken, so it lands after the writes before it, and later writes to the same bytes
-   win, as RC ordering gives on RoCE.
+5. Each link's receiver takes whole messages from the ring in arrival order and copies each write's bytes into place.
+   A single-link signal is applied when its header is taken; a bonded signal waits for placement counts from both
+   links. Overlapping writes retain later-write-wins order, as RC ordering gives on RoCE.
 6. Every header carries a sequence number. A lost or reordered message, bytes whose length differs from their header,
    a write outside the window or any unexpected completion fails the link instead of landing anywhere else.
 
@@ -116,7 +160,7 @@ progressing until its peers have flushed, because their flushes need its answer.
 
 ## Writes from several peers
 
-Nothing orders writes that arrive over different links. If two peers write the same bytes, a late write from one can
+Nothing orders writes from different peers. If two peers write the same bytes, a late write from one can
 land after a newer write from the other, even past a flag. Give each sender its own region at every receiver, as the
 all-reduce slots below do, and let each step's flag cover only that sender's region.
 
@@ -180,18 +224,59 @@ Every node must print `wrong=0`, `stalls=0` and the same hash; each ends with `P
 `build/rpc/fabric-check` runs on both machines of one link:
 
 ```bash
-fabric-check DEVICE GID_INDEX VIA PORT NAME RANK [ROUNDS [SIZES [SECONDS [PEER_PORT]]]]
+fabric-check DEVICE GID_INDEX VIA PORT NAME RANK [ROUNDS [SIZES [SECONDS [PEER_PORT [MODE [PROGRESS]]]]]]
 ```
 
 Both ranks give the same name, rounds and sizes (bytes, comma-separated; default `64,4096,14336,1048576`). At each size
 the ranks ping-pong a write and a signal `ROUNDS` times (default 10,000), and the receiver checks every word of the
 write the moment the signal lands, which tests that data lands before its flag under load. Rank 0 prints the round-trip
-median, p99 and maximum. Then rank 0 streams 4 MiB writes for `SECONDS` (default 5) and prints the rate. Each rank ends
-with `PASS` and exit 0 only if no word was wrong:
+median, p99 and maximum; `rtt_p50_us` is an additive alias for `rtt_median_us`. `MODE` is `split`, the existing write
+then signal calls, or `combined`, the Thunderbolt-only `write_signal` call. `PROGRESS` is `0` or `1`, selecting the single-link progress
+thread; its default remains `0`, and a bond always has one thread per physical link. Metadata records ABI, device,
+interface, link count, mode, progress flag, QoS, cooperative polling and requested stream duration.
+Both ping-pong source addresses leave the 64-byte header inside their registration, including the source near the
+48 MiB boundary of the Thunderbolt 12 MiB pieces, so small combined pings can use the fused send on both parities.
+
+Then rank 0 streams 4 MiB pieces for `SECONDS`, default 60; zero disables the stream for latency comparisons.
+Eight landing slots hold up to 32 MiB in flight. The receiver checks every byte of each piece before acknowledging
+its slot, and replaces the payload with its complement before reuse, so a missing repeated write cannot pass by
+leaving the preceding iteration's bytes in place. The sender never reuses a slot until its acknowledgement arrives,
+and a short positive run sends at least two complete slot cycles. Each source slot has separate header space for
+`write_signal`. Timing includes placement, byte checking, slot-credit waits and the final placement fence, rather
+than measuring unchecked repeated overwrites. This changes what the old stream measured.
+
+The sender prints total bytes, elapsed seconds, throughput and checked bytes, then posted/completed payload bytes
+for each physical link. The receiver independently prints checked bytes and wrong words. Each rank ends with
+`PASS` and exit 0 only if its checks and fabric calls succeeded:
 
 ```text
 fabric-check: rank 0 connected over thunderbolt
-fabric-check: size=4096 rounds=10000 wrong_words=0 rtt_median_us=... rtt_p99_us=... rtt_max_us=...
-fabric-check: stream bytes=... seconds=5.0xx gbit_s=...
+fabric-check: size=4096 rounds=10000 wrong_words=0 rtt_median_us=... rtt_p99_us=... rtt_max_us=... rtt_p50_us=...
+fabric-check: stream bytes=... seconds=60.0xx gbit_s=... checked_bytes=...
+fabric-check: stream link=0 posted_bytes=... completed_bytes=...
 fabric-check: rank 0 PASS
 ```
+
+`tests/dual_pipe_qualify.py` prepares one two-host hardware qualification plan. It is review-only by default and
+does not invoke SSH until `--execute` is supplied. Give `--host-a` and `--host-b`, each host's already-built checker
+path as `--program-a` and `--program-b`, and two values per host for `--devices-a/b`, `--interfaces-a/b` and
+`--addresses-a/b`. Addresses are the local addresses on the two cables; the script uses the other endpoint's address
+in each `via` string. The argument order identifies link one and link two at both hosts.
+
+Choose `--condition healthy` or `--condition degraded`, `--gid-index`, and a free `--base-port` and its successor.
+The script streams over each cable and then the bond for at least 60 seconds, repeats in the opposite direction,
+and records 64-byte and 4096-byte RTTs. It then runs latency-only QoS, cooperative-polling and split/combined-call
+comparisons. Both ranks must report the requested mode, progress, QoS, polling, duration and round count.
+Transferred and checked byte counts must agree, completed per-link payload bytes
+must sum to the stream, and both bond links must carry payload. Healthy acceptance is at least 1.8 times the faster
+single-link rate; degraded acceptance is at least 0.9 times their sum. Bonded p50 must be within 1 microsecond of the
+better single-link p50 at both small sizes in both directions. The script exits unsuccessfully if any criterion fails.
+The script derives throughput from transferred bytes and elapsed seconds, and checks that the separately printed
+rate agrees within its two-decimal rate and three-decimal time rounding. A verified stream must contain whole
+4 MiB pieces and at least 64 MiB, the checker's minimum two slot cycles.
+
+`python3 -B tests/dual_pipe_qualify.py --self-test` checks parsing and acceptance thresholds offline, with no SSH.
+An executed plan stores its runtime configuration and raw logs under ignored `results/` by default. Those logs
+contain private host and interface details; keep them out of publication. The script makes no RDMA enablement,
+installation, network configuration or GPU changes. Its hardware results are still required before claiming the
+bond achieves the throughput or latency targets.

@@ -5,6 +5,7 @@
  *   random    thousands of random writes and signals both ways at once match a replayed mirror
  *   bounds    a write outside what the receiver accepts fails the link instead of landing
  *   teardown  queue pairs with sends still waiting for credit are torn down without misuse
+ *   bond      transport hooks see complete writes and exact 64-bit signal metadata; nonblocking credit is bounded
  * Exit 0 means pass; STUB_SEED changes the delivery order across queue pairs. */
 #include "../rpc/link.h"
 
@@ -267,6 +268,117 @@ static void scenario_teardown(struct side *a, struct side *b) {
     CHECK(!a->e.qp && !a->e.cq && !b->e.qp && !a->e.tb, "queue pairs are gone");
 }
 
+struct bond_watch {
+    struct side *rx;
+    const unsigned char *src;
+    uint64_t dst, len, count, signals, seq, need[2], soff, value;
+    int wrong;
+};
+
+static void bond_placed(void *arg, uint64_t count) {
+    struct bond_watch *w = arg;
+    if (count != w->count + 1 || (w->len && memcmp(w->rx->mem + w->dst, w->src, w->len))) w->wrong = 1;
+    w->count = count;
+}
+
+static int bond_signal(void *arg, uint64_t seq, const uint64_t need[2], uint64_t off, uint64_t value) {
+    struct bond_watch *w = arg;
+    if (seq != w->seq || need[0] != w->need[0] || need[1] != w->need[1] || off != w->soff || value != w->value ||
+        w->count != tb_writes_placed(&w->rx->e)) w->wrong = 1;
+    w->signals++;
+    /* The callback queues the signal rather than releasing it: the transport must never store the flag itself. */
+    return 0;
+}
+
+static void bond_poll(struct side *a, struct side *b, struct bond_watch *w, uint64_t writes, uint64_t signals) {
+    uint64_t deadline = link_now_ns() + TIMEOUT;
+    while (w->count < writes || w->signals < signals) {
+        CHECK(tb_progress(&a->e) >= 0 && tb_progress(&b->e) >= 0, "bonded transport progresses");
+        CHECK(link_now_ns() < deadline, "bonded transport completion timed out");
+    }
+    CHECK(!w->wrong, "bond hooks saw incomplete data or changed metadata");
+}
+
+static void scenario_bond(struct side *a, struct side *b) {
+    stop(b);
+    struct bond_watch w = {.rx = b, .count = tb_writes_placed(&b->e), .soff = WINDOW - 128};
+    tb_bond_hooks(&b->e, &w, bond_placed, bond_signal);
+    const uint64_t sizes[] = {7, 4064, 65537, 4032, 4033, 100003};
+    uint64_t chunk = tb_write_limit(&a->e);
+    CHECK(chunk > 64 && chunk <= TB_TRY_MAX, "scheduler chunk limit follows granted depth");
+    uint64_t payload = tb_posted_payload(&a->e), initial_wire = tb_posted_bytes(&a->e);
+    for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+        uint64_t src = (1ull << 20) + i * (256ull << 10), before = tb_writes_posted(&a->e), signals = w.signals;
+        uint64_t cap = i >= 2 ? chunk - 64 : chunk;
+        w.src = a->mem + src, w.dst = (8ull << 20) + i * (256ull << 10), w.len = sizes[i] < cap ? sizes[i] : cap;
+        w.seq = (1ull << 40) + i + 1, w.need[0] = before + 1, w.need[1] = (1ull << 48) + i;
+        w.value = (1ull << 52) + i;
+        __atomic_store_n((uint64_t *)(void *)(b->mem + w.soff), 0, __ATOMIC_RELEASE);
+        if (i == 2)
+            CHECK(!tb_write_signal(&a->e, &a->r, src, w.dst, w.len, w.soff, 17, TIMEOUT), "ordinary fused wire remains accepted");
+        else if (i >= 3) {
+            CHECK(tb_can_bond_write_signal(&a->e, &a->r, src, w.len) == 1, "fused preflight reserves its actual packet count");
+            CHECK(!tb_bond_write_signal(&a->e, &a->r, src, w.dst, w.len, w.soff, w.value, w.seq, w.need, TIMEOUT),
+                  "a 64-byte bonded fused head posts");
+        }
+        else {
+            CHECK(tb_can_write(&a->e, &a->r, src, w.len) == 1, "nonblocking write has room");
+            CHECK(!tb_write_try(&a->e, &a->r, src, w.dst, w.len), "nonblocking write posts");
+            CHECK(tb_can_bond_signal(&a->e) == 1, "bond signal preflight checks staged-header room");
+            CHECK(!tb_bond_signal(&a->e, w.soff, w.value, w.seq, w.need, TIMEOUT), "a bonded signal posts");
+        }
+        CHECK(tb_writes_posted(&a->e) == before + 1, "every complete write adds exactly one posted message");
+        payload += w.len;
+        bond_poll(a, b, &w, before + 1, signals + (i == 2 ? 0 : 1));
+        CHECK(*(uint64_t *)(void *)(b->mem + w.soff) == (i == 2 ? 17 : 0), "only ordinary signals store directly");
+    }
+    CHECK(tb_posted_payload(&a->e) == payload && tb_posted_bytes(&a->e) > initial_wire, "posted payload excludes wire heads");
+    uint64_t deadline = link_now_ns() + TIMEOUT;
+    while (tb_completed_bytes(&a->e) != tb_posted_bytes(&a->e)) {
+        CHECK(tb_progress(&a->e) >= 0 && tb_progress(&b->e) >= 0, "earlier SENDs reap before reservation checks");
+        CHECK(link_now_ns() < deadline, "earlier SENDs timed out");
+    }
+    /* An unrepresentable fused header must leave both source bytes and counters untouched for the caller's fallback. */
+    uint64_t before = tb_writes_posted(&a->e), wire = tb_posted_bytes(&a->e);
+    unsigned char saved[64];
+    memcpy(saved, a->mem + TB_SEG - 48, sizeof(saved));
+    CHECK(tb_can_bond_write_signal(&a->e, &a->r, TB_SEG + 16, 128) == 2 &&
+          tb_can_bond_write_signal(&a->e, &a->r, 64, 0) < 0, "fused preflight distinguishes fallback from invalid input");
+    CHECK(tb_bond_write_signal(&a->e, &a->r, TB_SEG + 16, 0, 128, w.soff, 7, w.seq, w.need, TIMEOUT) == 1,
+          "bonded fusion across a registration requests fallback");
+    CHECK(!memcmp(saved, a->mem + TB_SEG - 48, sizeof(saved)) && tb_writes_posted(&a->e) == before &&
+          tb_posted_bytes(&a->e) == wire, "fallback posts and changes nothing");
+    CHECK(tb_write_try(&a->e, &a->r, 0, 0, TB_TRY_MAX + 1) < 0, "oversized nonblocking chunks are refused");
+    /* Reserve all headers before a source-registration split, then publish both complete placements. */
+    w.len = 0;
+    CHECK(!tb_write_try(&a->e, &a->r, TB_SEG - 7, 4096, 64), "a bounded registration split posts without waiting");
+    CHECK(tb_writes_posted(&a->e) == before + 2, "a source-registration split counts two writes");
+    bond_poll(a, b, &w, before + 2, w.signals);
+    CHECK(!memcmp(b->mem + 4096, a->mem + TB_SEG - 7, 64), "the source-registration split places every byte");
+    /* Stop reaping even the sender: eventually its finite reservation fills, without blocking or progress. */
+    for (unsigned i = 0; i < TB_SEND_WR; ++i) {
+        int posted = tb_write_try(&a->e, &a->r, 0, 12ull << 20, chunk);
+        CHECK(posted >= 0, "credit exhaustion is backpressure rather than a failed link");
+        if (posted == 1) break;
+    }
+    before = tb_writes_posted(&a->e), wire = tb_posted_bytes(&a->e), payload = tb_posted_payload(&a->e);
+    CHECK(tb_can_write(&a->e, &a->r, 0, chunk) == 0 &&
+          tb_write_try(&a->e, &a->r, 0, 12ull << 20, chunk) == 1, "full queues return immediately with no room");
+    CHECK(tb_writes_posted(&a->e) == before && tb_posted_bytes(&a->e) == wire && tb_posted_payload(&a->e) == payload,
+          "no-room writes post no partial payload or header");
+    CHECK(tb_posted_bytes(&a->e) > tb_completed_bytes(&a->e), "wire-byte backlog tracks unreaped SENDs");
+    bond_poll(a, b, &w, before, w.signals);
+    deadline = link_now_ns() + TIMEOUT;
+    while (tb_completed_bytes(&a->e) != tb_posted_bytes(&a->e)) {
+        CHECK(tb_progress(&a->e) >= 0 && tb_progress(&b->e) >= 0, "SEND completions reap");
+        CHECK(link_now_ns() < deadline, "SEND completion counters timed out");
+    }
+    CHECK(tb_completed_payload(&a->e) == tb_posted_payload(&a->e), "completion payload matches every posted byte");
+    tb_bond_hooks(&b->e, NULL, NULL, NULL);
+    start(b);
+    CHECK(!tb_fence(&a->e, TIMEOUT), "bond transport leaves the ordinary fence operational");
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
     g_mode = argv[1];
@@ -281,7 +393,11 @@ int main(int argc, char **argv) {
     start(&b);
     if (!strcmp(g_mode, "order")) scenario_order(&a, &b);
     else if (!strcmp(g_mode, "overlap")) scenario_overlap(&a, &b);
-    else if (!strcmp(g_mode, "joined")) scenario_joined(&a, &b);
+    else if (!strcmp(g_mode, "joined")) {
+        scenario_joined(&a, &b);
+        scenario_bond(&a, &b);
+    }
+    else if (!strcmp(g_mode, "bond")) scenario_bond(&a, &b);
     else if (!strcmp(g_mode, "random")) scenario_random(&a, &b);
     else if (bounds) g_quiet = 1, scenario_bounds(&a, &b);
     else if (!strcmp(g_mode, "teardown")) scenario_teardown(&a, &b);

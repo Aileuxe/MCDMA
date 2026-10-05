@@ -116,6 +116,46 @@ class LinkTests(unittest.TestCase):
     def test_fabric_refuses_bad_arguments(self):
         self.run_case('fabric', 'args')
 
+    def test_bonded_fabric_uses_both_thunderbolt_links(self):
+        for seed, depth in (('5', '4095'), ('6', '8')):
+            with self.subTest(seed=seed, depth=depth):
+                self.run_case('fabric', 'bond', STUB_SEED=seed, STUB_TB_DEPTH=depth, STUB_STRICT='1', STUB_LAZY='1')
+
+    def test_bond_device_and_via_lists_are_strict(self):
+        self.run_case('fabric', 'bond-args', STUB_STRICT='1')
+
+    def test_a_single_link_peer_cannot_satisfy_a_bond(self):
+        self.run_case('fabric', 'bond-mismatch', STUB_STRICT='1')
+
+    def test_bond_signals_wait_for_both_receive_placements(self):
+        for seed in ('1', '4'):
+            with self.subTest(seed=seed):
+                self.run_case('fabric', 'bond-order', STUB_SEED=seed, STUB_STRICT='1', STUB_LAZY='1')
+
+    def test_bond_keeps_using_the_faster_link_when_one_is_delayed(self):
+        self.run_case('fabric', 'bond-schedule', STUB_SEED='5', STUB_STRICT='1', STUB_LAZY='1')
+
+    def test_bond_overlapping_calls_preserve_posting_order(self):
+        self.run_case('fabric', 'bond-overlap', STUB_SEED='3', STUB_STRICT='1', STUB_LAZY='1')
+
+    def test_one_failed_link_poisons_the_whole_bond(self):
+        self.run_case('fabric', 'bond-fail', STUB_SEED='2', STUB_STRICT='1', STUB_LAZY='1')
+
+    def test_bond_signal_credit_backpressures_instead_of_poisoning(self):
+        self.run_case('fabric', 'bond-credit', STUB_SEED='4', STUB_STRICT='1', STUB_LAZY='1')
+
+    def test_bond_small_writes_stay_whole_at_tiny_depth_and_registration_boundaries(self):
+        for depth in ('4095', '4'):
+            with self.subTest(depth=depth):
+                self.run_case('fabric', 'bond-small', STUB_TB_DEPTH=depth, STUB_SEED='3',
+                              STUB_STRICT='1', STUB_LAZY='1')
+
+    def test_a_dead_bond_peer_does_not_fail_a_live_peers_flag_wait(self):
+        self.run_case('fabric', 'bond-wait', STUB_SEED='6', STUB_STRICT='1', STUB_LAZY='1')
+
+    def test_public_maximum_names_fit_bond_lane_suffixes(self):
+        self.run_case('fabric', 'bond-names', STUB_STRICT='1')
+
     def test_fabric_check_passes_on_both_link_kinds(self):
         self.run_case('fabric-check', 'tb', STUB_SEED='3', STUB_LAZY='1')
         self.run_case('fabric-check', 'roce', STUB_STRICT='1')
