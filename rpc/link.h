@@ -77,7 +77,7 @@ struct xmsg {
 
 /* One end of the exchange: a UDP socket on one Thunderbolt IP interface, admitting only on-link link-local peers. */
 struct xchg {
-    int fd, port, peer_port, pinned, learned;
+    int fd, port, peer_port, pinned, learned, v4;   /* v4: the pinned peer is IPv4, `peer` holds it mapped */
     unsigned ifindex;
     char ifname[32];
     char name[X_NAME];

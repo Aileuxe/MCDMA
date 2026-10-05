@@ -108,7 +108,8 @@ int xchg_decode(const uint8_t *in, size_t len, struct xmsg *m) {
     return 0;
 }
 
-/* IFACE or IFACE/fe80::ADDR; the address, when given, is the only peer admitted and is written without a %zone. */
+/* IFACE, IFACE/fe80::ADDR or IFACE/A.B.C.D (a link whose ends have only IPv4, such as a Thunderbolt /30); the address,
+ * when given, is the only peer admitted and is written without a %zone. An IPv4 peer is held as ::ffff:A.B.C.D. */
 int via_parse(const char *via, char *ifname, size_t n, struct in6_addr *peer, int *pinned) {
     const char *slash = strchr(via, '/');
     size_t len = slash ? (size_t)(slash - via) : strlen(via);
@@ -118,8 +119,55 @@ int via_parse(const char *via, char *ifname, size_t n, struct in6_addr *peer, in
     memcpy(ifname, via, len);
     ifname[len] = 0;
     if (!slash) return 0;
+    struct in_addr v4;
+    if (!strchr(slash + 1, '%') && inet_pton(AF_INET, slash + 1, &v4) == 1) {
+        peer->s6_addr[10] = peer->s6_addr[11] = 0xff;
+        memcpy(&peer->s6_addr[12], &v4, 4);
+        *pinned = 1;
+        return 0;
+    }
     if (strchr(slash + 1, '%') || inet_pton(AF_INET6, slash + 1, peer) != 1 || !IN6_IS_ADDR_LINKLOCAL(peer)) return -1;
     *pinned = 1;
+    return 0;
+}
+
+/* The pinned IPv4 peer's address as a socket address. */
+static struct sockaddr_in v4_peer(const struct xchg *x, int port) {
+    struct sockaddr_in to;
+    memset(&to, 0, sizeof(to));
+    to.sin_family = AF_INET;
+    to.sin_port = htons((uint16_t)port);
+    memcpy(&to.sin_addr, &x->peer.s6_addr[12], 4);
+    return to;
+}
+
+/* IPv4: a socket bound to the interface where it can be, sending with TTL 255 and reporting each datagram's
+ * interface and TTL, so only the pinned peer one hop away on this link is admitted, as on IPv6. */
+static int open_v4(struct xchg *x, int port) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0), one = 1, ttl = 255;
+    unsigned idx = x->ifindex;
+    int ok = fd >= 0 && !fcntl(fd, F_SETFD, FD_CLOEXEC) &&
+             !setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &one, sizeof(one)) &&
+             !setsockopt(fd, IPPROTO_IP, IP_RECVTTL, &one, sizeof(one)) &&
+             !setsockopt(fd, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl));
+#ifdef IP_BOUND_IF
+    ok = ok && !setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &idx, sizeof(idx));
+#else
+    (void)idx;
+#endif
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t)port);
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    socklen_t alen = sizeof(a);
+    if (!ok || bind(fd, (struct sockaddr *)&a, sizeof(a)) || getsockname(fd, (struct sockaddr *)&a, &alen)) {
+        link_log("exchange socket on %s port %d (IPv4) errno=%d", x->ifname, port, errno);
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    x->fd = fd;
+    x->port = ntohs(a.sin_port);
     return 0;
 }
 
@@ -143,6 +191,12 @@ int xchg_open(struct xchg *x, const char *via, int port, int peer_port, const ch
     snprintf(x->name, sizeof(x->name), "%s", name);
     x->port = port;
     x->peer_port = peer_port ? peer_port : port;
+    x->v4 = x->pinned && IN6_IS_ADDR_V4MAPPED(&x->peer);
+    if (x->v4) {
+        if (open_v4(x, port)) return -1;
+        xchg_session(x);
+        return 0;
+    }
     int fd = socket(AF_INET6, SOCK_DGRAM, 0), one = 1, hops = 255;
     unsigned idx = x->ifindex;
     int ok = fd >= 0 && !fcntl(fd, F_SETFD, FD_CLOEXEC) &&
@@ -194,6 +248,10 @@ int xchg_send(struct xchg *x, const struct xmsg *m) {
     uint8_t buf[X_MAX];
     int n = xchg_encode(m, buf, sizeof(buf));
     if (n < 0 || x->fd < 0) return -1;
+    if (x->v4) {
+        struct sockaddr_in to4 = v4_peer(x, x->peer_port);
+        return sendto(x->fd, buf, (size_t)n, 0, (struct sockaddr *)&to4, sizeof(to4)) == n ? 0 : -1;
+    }
     struct sockaddr_in6 to;
     memset(&to, 0, sizeof(to));
     to.sin6_family = AF_INET6;
@@ -215,11 +273,68 @@ static void reject(struct xchg *x, const char *why, const struct sockaddr_in6 *s
              (unsigned long long)x->rejected);
 }
 
+/* The IPv4 receive: only the pinned peer, on this interface, one hop away (TTL 255). */
+static int recv_v4(struct xchg *x, struct xmsg *m) {
+    uint8_t buf[X_MAX + 1];
+    struct sockaddr_in src;
+    union {
+        struct cmsghdr align;
+        uint8_t raw[256];
+    } control;
+    struct iovec iov = {buf, sizeof(buf)};
+    struct msghdr h;
+    memset(&h, 0, sizeof(h));
+    memset(&src, 0, sizeof(src));
+    h.msg_name = &src, h.msg_namelen = sizeof(src);
+    h.msg_iov = &iov, h.msg_iovlen = 1;
+    h.msg_control = control.raw, h.msg_controllen = sizeof(control.raw);
+    ssize_t got = recvmsg(x->fd, &h, MSG_DONTWAIT);
+    if (got < 0) return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR ? 0 : -1;
+    int ttl = -1;
+    unsigned arrived = 0;
+    for (struct cmsghdr *c = CMSG_FIRSTHDR(&h); c; c = CMSG_NXTHDR(&h, c)) {
+        if (c->cmsg_level != IPPROTO_IP) continue;
+        if (c->cmsg_type == IP_PKTINFO && c->cmsg_len >= CMSG_LEN(sizeof(struct in_pktinfo))) {
+            struct in_pktinfo info;
+            memcpy(&info, CMSG_DATA(c), sizeof(info));
+            arrived = (unsigned)info.ipi_ifindex;
+#ifdef __APPLE__
+        } else if (c->cmsg_type == IP_RECVTTL && c->cmsg_len >= CMSG_LEN(sizeof(unsigned char))) {
+            ttl = *(const unsigned char *)CMSG_DATA(c);
+#else
+        } else if (c->cmsg_type == IP_TTL && c->cmsg_len >= CMSG_LEN(sizeof(int))) {
+            memcpy(&ttl, CMSG_DATA(c), sizeof(ttl));
+#endif
+        }
+    }
+    struct sockaddr_in want = v4_peer(x, 0);
+    struct sockaddr_in6 shown;
+    memset(&shown, 0, sizeof(shown));
+    shown.sin6_family = AF_INET6;
+    shown.sin6_addr = x->peer;
+    memcpy(&shown.sin6_addr.s6_addr[12], &src.sin_addr, 4);
+    const char *why = NULL;
+    if (src.sin_family != AF_INET || memcmp(&src.sin_addr, &want.sin_addr, 4)) why = "not the configured peer";
+    else if (arrived != x->ifindex) why = "arrived on another interface";
+    else if (ttl != 255) why = "TTL is not 255, so it did not come from this link";
+    else if ((size_t)got > X_MAX || xchg_decode(buf, (size_t)got, m)) why = "not an MCDMA exchange message";
+    else if (strncmp(m->name, x->name, X_NAME)) why = "names another link";
+    if (why) {
+        reject(x, why, &shown);
+        return 0;
+    }
+    if (!memcmp(m->from, x->session, 16)) return 0;
+    x->peer_port = ntohs(src.sin_port);
+    x->learned = 1;
+    return 1;
+}
+
 /* 1 and an admitted message, 0 when nothing admissible arrived within timeout_ms, -1 on a socket error. */
 int xchg_recv(struct xchg *x, struct xmsg *m, int timeout_ms) {
     struct pollfd wait = {.fd = x->fd, .events = POLLIN};
     int ready = poll(&wait, 1, timeout_ms);
     if (ready <= 0) return ready < 0 && errno != EINTR ? -1 : 0;
+    if (x->v4) return recv_v4(x, m);
     uint8_t buf[X_MAX + 1];
     struct sockaddr_in6 src;
     union {
