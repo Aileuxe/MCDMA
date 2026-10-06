@@ -150,8 +150,9 @@ counts. This experiment does not select a new production scheduler.
 
 ## Several QPs per cable
 
-Unset `MCDMA_FABRIC_QPS` selects two per Thunderbolt device if all advertise support, otherwise a uniform one with
-its choice logged. Set 1, 2 or 3 for an exact width, or use `mcdma_fabric_open_qps` with Q=0 for default and Q=1..3
+Unset `MCDMA_FABRIC_QPS` selects two per device for one or two physical cables if all advertise support,
+otherwise one. Three or more physical cables default to one QP each, following the four-cable qualification.
+The selected geometry is logged. Set 1, 2 or 3 for an exact width, or use `mcdma_fabric_open_qps` with Q=0 for default and Q=1..3
 for explicit selection independent of the environment. RoCE retains one QP. Unsupported widths refuse.
 
 Every Thunderbolt connection owns its context, PD, window registrations, QP, CQ, ring and placement lock. The

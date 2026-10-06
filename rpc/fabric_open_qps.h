@@ -44,7 +44,7 @@ int mcdma_fabric_open_qps(const char *device, int gid, int mtu, void *window, si
     pthread_mutex_init(&f->lock, NULL);
     pthread_cond_init(&f->work, NULL);
     f->trace_enabled = getenv("MCDMA_TRACE") && !strcmp(getenv("MCDMA_TRACE"), "1");
-    f->devices = n; f->qps = (int)(requested ? requested : 2); f->bonded = n;
+    f->devices = n; f->qps = (int)(requested ? requested : n >= 3 ? 1 : 2); f->bonded = n;
     f->win.base = window; f->win.length = length;
     int status = MCDMA_FABRIC_OK, thunderbolt = 1;
     for (int d = 0; !status && d < n; ++d) {

@@ -91,7 +91,10 @@ class LinkTests(unittest.TestCase):
         for n, q in (('1', '2'), ('1', '3'), ('2', '2'), ('4', '2'), ('4', '3'), ('8', '3')):
             with self.subTest(devices=n, qps=q):
                 self.run_case('nbond', n, q, MCDMA_FABRIC_QPS=q, STUB_SEED='7', STUB_STRICT='1', STUB_LAZY='1')
-        self.run_case('nbond', '4', '2', NBOND_DEFAULT_QPS='1', STUB_SEED='7', STUB_STRICT='1', STUB_LAZY='1')
+        self.run_case('nbond', '1', '2', NBOND_DEFAULT_QPS='1', STUB_SEED='7', STUB_STRICT='1', STUB_LAZY='1')
+        self.run_case('nbond', '2', '2', NBOND_DEFAULT_QPS='1', STUB_SEED='7', STUB_STRICT='1', STUB_LAZY='1')
+        self.run_case('nbond', '3', '1', NBOND_DEFAULT_QPS='1', STUB_SEED='7', STUB_STRICT='1', STUB_LAZY='1')
+        self.run_case('nbond', '4', '1', NBOND_DEFAULT_QPS='1', STUB_SEED='7', STUB_STRICT='1', STUB_LAZY='1')
         self.run_case('nbond', '1', '1', NBOND_DEFAULT_QPS='1', NBOND_CAP_ONE='1', STUB_SEED='7', STUB_STRICT='1', STUB_LAZY='1')
         self.run_case('nbond', '4', '2', NBOND_MISMATCH='1', MCDMA_FABRIC_QPS='2', STUB_SEED='7', STUB_STRICT='1', STUB_LAZY='1')
 

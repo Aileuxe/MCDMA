@@ -50,13 +50,14 @@ MCDMA_FABRIC_API uint32_t mcdma_fabric_abi(void);
  * progress thread per link. Single-link strings and ABI 1 are unchanged. On Linux, dmabuf_fd >= 0 registers that
  * DMA-BUF from dmabuf_offset instead, `window` being its CPU mapping; elsewhere it is UNSUPPORTED.
  * gid_index -1 scans each Thunderbolt data device for a nonzero GID, preferring IPv6 link-local.
- * MCDMA_FABRIC_QPS=1..3 requests an exact width; unset selects two if all devices support it, else one.
+ * MCDMA_FABRIC_QPS=1..3 requests an exact width; unset selects two for one/two devices if supported,
+ * otherwise one. Three or more devices default to one QP each after the four-cable qualification.
  * Admission registrations are released on first connect. Each Thunderbolt connection owns an exclusive
  * context, PD and window registrations, avoiding shared provider queue mappings. Local peers reserve Q against its cap, at most three;
  * provider creation enforces QPs held by other contexts/processes. */
 MCDMA_FABRIC_API int mcdma_fabric_open(const char *device, int gid_index, int path_mtu, void *window, size_t length,
                                        int dmabuf_fd, uint64_t dmabuf_offset, uint32_t flags, struct mcdma_fabric **out);
-/* Explicit QPs per physical device; 0 selects the supported default of two, 1..3 requests that exact width. */
+/* Explicit QPs per physical device; 0 selects the device-count default, 1..3 requests that exact width. */
 MCDMA_FABRIC_API int mcdma_fabric_open_qps(const char *device, int gid_index, int path_mtu, void *window, size_t length,
                                          int dmabuf_fd, uint64_t dmabuf_offset, uint32_t flags, unsigned qps,
                                          struct mcdma_fabric **out);
