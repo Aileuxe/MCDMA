@@ -182,8 +182,10 @@ How a write lands:
 1. Each link keeps a ring of 2,048 one-packet receives (8 MiB) posted, so a message lands at once whatever the
    receiver is doing. Posting a receive on a live Thunderbolt queue pair costs 0.25-0.5 µs (0.01-0.03 µs on a fresh
    one), and a send posted meanwhile waits for the link's lock. So a progress thread puts a landed message's receives
-   back 5 µs later, when a reply has usually posted, in batches of eight between polls, and stops while a caller
-   waits for the lock; a ring more than a quarter used refills at once, as a stream needs.
+   back 5 µs later, when a reply has usually posted, two between polls, and stops while a caller waits for the lock:
+   a send that comes while they go back, as when two peers swap and one sends a little after the other's message
+   lands, waits behind two receives (about a microsecond). A ring more than a quarter used refills at once, as a
+   stream needs.
 2. A write of up to 4,064 bytes travels inside one header message, a single packet.
 3. A larger write is a header message with its offset and length, then its bytes as a message of their own, sent
    straight from the window with no copy, in pieces of at most 4 MiB that never cross a registration.

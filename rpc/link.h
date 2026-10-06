@@ -31,6 +31,7 @@
 #define TB_DEPTH 4095               /* send queue depth in packets that Thunderbolt allows */
 #define TB_TRY_MAX (256ull << 10)    /* largest bounded, nonblocking bonded write chunk */
 #define TB_REPOST_WAIT_NS 5000ull   /* how long a progress thread leaves a landed message's receives for a reply */
+#define TB_RECV_BATCH 2u            /* receives it then posts a pass: a send that comes meanwhile waits behind these */
 #define LINK_REGION_MAX 128         /* registrations per region, and keys per exchange datagram */
 #define LINK_MRS (LINK_REGION_MAX + 4)
 #define LINK_RC_DEPTH 31            /* RoCE CQ and send queue: the CX5 provider refuses 63 */

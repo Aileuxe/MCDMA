@@ -26,7 +26,7 @@ enum { C_WRITE = 1, C_INLINE, C_SIGNAL, C_FENCE, C_FENCE_ACK, C_WRITE_SIGNAL, C_
 #define BOND_WS_HEAD 64
 #define TB_STALL_NS 10000000000ull /* a bonded message waiting this long on the other link fails its link */
 #define TB_RATE_MIN 65536u        /* a send this large measures its link's rate; smaller ones are mostly latency */
-#define TB_RECV_BATCH 8u          /* receives a progress thread posts again between checks for a waiting caller */
+#define TB_RECV_BULK 8u           /* receives a call while a ring more than a quarter used refills */
 enum { T_SEND = 1, T_RECV };
 
 struct head {
@@ -725,22 +725,26 @@ static int take(struct ep *e, uint64_t first, uint64_t count, uint64_t bytes) {
 }
 
 /* Post the slots taken messages used again, in ring order. On a live Thunderbolt queue pair each receive costs
- * 0.25-0.5 us (0.01-0.03 us on a fresh one), and a reply posted while they go back waits behind them. So a progress
- * thread (`wanted`) leaves them for TB_REPOST_WAIT_NS after a message lands, when a reply would post, then puts
- * back a batch a pass between polls, and stops while a caller waits for the lock. A ring more than a quarter used,
- * as in a stream, refills at once. Without `wanted` every slot goes back now. */
+ * 0.25-0.5 us (0.01-0.03 us on a fresh one), and a send posted while they go back waits behind them. So a progress
+ * thread (`wanted`) leaves them for TB_REPOST_WAIT_NS after a message lands, when a reply would post, then puts back
+ * TB_RECV_BATCH a pass between polls, and stops while a caller waits for the lock: a send posted in that time, as
+ * when two peers swap and one sends a little after the other's message lands, waits behind two receives, not a
+ * message's worth. A ring more than a quarter used, as in a stream, refills at once. Without `wanted` every slot
+ * goes back now. */
 static void repost(struct ep *e, const int *wanted) {
     struct tb *t = e->tb;
     uint64_t want = t->used + t->slots - t->posted;
     if (!want) return;
+    uint32_t most = 64;
     if (wanted) {
         int low = t->posted - t->filled < (uint64_t)t->slots * 3 / 4;
         if (!low && link_now_ns() - t->taken_ns < TB_REPOST_WAIT_NS) return;
-        if (!low && want > TB_RECV_BATCH) want = TB_RECV_BATCH;
+        most = low ? TB_RECV_BULK : TB_RECV_BATCH;
+        if (!low && want > most) want = most;
     }
     while (want && !t->poisoned) {
         if (wanted && __atomic_load_n(wanted, __ATOMIC_ACQUIRE)) break;
-        uint32_t most = wanted ? TB_RECV_BATCH : 64, n = want < most ? (uint32_t)want : most;
+        uint32_t n = want < most ? (uint32_t)want : most;
         int got = post_recvs(e, t->posted, n);
         if (got <= 0) break;
         t->posted += (uint64_t)got, want -= (uint64_t)got;

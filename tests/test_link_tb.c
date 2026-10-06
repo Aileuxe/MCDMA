@@ -9,7 +9,7 @@
  *   tail      a headless tail waits for its announcement, lands where it says and counts as its write; a joined part
  *             waits for the bond's go-ahead, announces its tail, and a mismatched tail fails the link
  *   repost    a progress thread leaves a landed message's receives for a reply's moment, holds them back while a
- *             caller waits for the lock, then puts them back; plain progress puts them back at once
+ *             caller waits for the lock, then puts them back a few a pass; plain progress puts them back at once
  * Exit 0 means pass; STUB_SEED changes the delivery order across queue pairs. */
 #include "../rpc/link.h"
 
@@ -495,11 +495,13 @@ static void scenario_repost(struct side *a, struct side *b) {
     uint64_t until = link_now_ns() + 3 * TB_REPOST_WAIT_NS;
     while (link_now_ns() < until) CHECK(tb_progress_some(&b->e, &wanted) >= 0, "progress while a caller waits");
     CHECK(tb_unposted(&b->e) >= 10, "a waiting caller keeps the receives back");
-    /* then they go back, a batch a pass */
+    /* then they go back TB_RECV_BATCH a pass, so a send that comes meanwhile waits behind no more than those */
     wanted = 0;
     uint64_t deadline = link_now_ns() + TIMEOUT;
     while (tb_unposted(&b->e)) {
+        uint64_t before = tb_unposted(&b->e);
         CHECK(tb_progress_some(&b->e, &wanted) >= 0, "progress puts the receives back");
+        CHECK(tb_unposted(&b->e) + TB_RECV_BATCH >= before, "a pass puts back no more than TB_RECV_BATCH receives");
         CHECK(link_now_ns() < deadline, "the receives never went back");
     }
     /* plain progress, as a sender waiting for room uses, puts them back at once */
