@@ -31,7 +31,9 @@ struct smr { struct ibv_mr mr; int dev, access, live; };
 struct scq { struct ibv_cq cq; struct ibv_wc *ring; int cap, head, count, destroyed; };
 struct swr { uint64_t id; unsigned char *addr; uint32_t len, sent; };
 struct sq { struct swr *v; uint32_t cap, head, count, packets; };
-struct sqp { struct ibv_qp qp; int dev, destroyed; uint32_t dest, cap_send, cap_recv; struct sq send, recv; };
+struct sqp { struct ibv_qp qp; int dev, destroyed, held, failed, send_blocked; unsigned hold_next;
+             uint64_t hold_id; uint32_t dest, cap_send, cap_recv; struct sq send, recv; };
+static void flush(struct sqp *q);
 
 static const char *g_names[NDEV] = {"roce0", "roce1", "tb0", "tb1", "tb2", "tb3", "tb4",
                                     "tb5", "tb6", "tb7", "tb8", "tb9", "tb10", "tb11", "tb12", "tb13", "tb14", "tb15"};
@@ -72,6 +74,35 @@ void stub_tb_hold_completions(const char *name, int hold) {
     pthread_mutex_lock(&g_mu);
     g_hold_completions[device_index(name)] = !!hold;
     pthread_mutex_unlock(&g_mu);
+}
+
+static struct sqp *nth_qp(const char *name, unsigned member) {
+    int dev = device_index(name);
+    for (int i = 0; i < g_nqp; ++i)
+        if (g_qp[i]->dev == dev && !g_qp[i]->destroyed && member-- == 0) return g_qp[i];
+    die("missing live QP ordinal"); return NULL;
+}
+
+void stub_tb_hold_qp_completions(const char *name, unsigned member, int hold) {
+    pthread_mutex_lock(&g_mu); nth_qp(name, member)->held = !!hold; pthread_mutex_unlock(&g_mu);
+}
+void stub_tb_fail_qp(const char *name, unsigned member) {
+    pthread_mutex_lock(&g_mu);
+    struct sqp *q = nth_qp(name, member);
+    q->failed = 1; q->qp.state = IBV_QPS_ERR; flush(q);
+    pthread_mutex_unlock(&g_mu);
+}
+void stub_tb_hold_nth_send(const char *name, unsigned member, unsigned nth) {
+    pthread_mutex_lock(&g_mu);
+    struct sqp *q = nth_qp(name, member);
+    q->hold_next = nth; q->send_blocked = 0;
+    pthread_mutex_unlock(&g_mu);
+}
+unsigned stub_tb_live_qps(const char *name) {
+    pthread_mutex_lock(&g_mu); unsigned n = (unsigned)g_uc[device_index(name)]; pthread_mutex_unlock(&g_mu); return n;
+}
+unsigned stub_tb_live_mrs(const char *name) {
+    pthread_mutex_lock(&g_mu); unsigned n = (unsigned)g_mrs[device_index(name)]; pthread_mutex_unlock(&g_mu); return n;
 }
 
 uint64_t stub_tb_sent_bytes(const char *name) {
@@ -198,6 +229,7 @@ static void pump(int polling) {
             if (!d || d->destroyed || g_hold[d->dev] ||
                 (d->qp.state != IBV_QPS_RTR && d->qp.state != IBV_QPS_RTS) || !d->recv.count) break;
             struct swr *s = &q->send.v[q->send.head], r = d->recv.v[d->recv.head];
+            if (q->send_blocked && s->id == q->hold_id) break;
             uint32_t len = s->len - s->sent < PACKET ? s->len - s->sent : PACKET;
             int last = s->sent + len == s->len;
             if (r.len < len) die("a receive smaller than the packet that fills it");
@@ -221,7 +253,10 @@ static int stub_poll(struct ibv_cq *cq, int n, struct ibv_wc *wc) {
     pump(1);
     int got = 0;
     int dev = ((struct sctx *)c->cq.context)->dev;
-    for (; !g_hold_completions[dev] && got < n && c->count; ++got) {
+    int held = g_hold_completions[dev];
+    for (int i = 0; i < g_nqp; ++i)
+        if (!g_qp[i]->destroyed && g_qp[i]->qp.send_cq == cq && g_qp[i]->held) held = 1;
+    for (; !held && got < n && c->count; ++got) {
         wc[got] = c->ring[c->head];
         c->head = (c->head + 1) % c->cap, c->count--;
     }
@@ -234,7 +269,7 @@ static int stub_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_
     (void)bad;
     pthread_mutex_lock(&g_mu);
     if (q->destroyed) die("post_send on a destroyed QP");
-    if (g_failed[q->dev]) {
+    if (g_failed[q->dev] || q->failed) {
         pthread_mutex_unlock(&g_mu);
         return EIO;
     }
@@ -254,6 +289,7 @@ static int stub_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_
                 return ENOMEM;   /* Thunderbolt's send queue counts packets and refuses past its depth */
             }
             enqueue(&q->send, wr->wr_id, s->addr, s->length);
+            if (q->hold_next && --q->hold_next == 0) { q->hold_id = wr->wr_id; q->send_blocked = 1; }
             g_sent_bytes[q->dev] += s->length;
             g_sends[q->dev]++;
         } else if (wr->opcode == IBV_WR_RDMA_WRITE) {
@@ -278,7 +314,7 @@ static int stub_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr, struct ibv_
     (void)bad;
     pthread_mutex_lock(&g_mu);
     if (q->destroyed) die("post_recv on a destroyed QP");
-    if (g_failed[q->dev]) {
+    if (g_failed[q->dev] || q->failed) {
         pthread_mutex_unlock(&g_mu);
         return EIO;
     }
@@ -342,7 +378,8 @@ int ibv_query_port(struct ibv_context *c, uint8_t port, struct _compat_ibv_port_
 }
 int ibv_query_device(struct ibv_context *c, struct ibv_device_attr *a) {
     memset(a, 0, sizeof(*a));
-    a->max_qp = is_tb(((struct sctx *)c)->dev) ? TB_QPS : MAXQP;
+    const char *cap = getenv("STUB_QP_CAP");
+    a->max_qp = is_tb(((struct sctx *)c)->dev) ? (cap ? atoi(cap) : TB_QPS) : MAXQP;
     a->max_qp_wr = 4095; a->max_mr_size = TB_MR_MAX;
     return 0;
 }

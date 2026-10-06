@@ -13,6 +13,7 @@ enforces RoCE keys and models Thunderbolt RDMA as two Studios on macOS 27.0 meas
 
 | Call | What it does |
 | --- | --- |
+| `mcdma_fabric_open_qps` | Explicit QPs per device, or zero for the supported default |
 | `mcdma_fabric_open` | Opens one device, or N Thunderbolt devices joined by `+`, and registers the same window on each |
 | `mcdma_fabric_connect_links`, `mcdma_fabric_max_links` | Explicit N UDP ports and supported member limit |
 | `mcdma_fabric_connect` | Meets one peer over a Thunderbolt IP interface; both sides call it with the same name |
@@ -104,8 +105,8 @@ at `port` and `peer_port`, with zero peer_port meaning the local base. The addit
 `mcdma_fabric_max_links` reports the supported maximum. Old single-link callers retain their ABI and wire protocol.
 Bonds negotiate a new mode and N plus lane position; both ends must use this build. Mixed old/new bonds refuse.
 
-Each member owns a progress thread. `write_signal` of at least 40 KiB divides the source into N contiguous parts,
-with at least 2 KiB per part and 64-byte cuts. Recent rates influence the cut, clamped to 3:1. All workers prepare
+Each QP lane owns a progress thread. `write_signal` of at least 40 KiB divides the source into N*Q contiguous parts,
+normally at least 2 KiB per part, reduced near threshold for many lanes, with 64-byte cuts. Recent rates influence the cut, clamped to 3:1. All workers prepare
 before one release lets them post concurrently. Each part carries an ordered control header and ordinary payload,
 split further at registration or message boundaries. A final signal names all N placement watermarks. This costs
 more headers than the old two-link tail encoding, but avoids serializing the parts of one mid-size exchange.
@@ -118,18 +119,47 @@ The two-link small-message path keeps its joined encoding. The API still reserve
 
 A signal publishes after all N prefixes cover its watermarks, in signal sequence order. Placement counts advance
 after payload copies. Overlapping write_signal calls carry the prior prefixes they must wait for at the receiver,
-and an overwrite of a signalled word also waits for prior signals. Plain overlapping writes retain their ordered
+and every payload range covered by a signal waits for that signal
+to publish before a later overlapping copy begins. Standalone signals cover all earlier payload ranges too. Plain overlapping writes retain their ordered
 member or fence every member first. `flush` fences remote placement on all members; local SEND completion is
 insufficient. Source bytes must remain unchanged through flush or the application's equivalent peer acknowledgement.
 
 Plain writes use bounded chunks and the least queued eligible member. Small operations retain one member's affinity.
-`link_count` returns N; `link_stats` reports posted and completed payload bytes in device order, excluding headers.
+`link_count` returns N*Q; `link_stats` reports posted and completed payload bytes in QP-major order, excluding headers.
 A missing or inactive device refuses open and unwinds already opened members. A failed member poisons the entire
 peer and sends its reason. There is no silent reduced-width mode because both ends must agree on every watermark.
 Disconnect and explicitly reconnect with the same smaller list on both ends if reduced width is wanted.
 
 `MCDMA_FABRIC_QOS=1` gives progress threads user-interactive QoS on macOS. Cooperative wait polling remains available
 through `MCDMA_FABRIC_WAIT_POLL`; a caller spinning directly on its word relies on the progress threads.
+
+## Several QPs per cable
+
+Unset `MCDMA_FABRIC_QPS` selects two per Thunderbolt device if all advertise support, otherwise a uniform one with
+its choice logged. Set 1, 2 or 3 for an exact width, or use `mcdma_fabric_open_qps` with Q=0 for default and Q=1..3
+for explicit selection independent of the environment. RoCE retains one QP. Unsupported widths refuse.
+
+One context, PD and window registration set belongs to each physical device; its QP lanes share those registrations
+and have independent QPs, CQs, rings, locks and progress threads. Shared lanes close before their device owner.
+Local simultaneous peer reservations count Q per connection against the reported cap, capped at three; provider
+allocation also enforces QPs held by other contexts/processes. A partial connect unwinds all allocated QPs and
+its reservation. Q=2 or 3 therefore permits only one peer per physical device in a fabric. Any failed QP fails the peer.
+
+Devices and vias still describe N physical members. Base connect reserves N*Q consecutive UDP ports. Explicit
+N-port arrays reserve further QPs in disjoint blocks, stride max(base)-min(base)+1; N*Q arrays name every lane.
+For four bases 7530..7533, Q=2 also reserves 7534..7537, Q=3 through 7541. Duplicates and overflow refuse before
+peer creation. Multi-QP handshake checks N, Q, lane, window and session and rejects a differently configured peer.
+
+`device_count` and `qps_per_device` report physical geometry. `link_stats` index q*N+d belongs to device d, QP q;
+sum all q for a cable's traffic. Completion, signal watermarks and overlap dependencies cover every lane.
+Four cables with default Q=2 cost eight progress threads per rank, four more than Q=1; Q=3 costs twelve.
+Idle backoff remains, but CPU scheduling and provider/context contention can limit scaling. Host tests establish
+correctness, not new throughput.
+
+The flag orders publication; it does not hold a permanent snapshot for a reader. After publication a later write
+may proceed. A consumer that must retain those bytes must acknowledge consumption before the producer reuses
+that region, or use disjoint slots with the equivalent phase barrier. Source bytes also remain unchanged until
+remote flush or an acknowledgement proving their use has ended.
 
 ## Thunderbolt links
 

@@ -371,9 +371,10 @@ int fabric_check(int argc, char **argv) {
     }
     printf("fabric-check: rank %d connected over %s\n", rank,
            mcdma_fabric_link(p) == MCDMA_FABRIC_THUNDERBOLT ? "thunderbolt" : "roce");
-    printf("fabric-check: metadata abi=%u device=%s via=%s gid_index=%d links=%u mode=%s progress=%llu "
+    printf("fabric-check: metadata abi=%u device=%s via=%s gid_index=%d links=%u devices=%u qps_per_device=%u mode=%s progress=%llu "
            "qos=%s wait_poll=%s wait=%s pattern=%s gap_us=%llu stream_seconds=%.3f verification=every_byte build=%s\n",
            mcdma_fabric_abi(), argv[1], argv[3], gid_index, mcdma_fabric_link_count(p),
+           mcdma_fabric_device_count(p), mcdma_fabric_qps_per_device(p),
            combined ? "combined" : "split", (unsigned long long)progress,
            getenv("MCDMA_FABRIC_QOS") ? getenv("MCDMA_FABRIC_QOS") : "0",
            getenv("MCDMA_FABRIC_WAIT_POLL") ? getenv("MCDMA_FABRIC_WAIT_POLL") : "1", spin ? "spin" : "library",

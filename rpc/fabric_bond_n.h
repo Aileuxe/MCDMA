@@ -9,9 +9,11 @@ static void bond_parts(const struct bond_load *load, unsigned n, uint64_t len, u
         rates[k] = rate > (1ull << 20) ? (1ull << 20) : rate;
         sum += rates[k];
     }
-    uint64_t rest = len - n * BOND_PART, used = 0;
+    uint64_t minimum = len / n / 64 * 64;
+    if (minimum > BOND_PART) minimum = BOND_PART;
+    uint64_t rest = len - n * minimum, used = 0;
     for (unsigned k = 0; k + 1 < n; ++k) {
-        sizes[k] = BOND_PART + (rest / sum * rates[k] + (rest % sum) * rates[k] / sum) / 64 * 64;
+        sizes[k] = minimum + (rest / sum * rates[k] + (rest % sum) * rates[k] / sum) / 64 * 64;
         used += sizes[k];
     }
     sizes[n - 1] = len - used;
@@ -26,7 +28,7 @@ static int bond_parallel(struct mcdma_fabric_peer *p, uint64_t off, uint64_t rof
     if (bond_look(p, load)) return -1;
     unsigned n = (unsigned)p->bonded;
     uint64_t sizes[BOND_LINKS] = {0}, ordinal[BOND_LINKS] = {0};
-    if (len < BOND_SPLIT || len < n * BOND_PART) {
+    if (len < BOND_SPLIT) {
         unsigned k = p->turn++ % n;
         if (len <= TB_PACKET - (48 + n * 8)) {
             uint64_t need[BOND_LINKS] = {0}; bond_watermarks(p, need); need[k]++;
@@ -39,6 +41,7 @@ static int bond_parallel(struct mcdma_fabric_peer *p, uint64_t off, uint64_t rof
             p->tx_signal++; ordinal[k] = need[k];
             bond_remember(p, roff, len, ordinal, 0);
             bond_remember(p, soff, 8, (uint64_t[BOND_LINKS]){0}, 1);
+            bond_flagged(p);
             return 0;
         }
         enter(p->part[k]->f);

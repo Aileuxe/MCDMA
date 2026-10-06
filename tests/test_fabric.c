@@ -990,6 +990,7 @@ static void later_wins(struct rank *a, struct rank *b, const char *held, uint64_
     CHECK(landed(b, dst + inner, small, 0, step + 1), "the later write wins where they overlap");
     for (uint64_t i = inner + small; i < big; ++i)
         CHECK(b->mem[dst + i] == pattern(0, step, i), "and the earlier write's end survives");
+    CHECK(!mcdma_fabric_flush(a->p, 5 * SECOND), "retire this phase before a later phase holds receives");
 }
 
 /* A signal stores a word that a later write-and-signal's bytes cover: the later bytes win. */
@@ -1005,6 +1006,7 @@ static void later_than_signal(struct rank *a, struct rank *b, const char *held, 
     stub_tb_hold_completions(held, 0);
     spin_flag(b, FLAG, step, "the later flag arrives");
     CHECK(landed(b, dst, len, 0, step), "the later bytes win over the earlier signal's word");
+    CHECK(!mcdma_fabric_flush(a->p, 5 * SECOND), "retire signalled ranges before holding the next phase");
 }
 
 static void scenario_bond_later(void) {

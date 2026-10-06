@@ -18,7 +18,7 @@ STUB = ['tests/stub_link_verbs.c']
 SKIP = 77
 # a failing sanitizer or stub exits with a status instead of aborting, so no crash report is raised
 QUIET = {'ASAN_OPTIONS': 'abort_on_error=0:detect_leaks=0', 'UBSAN_OPTIONS': 'halt_on_error=1:abort_on_error=0',
-         'TSAN_OPTIONS': 'halt_on_error=1:abort_on_error=0:exitcode=66', 'MCDMA_FABRIC_LOG': '0'}
+         'TSAN_OPTIONS': 'halt_on_error=1:abort_on_error=0:exitcode=66', 'MCDMA_FABRIC_LOG': '0', 'MCDMA_FABRIC_QPS': '1'}
 BASE = ['cc', '-std=c11', '-O1', '-g', '-Wall', '-Wextra', '-Werror', '-DMCDMA_LINK_TEST_INTERFACES']
 FABRIC = ['-DMCDMA_FABRIC_TEST_DMABUF', '-DMCDMA_FABRIC_TESTING', 'rpc/libmcdma_fabric.c', *LINK, *STUB,
           'tests/test_fabric.c']
@@ -85,6 +85,14 @@ class LinkTests(unittest.TestCase):
         for n in ('3', '4', '8'):
             with self.subTest(links=n):
                 self.run_case('nbond', n, STUB_SEED='7', STUB_STRICT='1', STUB_LAZY='1')
+
+    def test_multiple_qps_share_registrations_and_complete_every_lane(self):
+        for n, q in (('1', '2'), ('1', '3'), ('2', '2'), ('4', '2'), ('4', '3'), ('8', '3')):
+            with self.subTest(devices=n, qps=q):
+                self.run_case('nbond', n, q, MCDMA_FABRIC_QPS=q, STUB_SEED='7', STUB_STRICT='1', STUB_LAZY='1')
+        self.run_case('nbond', '4', '2', NBOND_DEFAULT_QPS='1', STUB_SEED='7', STUB_STRICT='1', STUB_LAZY='1')
+        self.run_case('nbond', '1', '1', NBOND_DEFAULT_QPS='1', NBOND_CAP_ONE='1', STUB_SEED='7', STUB_STRICT='1', STUB_LAZY='1')
+        self.run_case('nbond', '4', '2', NBOND_MISMATCH='1', MCDMA_FABRIC_QPS='2', STUB_SEED='7', STUB_STRICT='1', STUB_LAZY='1')
 
     def test_the_exchange_admits_only_on_link_peers(self):
         self.run_case('link-xchg')
@@ -215,6 +223,8 @@ class LinkTests(unittest.TestCase):
             self.skipTest('the compiler has no ThreadSanitizer')
         self.run_case('nbond-tsan', '4', STUB_SEED='4', STUB_STRICT='1', STUB_LAZY='1')
         self.run_case('nbond-tsan', '4', STUB_SEED='4', STUB_STRICT='1', STUB_LAZY='1', BOND_ASLEEP='1')
+        self.run_case('nbond-tsan', '4', '2', MCDMA_FABRIC_QPS='2', STUB_SEED='4', STUB_STRICT='1', STUB_LAZY='1')
+        self.run_case('nbond-tsan', '4', '2', MCDMA_FABRIC_QPS='2', STUB_SEED='4', STUB_STRICT='1', STUB_LAZY='1', BOND_ASLEEP='1')
         for scenario in ('bond', 'bond-order', 'bond-overlap', 'bond-fail', 'bond-credit', 'bond-stripe',
                          'bond-pingpong', 'bond-later', 'bond-magic', 'bond-down', 'down', 'zero'):
             with self.subTest(scenario=scenario):

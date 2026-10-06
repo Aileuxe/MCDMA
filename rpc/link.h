@@ -27,7 +27,7 @@
 #define TB_RING 2048                /* one-packet receives each link keeps posted: 8 MiB */
 #define TB_STAGE 64                 /* header messages in flight */
 #define TB_SEND_WR 1024             /* sends in flight */
-#define TB_BOND_MAX 8u
+#define TB_BOND_MAX 24u
 #define TB_MSG (4ull << 20)         /* largest message */
 #define TB_DEPTH 4095               /* send queue depth in packets that Thunderbolt allows */
 #define TB_TRY_MAX (256ull << 10)    /* largest bounded, nonblocking bonded write chunk */

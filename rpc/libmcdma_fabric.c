@@ -24,7 +24,7 @@
 #define OP_NS 10000000000ull        /* a write or signal that cannot be posted within this fails its peer */
 #define PIECE (4ull << 20)
 #define READ_PIECE (2ull << 20)     /* the Mac provider's proven READ size, one outstanding at a time */
-#define BOND_LINKS MCDMA_FABRIC_MAX_LINKS
+#define BOND_LINKS MCDMA_FABRIC_MAX_LANES
 #define BOND_CHUNK (256ull << 10)
 #define BOND_BACKLOG (4 * BOND_CHUNK) /* bound the slow-link tail instead of queueing half a large write there */
 #define BOND_SMALL (16ull << 10)
@@ -56,7 +56,8 @@ struct mcdma_fabric {
     struct mcdma_fabric_peer *peers[MAX_PEERS];
     int npeers;
     struct mcdma_fabric *part[BOND_LINKS]; /* a bond owns N ordinary fabrics, each with its own progress lock */
-    int bonded, wait_poll, waiters;
+    int bonded, wait_poll, waiters, shared, devices, qps, reserved;
+    unsigned qp_limit[MCDMA_FABRIC_MAX_LINKS];
     /* A bond's sender hands a cut write's tail to its link's progress thread, so the two links' sends post at once;
      * a send's first barrier after posting waits 0.4-1.2 us for the device on macOS 27, and from one thread the
      * second send would wait behind the first's. */
@@ -113,7 +114,11 @@ struct mcdma_fabric_peer {
     char why[96];
     struct mcdma_fabric_peer *part[BOND_LINKS], *bond;
     unsigned lane;
-    int bonded, meeting, fallback_logged;
+    int bonded, meeting, fallback_logged, reserved;
+#ifdef MCDMA_FABRIC_TESTING
+    void (*signal_observer)(void *, const unsigned char *, uint64_t, uint64_t);
+    void *observer_arg;
+#endif
     uint8_t session[16];
     pthread_mutex_t rx_lock;         /* only signal bookkeeping; never held across payload placement */
     struct bond_signal *pending;
@@ -179,7 +184,7 @@ static int split_links(const char *s, char out[BOND_LINKS][128], int different) 
     for (const char *at = s; *at;) {
         const char *end = strchr(at, '+');
         size_t n = end ? (size_t)(end - at) : strlen(at);
-        if (!n || n >= 128 || count == BOND_LINKS) return 0;
+        if (!n || n >= 128 || count == MCDMA_FABRIC_MAX_LINKS) return 0;
         for (size_t i = 0; i < n; ++i) if ((unsigned char)at[i] <= ' ' || at[i] == 127) return 0;
         memcpy(out[count], at, n); out[count][n] = 0;
         for (unsigned i = 0; different && i < count; ++i) if (!strcmp(out[i], out[count])) return 0;
@@ -200,6 +205,9 @@ static void bond_drain(struct mcdma_fabric_peer *p) {
             ready = s->need[k] <= __atomic_load_n(&p->placed[k].count, __ATOMIC_SEQ_CST);
         if (!ready) break;
         __atomic_store_n((uint64_t *)(void *)(p->f->win.base + s->off), s->value, __ATOMIC_RELEASE);
+#ifdef MCDMA_FABRIC_TESTING
+        if (p->signal_observer) p->signal_observer(p->observer_arg, p->f->win.base, s->off, s->value);
+#endif
         s->seq = 0;
         /* after the word: a joined part waiting for earlier signals reads this, then may overwrite the word */
         __atomic_store_n(&p->rx_signal, p->rx_signal + 1, __ATOMIC_RELEASE);
@@ -474,58 +482,7 @@ static void *progress_main(void *arg) {
     return NULL;
 }
 
-int mcdma_fabric_open(const char *device, int gid_index, int path_mtu, void *window, size_t length, int dmabuf_fd,
-                      uint64_t dmabuf_offset, uint32_t flags, struct mcdma_fabric **out) {
-    long page = sysconf(_SC_PAGESIZE);
-    if (!out) return MCDMA_FABRIC_INVALID;
-    *out = NULL;
-    if (!device || !window || !length || page <= 0 || (uintptr_t)window % (uintptr_t)page || length % (size_t)page ||
-        (flags & ~MCDMA_FABRIC_PROGRESS_THREAD))
-        return MCDMA_FABRIC_INVALID;
-    struct mcdma_fabric *f = calloc(1, sizeof(*f));
-    if (!f) return MCDMA_FABRIC_NOMEM;
-    pthread_mutex_init(&f->lock, NULL);
-    f->wait_poll = !getenv("MCDMA_FABRIC_WAIT_POLL") || strcmp(getenv("MCDMA_FABRIC_WAIT_POLL"), "0");
-    char devices[BOND_LINKS][128];
-    int count = split_links(device, devices, 1);
-    if (!count) {
-        pthread_mutex_destroy(&f->lock);
-        free(f);
-        return MCDMA_FABRIC_INVALID;
-    }
-    if (count > 1) {
-        f->bonded = count;
-        f->win.base = window, f->win.length = length;
-        int status = MCDMA_FABRIC_OK;
-        for (int k = 0; !status && k < count; ++k) {
-            status = mcdma_fabric_open(devices[k], gid_index, path_mtu, window, length, dmabuf_fd, dmabuf_offset,
-                                        flags | MCDMA_FABRIC_PROGRESS_THREAD, &f->part[k]);
-            if (!status && f->part[k]->dev.kind != LINK_TB) status = MCDMA_FABRIC_UNSUPPORTED;
-        }
-        if (status) {
-            for (unsigned k = 0; k < (unsigned)f->bonded; ++k) mcdma_fabric_close(&f->part[k]);
-            pthread_mutex_destroy(&f->lock);
-            free(f);
-            return status;
-        }
-        *out = f;
-        return MCDMA_FABRIC_OK;
-    }
-    int status = ep_open(&f->dev, device, gid_index, path_mtu) ? MCDMA_FABRIC_DEVICE : 0;
-    if (!status) status = register_window(f, window, length, dmabuf_fd, dmabuf_offset);
-    if (!status && (flags & MCDMA_FABRIC_PROGRESS_THREAD)) {
-        f->threaded = !pthread_create(&f->thread, NULL, progress_main, f);
-        if (!f->threaded) status = MCDMA_FABRIC_NOMEM;
-    }
-    if (status) {
-        ep_close(&f->dev);
-        pthread_mutex_destroy(&f->lock);
-        free(f);
-        return status;
-    }
-    *out = f;
-    return MCDMA_FABRIC_OK;
-}
+#include "fabric_open_qps.h"
 
 /* Both sides offer until each holds the other's offer and has heard that the other holds its own. */
 static int exchange(struct mcdma_fabric_peer *p, uint64_t timeout_ns) {
@@ -535,8 +492,11 @@ static int exchange(struct mcdma_fabric_peer *p, uint64_t timeout_ns) {
     if (p->bond) memcpy(p->x.session, p->bond->session, sizeof(p->x.session));
     xchg_prepare(&p->x, &p->mine, X_OFFER, ROLE_PEER, 0);
     ep_info(&p->e, &f->win, &p->mine.info);
-    p->mine.info.mode = p->bond ? (MODE_DIRECT | 0xa0) : MODE_DIRECT;
-    p->mine.info.req = f->win.length, p->mine.info.rep = p->bond ? ((uint64_t)p->bond->bonded << 32) | (p->lane + 1) : 0;
+    p->mine.info.mode = p->bond ? (MODE_DIRECT | (p->bond->f->qps > 1 ? 0xb0 : 0xa0)) : MODE_DIRECT;
+    p->mine.info.req = f->win.length;
+    p->mine.info.rep = p->bond ? ((uint64_t)p->bond->bonded << 32) | (p->lane + 1) : 0;
+    if (p->bond && p->bond->f->qps > 1)
+        p->mine.info.rep |= ((uint64_t)p->bond->f->devices << 56) | ((uint64_t)p->bond->f->qps << 48);
     uint64_t deadline = link_now_ns() + timeout_ns, resend = 0;
     int have = 0, heard = 0;
     while (!(have && heard)) {
@@ -557,7 +517,7 @@ static int exchange(struct mcdma_fabric_peer *p, uint64_t timeout_ns) {
         if (!have) {
             const struct xinfo *i = &got.info;
             const char *why = i->transport != p->e.kind ? "the two ends use different link kinds"
-                              : i->rep != p->mine.info.rep || (p->bond && i->mode != (MODE_DIRECT | 0xa0))
+                              : i->rep != p->mine.info.rep || (p->bond && i->mode != p->mine.info.mode)
                                   ? "the two ends use different fabric link configurations"
                               : i->req < 8 || !table_valid(&i->table, i->req, i->transport == LINK_ROCE)
                                   ? "a malformed window"
@@ -655,44 +615,84 @@ static int connect_lane(struct mcdma_fabric *f, const char *via, int port, int p
     return MCDMA_FABRIC_OK;
 }
 
+static int reserve_peer(struct mcdma_fabric *f) {
+    enter(f);
+    int bad = f->reserved == MAX_PEERS;
+    for (int d = 0; !bad && d < f->devices; ++d)
+        if (f->qp_limit[d] && (unsigned)((f->reserved + 1) * f->qps) > f->qp_limit[d]) bad = 1;
+    if (!bad) f->reserved++;
+    pthread_mutex_unlock(&f->lock);
+    if (bad) link_log("fabric: another peer would exceed the per-device QP budget");
+    return bad ? MCDMA_FABRIC_DEVICE : MCDMA_FABRIC_OK;
+}
+
+static void unreserve_peer(struct mcdma_fabric *f) {
+    enter(f); f->reserved--; pthread_mutex_unlock(&f->lock);
+}
+
+/* N physical base ports reserve disjoint blocks; an explicit N*Q list names every lane directly. */
+static int lane_ports(const uint16_t *input, unsigned n, unsigned devices, unsigned lanes, uint16_t *out) {
+    if (!input || (n != devices && n != lanes)) return -1;
+    uint32_t lo = 65535, hi = 0;
+    for (unsigned k = 0; k < n; ++k) {
+        if (!input[k]) return -1;
+        for (unsigned j = 0; j < k; ++j) if (input[j] == input[k]) return -1;
+        if (input[k] < lo) lo = input[k];
+        if (input[k] > hi) hi = input[k];
+    }
+    for (unsigned k = 0; k < lanes; ++k) {
+        uint32_t port = n == lanes ? input[k] : input[k % devices] + (k / devices) * (hi - lo + 1);
+        if (port > 65535) return -1;
+        out[k] = (uint16_t)port;
+    }
+    return 0;
+}
+
 int mcdma_fabric_connect_links(struct mcdma_fabric *f, const char *via, const uint16_t *ports,
                                 const uint16_t *peer_ports, unsigned nports, const char *name,
                                 uint64_t timeout_ns, struct mcdma_fabric_peer **out) {
     if (!out) return MCDMA_FABRIC_INVALID;
     *out = NULL;
-    if (!f || !via || !name || !valid_name(name) || !ports || !peer_ports || !timeout_ns ||
-        nports != (unsigned)(f->bonded ? f->bonded : 1)) return MCDMA_FABRIC_INVALID;
-    for (unsigned k = 0; k < nports; ++k) {
-        if (!ports[k] || !peer_ports[k]) return MCDMA_FABRIC_INVALID;
-        for (unsigned j = 0; j < k; ++j)
-            if (ports[j] == ports[k] || peer_ports[j] == peer_ports[k]) return MCDMA_FABRIC_INVALID;
+    if (!f || !via || !name || !valid_name(name) || !timeout_ns) return MCDMA_FABRIC_INVALID;
+    unsigned lanes = (unsigned)(f->bonded ? f->bonded : 1);
+    uint16_t local[BOND_LINKS], remote[BOND_LINKS];
+    if (lane_ports(ports, nports, (unsigned)f->devices, lanes, local) ||
+        lane_ports(peer_ports, nports, (unsigned)f->devices, lanes, remote)) {
+        link_log("fabric: invalid physical/lane ports or expanded port range exceeds 65535");
+        return MCDMA_FABRIC_INVALID;
     }
     char links[BOND_LINKS][128];
     int count = split_links(via, links, 0);
-    if (!count || (count != 1 && count != (int)nports)) return MCDMA_FABRIC_INVALID;
-    if (!f->bonded) return connect_lane(f, via, ports[0], peer_ports[0], name, timeout_ns, NULL, 0, out);
+    if (!count || (count != 1 && count != f->devices)) return MCDMA_FABRIC_INVALID;
+    int budget = reserve_peer(f);
+    if (budget) return budget;
+    if (!f->bonded) {
+        int result = connect_lane(f, via, local[0], remote[0], name, timeout_ns, NULL, 0, out);
+        if (result) unreserve_peer(f); else (*out)->reserved = 1;
+        return result;
+    }
     struct mcdma_fabric_peer *p = calloc(1, sizeof(*p));
-    if (!p) return MCDMA_FABRIC_NOMEM;
+    if (!p) { unreserve_peer(f); return MCDMA_FABRIC_NOMEM; }
     p->f = f, p->bonded = f->bonded, p->meeting = count == 1, p->rx_signal = 1;
     snprintf(p->name, sizeof(p->name), "%s", name);
     pthread_mutex_init(&p->rx_lock, NULL);
     p->pending = calloc(BOND_SIGNALS, sizeof(*p->pending));
     int status = p->pending ? MCDMA_FABRIC_OK : MCDMA_FABRIC_NOMEM;
-    for (unsigned k = 0; k < nports; ++k) {
+    for (unsigned k = 0; k < lanes; ++k) {
         p->tails[k] = calloc(BOND_SIGNALS, sizeof(*p->tails[k]));
         if (!p->tails[k]) status = MCDMA_FABRIC_NOMEM;
     }
     link_random(p->session, sizeof(p->session));
     uint64_t deadline = link_now_ns() + timeout_ns;
-    for (unsigned k = 0; !status && k < nports; ++k) {
+    for (unsigned k = 0; !status && k < lanes; ++k) {
         char link_name[X_NAME];
         snprintf(link_name, sizeof(link_name), "%s-%u", name, k);
         uint64_t now = link_now_ns();
         if (now >= deadline) status = MCDMA_FABRIC_TIMEOUT;
-        else status = connect_lane(f->part[k], links[count == 1 ? 0 : k], ports[k], peer_ports[k],
+        else status = connect_lane(f->part[k], links[count == 1 ? 0 : k % (unsigned)f->devices], local[k], remote[k],
                                    link_name, deadline - now, p, k, &p->part[k]);
     }
-    for (unsigned k = 1; !status && k < nports; ++k)
+    for (unsigned k = 1; !status && k < lanes; ++k)
         if (memcmp(p->part[0]->x.peer_session, p->part[k]->x.peer_session, 16) ||
             p->part[0]->remote_length != p->part[k]->remote_length ||
             p->part[0]->remote.base != p->part[k]->remote.base) status = MCDMA_FABRIC_PEER;
@@ -704,23 +704,23 @@ int mcdma_fabric_connect_links(struct mcdma_fabric *f, const char *via, const ui
     pthread_mutex_unlock(&f->lock);
     if (status) {
         mark_down(p);
-        for (unsigned k = 0; k < nports; ++k) mcdma_fabric_disconnect(&p->part[k]);
+        for (unsigned k = 0; k < lanes; ++k) mcdma_fabric_disconnect(&p->part[k]);
         free(p->pending);
-        for (unsigned k = 0; k < nports; ++k) free(p->tails[k]);
+        for (unsigned k = 0; k < lanes; ++k) free(p->tails[k]);
         pthread_mutex_destroy(&p->rx_lock);
-        free(p);
+        free(p); unreserve_peer(f);
         return status;
     }
-    *out = p;
+    p->reserved = 1; *out = p;
     return MCDMA_FABRIC_OK;
 }
 
-unsigned mcdma_fabric_max_links(void) { return BOND_LINKS; }
+unsigned mcdma_fabric_max_links(void) { return MCDMA_FABRIC_MAX_LINKS; }
 
 int mcdma_fabric_connect(struct mcdma_fabric *f, const char *via, int port, int peer_port, const char *name,
                          uint64_t timeout_ns, struct mcdma_fabric_peer **out) {
     if (out) *out = NULL;
-    unsigned n = f ? (unsigned)(f->bonded ? f->bonded : 1) : 0;
+    unsigned n = f ? (unsigned)f->devices : 0;
     if (!n || port < 1 || port > 65536 - (int)n || peer_port < 0 ||
         (peer_port && peer_port > 65536 - (int)n)) return MCDMA_FABRIC_INVALID;
     uint16_t ports[BOND_LINKS], peers[BOND_LINKS];
@@ -842,6 +842,13 @@ static void bond_remember(struct mcdma_fabric_peer *p, uint64_t off, uint64_t le
         p->floored = 1, p->nranges = 0;
     }
     p->ranges[p->nranges++] = r;
+}
+
+/* A signal covers every earlier payload range, not just the word it stores. A later overlapping copy must
+ * wait for that signal's publication as well as its payload prefixes. Conservative folds keep this dependency. */
+static void bond_flagged(struct mcdma_fabric_peer *p) {
+    if (p->floored) p->floor.signal = 1;
+    for (unsigned i = 0; i < p->nranges; ++i) p->ranges[i].signal = 1;
 }
 
 /* For a plain write, which has no wait of its own: overwriting bytes that only one link carried stays on that link's
@@ -1092,6 +1099,7 @@ static int bond_post(struct mcdma_fabric_peer *p, const struct bond_plan *plan, 
     if (rest) mine[t] = need[t];
     bond_remember(p, roff, len, mine, 0);
     bond_remember(p, soff, 8, (uint64_t[BOND_LINKS]){0, 0}, 1);
+    bond_flagged(p);
     return 0;
 }
 
@@ -1118,6 +1126,7 @@ static int bond_signal_locked(struct mcdma_fabric_peer *p, uint64_t off, uint64_
                 p->tx_signal++;
                 /* a later write over this word waits for the signal at the receiver, or fences */
                 bond_remember(p, off, 8, (uint64_t[BOND_LINKS]){0, 0}, 1);
+                bond_flagged(p);
                 return 0;
             }
         }
@@ -1165,6 +1174,13 @@ static int bond_write_signal_locked(struct mcdma_fabric_peer *p, uint64_t off, u
 }
 
 unsigned mcdma_fabric_link_count(const struct mcdma_fabric_peer *p) { return !p ? 0 : p->bonded ? (unsigned)p->bonded : 1; }
+
+unsigned mcdma_fabric_device_count(const struct mcdma_fabric_peer *p) {
+    return p ? (unsigned)(p->bond ? p->bond : p)->f->devices : 0;
+}
+unsigned mcdma_fabric_qps_per_device(const struct mcdma_fabric_peer *p) {
+    return p ? (unsigned)(p->bond ? p->bond : p)->f->qps : 0;
+}
 
 int mcdma_fabric_link_stats(const struct mcdma_fabric_peer *p, unsigned index,
                             struct mcdma_fabric_link_stats *out) {
@@ -1316,6 +1332,7 @@ void mcdma_fabric_disconnect(struct mcdma_fabric_peer **pp) {
     enter(f);
     for (int i = 0; i < f->npeers; ++i)
         if (f->peers[i] == p) f->peers[i] = f->peers[--f->npeers];
+    if (p->reserved) { f->reserved--; p->reserved = 0; }
     pthread_mutex_unlock(&f->lock);
     if (p->bonded) {
         mark_down(p);
@@ -1340,14 +1357,32 @@ void mcdma_fabric_close(struct mcdma_fabric **ff) {
         mcdma_fabric_disconnect(&p);
     }
     if (f->bonded) {
-        for (unsigned k = 0; k < (unsigned)f->bonded; ++k) mcdma_fabric_close(&f->part[k]);
-    } else ep_close(&f->dev);
+        for (unsigned k = (unsigned)f->bonded; k > 0; --k) mcdma_fabric_close(&f->part[k - 1]);
+    } else if (!f->shared) ep_close(&f->dev);
     pthread_mutex_destroy(&f->lock);
     free(f);
     *ff = NULL;
 }
 
 #ifdef MCDMA_FABRIC_TESTING
+void mcdma_fabric_test_observe_signal(struct mcdma_fabric_peer *p,
+    void (*observer)(void *, const unsigned char *, uint64_t, uint64_t), void *arg) {
+    pthread_mutex_lock(&p->rx_lock);
+    p->signal_observer = observer; p->observer_arg = arg;
+    pthread_mutex_unlock(&p->rx_lock);
+}
+
+/* Snapshot under every receive-placement lock, so a test may inspect an unpublished flag without a data race. */
+void mcdma_fabric_test_snapshot(struct mcdma_fabric_peer *p, unsigned char *dst, uint64_t off, size_t len,
+                                uint64_t soff, uint64_t *flag, uint64_t *placed) {
+    unsigned n = (unsigned)p->bonded;
+    for (unsigned k = 0; k < n; ++k) enter(p->part[k]->f);
+    memcpy(dst, p->f->win.base + off, len);
+    *flag = __atomic_load_n((uint64_t *)(void *)(p->f->win.base + soff), __ATOMIC_ACQUIRE);
+    for (unsigned k = 0; k < n; ++k) placed[k] = __atomic_load_n(&p->placed[k].count, __ATOMIC_ACQUIRE);
+    for (unsigned k = n; k > 0; --k) pthread_mutex_unlock(&p->part[k - 1]->f->lock);
+}
+
 /* Offline tests plan a bonded write_signal without links: each link's queued bytes, rate and largest message. */
 int mcdma_fabric_test_plan(const struct region *win, const uint64_t backlog[2], const uint64_t rate[2],
                            const uint64_t max[2], uint64_t off, uint64_t len, unsigned *turn, unsigned *head,

@@ -11,6 +11,8 @@
 
 #define MCDMA_FABRIC_ABI 1u
 #define MCDMA_FABRIC_MAX_LINKS 8u
+#define MCDMA_FABRIC_MAX_QPS 3u
+#define MCDMA_FABRIC_MAX_LANES (MCDMA_FABRIC_MAX_LINKS * MCDMA_FABRIC_MAX_QPS)
 #if defined(__GNUC__)
 #define MCDMA_FABRIC_API __attribute__((visibility("default")))
 #else
@@ -46,20 +48,29 @@ MCDMA_FABRIC_API uint32_t mcdma_fabric_abi(void);
  * distinct Thunderbolt devices and registers the same window on all. A bond always starts one
  * progress thread per link. Single-link strings and ABI 1 are unchanged. On Linux, dmabuf_fd >= 0 registers that
  * DMA-BUF from dmabuf_offset instead, `window` being its CPU mapping; elsewhere it is UNSUPPORTED.
- * gid_index -1 scans each Thunderbolt data device for a nonzero GID, preferring IPv6 link-local. */
+ * gid_index -1 scans each Thunderbolt data device for a nonzero GID, preferring IPv6 link-local.
+ * MCDMA_FABRIC_QPS=1..3 requests an exact width; unset selects two if all devices support it, else one.
+ * Window registrations are shared across each device's QPs. Local peers reserve Q against its cap, at most three;
+ * provider creation enforces QPs held by other contexts/processes. */
 MCDMA_FABRIC_API int mcdma_fabric_open(const char *device, int gid_index, int path_mtu, void *window, size_t length,
                                        int dmabuf_fd, uint64_t dmabuf_offset, uint32_t flags, struct mcdma_fabric **out);
+/* Explicit QPs per physical device; 0 selects the supported default of two, 1..3 requests that exact width. */
+MCDMA_FABRIC_API int mcdma_fabric_open_qps(const char *device, int gid_index, int path_mtu, void *window, size_t length,
+                                         int dmabuf_fd, uint64_t dmabuf_offset, uint32_t flags, unsigned qps,
+                                         struct mcdma_fabric **out);
 
 /* Meet over `via`: IFACE, IFACE/fe80::ADDR or IFACE/IPv4 to admit only that address. A bond accepts N entries
  * joined by '+', in device order, e.g. "en3/192.0.2.10+en4/198.51.100.10". Both ends must bond the corresponding links
  * and call with the same name. One meeting via on an existing active Thunderbolt interface also works for all data devices,
  * even when that device is outside the data list.
- * Lane k binds UDP port+k and sends to peer_port+k (0 means port). Both ends must use the same N-aware wire build.
+ * Lane k binds UDP port+k and sends to peer_port+k (0 means port), in QP-major order across N*Q lanes.
+ * Multi-QP peers check both N and Q and refuse old bond wire formats.
  * Returns once every queue pair is at RTS and all links name the same remote peer. */
 MCDMA_FABRIC_API int mcdma_fabric_connect(struct mcdma_fabric *f, const char *via, int port, int peer_port,
                                           const char *name, uint64_t timeout_ns, struct mcdma_fabric_peer **out);
 
-/* Additive ABI 1: physical ports in device order, with one via for the meeting or one per device. */
+/* N physical base ports, or N*Q explicit lane ports. With N bases, QP q uses base[d] plus
+ * q*(max(base)-min(base)+1). Local and peer blocks must fit u16. Vias stay one or N physical entries. */
 MCDMA_FABRIC_API int mcdma_fabric_connect_links(struct mcdma_fabric *f, const char *via, const uint16_t *ports,
                                                const uint16_t *peer_ports, unsigned nports, const char *name,
                                                uint64_t timeout_ns, struct mcdma_fabric_peer **out);
@@ -77,12 +88,14 @@ MCDMA_FABRIC_API uint64_t mcdma_fabric_peer_length(const struct mcdma_fabric_pee
  * up, so a caller spinning on a window word can poll it. */
 MCDMA_FABRIC_API int mcdma_fabric_peer_status(const struct mcdma_fabric_peer *p, char *why, size_t n);
 
-/* Additive ABI 1 diagnostics: one link for an ordinary peer, N for a bond; NULL has zero. Counts are write payload
+/* Additive ABI 1 diagnostics: N*Q lanes, index q*N+d; NULL has zero. Counts are write payload
  * bytes, excluding headers, signals and fence traffic. Local SEND completion is not proof of remote placement;
  * the API requires flush before source reuse. RoCE completed_bytes is published at successful flush. Index order
  * is the device/via string order. */
 struct mcdma_fabric_link_stats { uint64_t posted_bytes, completed_bytes; };
 MCDMA_FABRIC_API unsigned mcdma_fabric_link_count(const struct mcdma_fabric_peer *p);
+MCDMA_FABRIC_API unsigned mcdma_fabric_device_count(const struct mcdma_fabric_peer *p);
+MCDMA_FABRIC_API unsigned mcdma_fabric_qps_per_device(const struct mcdma_fabric_peer *p);
 MCDMA_FABRIC_API int mcdma_fabric_link_stats(const struct mcdma_fabric_peer *p, unsigned index,
                                             struct mcdma_fabric_link_stats *out);
 
