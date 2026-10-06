@@ -33,7 +33,7 @@ static int bond_parallel(struct mcdma_fabric_peer *p, uint64_t off, uint64_t rof
         if (len <= TB_PACKET - (48 + n * 8)) {
             uint64_t need[BOND_LINKS] = {0}; bond_watermarks(p, need); need[k]++;
             enter(p->part[k]->f);
-            int bad = tb_bond_inline_n(&p->part[k]->e, &p->part[k]->f->win, off, roff, len,
+            int bad = tb_bond_inline_n(&p->part[k]->e, &p->part[k]->win, off, roff, len,
                                         soff, value, p->tx_signal + 1, need, wait, n,
                                         signalled ? BOND_WAIT_SIGNALS : 0, OP_NS);
             pthread_mutex_unlock(&p->part[k]->f->lock);
@@ -45,7 +45,7 @@ static int bond_parallel(struct mcdma_fabric_peer *p, uint64_t off, uint64_t rof
             return 0;
         }
         enter(p->part[k]->f);
-        int bad = tb_bond_write_n(&p->part[k]->e, &p->part[k]->f->win, off, roff, len,
+        int bad = tb_bond_write_n(&p->part[k]->e, &p->part[k]->win, off, roff, len,
                                    p->tx_signal + 1, wait, n, signalled ? BOND_WAIT_SIGNALS : 0, OP_NS);
         ordinal[k] = tb_writes_posted(&p->part[k]->e);
         pthread_mutex_unlock(&p->part[k]->f->lock);

@@ -139,11 +139,14 @@ Unset `MCDMA_FABRIC_QPS` selects two per Thunderbolt device if all advertise sup
 its choice logged. Set 1, 2 or 3 for an exact width, or use `mcdma_fabric_open_qps` with Q=0 for default and Q=1..3
 for explicit selection independent of the environment. RoCE retains one QP. Unsupported widths refuse.
 
-One context, PD and window registration set belongs to each physical device; its QP lanes share those registrations
-and have independent QPs, CQs, rings, locks and progress threads. Shared lanes close before their device owner.
-Local simultaneous peer reservations count Q per connection against the reported cap, capped at three; provider
-allocation also enforces QPs held by other contexts/processes. A partial connect unwinds all allocated QPs and
-its reservation. Q=2 or 3 therefore permits only one peer per physical device in a fabric. Any failed QP fails the peer.
+Every Thunderbolt connection owns its context, PD, window registrations, QP, CQ, ring and placement lock. The
+QP-free admission registration is released on first connect so it is not charged alongside active connections.
+This avoids sharing the provider's queue mappings between QPs; window bytes are still the same caller allocation.
+Multiple connections consume more of the device's MR budget. With Q=2 each window's registrations count twice,
+plus the rings, so a configuration that exhausts that budget refuses rather than silently dropping QPs.
+Local simultaneous peer reservations count Q per connection against the reported cap, capped at three;
+provider allocation also enforces other contexts/processes. A partial connect unwinds all allocations and its
+reservation. Q=2 or 3 permits only one peer per physical device in a fabric. Any failed QP fails the peer.
 
 Devices and vias still describe N physical members. Base connect reserves N*Q consecutive UDP ports. Explicit
 N-port arrays reserve further QPs in disjoint blocks, stride max(base)-min(base)+1; N*Q arrays name every lane.

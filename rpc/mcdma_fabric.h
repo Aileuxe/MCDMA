@@ -50,7 +50,8 @@ MCDMA_FABRIC_API uint32_t mcdma_fabric_abi(void);
  * DMA-BUF from dmabuf_offset instead, `window` being its CPU mapping; elsewhere it is UNSUPPORTED.
  * gid_index -1 scans each Thunderbolt data device for a nonzero GID, preferring IPv6 link-local.
  * MCDMA_FABRIC_QPS=1..3 requests an exact width; unset selects two if all devices support it, else one.
- * Window registrations are shared across each device's QPs. Local peers reserve Q against its cap, at most three;
+ * Admission registrations are released on first connect. Each Thunderbolt connection owns an exclusive
+ * context, PD and window registrations, avoiding shared provider queue mappings. Local peers reserve Q against its cap, at most three;
  * provider creation enforces QPs held by other contexts/processes. */
 MCDMA_FABRIC_API int mcdma_fabric_open(const char *device, int gid_index, int path_mtu, void *window, size_t length,
                                        int dmabuf_fd, uint64_t dmabuf_offset, uint32_t flags, struct mcdma_fabric **out);

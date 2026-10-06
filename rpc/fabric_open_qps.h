@@ -6,6 +6,7 @@ static int open_member(const char *device, int gid, int mtu, void *window, size_
     if (!f) return MCDMA_FABRIC_NOMEM;
     pthread_mutex_init(&f->lock, NULL);
     f->devices = f->qps = 1;
+    f->registration_owner = owner ? owner : f;
     f->wait_poll = !getenv("MCDMA_FABRIC_WAIT_POLL") || strcmp(getenv("MCDMA_FABRIC_WAIT_POLL"), "0");
     int status = MCDMA_FABRIC_OK;
     if (owner) { f->shared = 1; f->dev = owner->dev; f->win = owner->win; }

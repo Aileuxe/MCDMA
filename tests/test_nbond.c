@@ -23,6 +23,7 @@ void stub_tb_hold_qp_completions(const char *, unsigned, int);
 void stub_tb_fail_qp(const char *, unsigned);
 unsigned stub_tb_live_qps(const char *);
 unsigned stub_tb_live_mrs(const char *);
+unsigned stub_tb_live_contexts(const char *);
 void stub_tb_hold_nth_send(const char *, unsigned, unsigned);
 void mcdma_fabric_test_observe_signal(struct mcdma_fabric_peer *,
     void (*)(void *, const unsigned char *, uint64_t, uint64_t), void *);
@@ -233,6 +234,14 @@ int main(int argc, char **argv) {
         puts("mismatched QP widths refused and all resources released"); return 0;
     }
     CHECK(!r[0].status && !r[1].status);
+    if (getenv("NBOND_CLOSE_ONLY")) {
+        for (unsigned rank = 0; rank < 2; ++rank) { mcdma_fabric_close(&r[rank].f); munmap(r[rank].w, WINDOW); }
+        for (unsigned rank = 0; rank < 2; ++rank) for (unsigned d = 0; d < n; ++d) {
+            char name[12]; snprintf(name, sizeof(name), "tb%u", 2 * d + rank);
+            CHECK(!stub_tb_live_contexts(name) && !stub_tb_live_qps(name) && !stub_tb_live_mrs(name));
+        }
+        puts("exclusive connection mappings unmapped once and all contexts closed"); return 0;
+    }
     CHECK(mcdma_fabric_link_count(r[0].p) == lanes);
     CHECK(mcdma_fabric_device_count(r[0].p) == n && mcdma_fabric_qps_per_device(r[0].p) == qps);
     if (qps > 1) {
@@ -244,7 +253,8 @@ int main(int argc, char **argv) {
     for (unsigned rank = 0; rank < 2; ++rank) for (unsigned d = 0; d < n; ++d) {
         char name[12]; snprintf(name, sizeof(name), "tb%u", 2 * d + rank);
         CHECK(stub_tb_live_qps(name) == qps);
-        CHECK(stub_tb_live_mrs(name) == 2 + qps); /* two window registrations shared by every QP, plus one ring each */
+        CHECK(stub_tb_live_mrs(name) == 3 * qps); /* admission retired; each connection has two window MRs and one ring */
+        CHECK(stub_tb_live_contexts(name) == qps + 1); /* QP-free admission context plus exclusive connections */
     }
     if (qps > 1) {
         struct mcdma_fabric_peer *extra = NULL;
@@ -298,6 +308,7 @@ int main(int argc, char **argv) {
     for (unsigned rank = 0; rank < 2; ++rank) for (unsigned d = 0; d < n; ++d) {
         char name[12]; snprintf(name, sizeof(name), "tb%u", 2 * d + rank);
         CHECK(stub_tb_live_qps(name) == 0 && stub_tb_live_mrs(name) == 0);
+        CHECK(stub_tb_live_contexts(name) == 0);
     }
     printf("N-bond %u x %u: split, payloads, delayed reassembly, overlap, ports, auto GIDs and fail-closed passed\n", n, qps);
     return 0;

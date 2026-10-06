@@ -25,7 +25,7 @@
 #define TB_MAX_MSG 16773120u
 #define TB_QPS 3
 
-struct sctx { struct ibv_context c; int dev; };
+struct sctx { struct ibv_context c; int dev, qp_map, cq_map, qps, cqs, pds; };
 struct spd { struct ibv_pd pd; int dev; };
 struct smr { struct ibv_mr mr; int dev, access, live; };
 struct scq { struct ibv_cq cq; struct ibv_wc *ring; int cap, head, count, destroyed; };
@@ -42,6 +42,7 @@ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static struct smr *g_mr[MAXMR];
 static struct sqp *g_qp[MAXQP];
 static int g_nmr, g_nqp, g_mrs[NDEV], g_uc[NDEV];
+static unsigned g_contexts[NDEV];
 static uint64_t g_rand;
 static int g_hold[NDEV], g_hold_completions[NDEV], g_failed[NDEV];
 static unsigned g_pace[NDEV], g_pumps;
@@ -103,6 +104,9 @@ unsigned stub_tb_live_qps(const char *name) {
 }
 unsigned stub_tb_live_mrs(const char *name) {
     pthread_mutex_lock(&g_mu); unsigned n = (unsigned)g_mrs[device_index(name)]; pthread_mutex_unlock(&g_mu); return n;
+}
+unsigned stub_tb_live_contexts(const char *name) {
+    pthread_mutex_lock(&g_mu); unsigned n = g_contexts[device_index(name)]; pthread_mutex_unlock(&g_mu); return n;
 }
 
 uint64_t stub_tb_sent_bytes(const char *name) {
@@ -279,6 +283,7 @@ static int stub_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_
         if (!(wr->send_flags & IBV_SEND_SIGNALED)) die("an unsignaled send");
         struct ibv_sge *s = &wr->sg_list[0];
         check_local(s->lkey, s->addr, s->length, q->dev, 0);
+        if (find(s->lkey)->mr.pd != qp->pd) die("a SEND lkey belongs to another protection domain");
         void *local = (void *)(uintptr_t)s->addr, *remote = (void *)(uintptr_t)wr->wr.rdma.remote_addr;
         if (is_tb(q->dev)) {
             if (wr->opcode != IBV_WR_SEND) die("Thunderbolt RDMA lands every request in the next receive: only SEND");
@@ -324,6 +329,7 @@ static int stub_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr, struct ibv_
         if (wr->num_sge != 1) die("a receive with other than one scatter entry");
         struct ibv_sge *s = &wr->sg_list[0];
         check_local(s->lkey, s->addr, s->length, q->dev, 1);
+        if (find(s->lkey)->mr.pd != qp->pd) die("a RECV lkey belongs to another protection domain");
         if (s->length > PACKET) die("a receive larger than 4096 bytes: Thunderbolt completes it with an error");
         if (q->recv.count == q->recv.cap) die("a Thunderbolt receive queue overrun");
         enqueue(&q->recv, wr->wr_id, s->addr, s->length);
@@ -354,9 +360,16 @@ struct ibv_context *ibv_open_device(struct ibv_device *d) {
     c->c.ops.poll_cq = stub_poll;
     c->c.ops.post_send = stub_post_send;
     c->c.ops.post_recv = stub_post_recv;
+    pthread_mutex_lock(&g_mu); g_contexts[c->dev]++; pthread_mutex_unlock(&g_mu);
     return &c->c;
 }
 int ibv_close_device(struct ibv_context *c) {
+    struct sctx *ctx = (struct sctx *)c;
+    pthread_mutex_lock(&g_mu);
+    if (ctx->qps || ctx->cqs || ctx->pds || ctx->qp_map || ctx->cq_map) die("closing a context with live resources or mappings");
+    for (int i = 0; i < g_nmr; ++i) if (g_mr[i]->live && g_mr[i]->mr.context == c) die("closing a context with a live MR");
+    g_contexts[ctx->dev]--;
+    pthread_mutex_unlock(&g_mu);
     free(c);
     return 0;
 }
@@ -399,9 +412,15 @@ struct ibv_pd *ibv_alloc_pd(struct ibv_context *c) {
     struct spd *p = calloc(1, sizeof(*p));
     p->pd.context = c;
     p->dev = ((struct sctx *)c)->dev;
+    pthread_mutex_lock(&g_mu); ((struct sctx *)c)->pds++; pthread_mutex_unlock(&g_mu);
     return &p->pd;
 }
 int ibv_dealloc_pd(struct ibv_pd *p) {
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < g_nqp; ++i) if (!g_qp[i]->destroyed && g_qp[i]->qp.pd == p) die("deallocating PD with a live QP");
+    for (int i = 0; i < g_nmr; ++i) if (g_mr[i]->live && g_mr[i]->mr.pd == p) die("deallocating PD with a live MR");
+    ((struct sctx *)p->context)->pds--;
+    pthread_mutex_unlock(&g_mu);
     free(p);
     return 0;
 }
@@ -456,6 +475,10 @@ struct ibv_cq *ibv_create_cq(struct ibv_context *ctx, int cqe, void *cq_context,
     struct scq *c = calloc(1, sizeof(*c));
     c->cq.context = ctx, c->cq.cqe = cqe, c->cap = cqe;
     c->ring = calloc((size_t)cqe, sizeof(*c->ring));
+    pthread_mutex_lock(&g_mu);
+    ((struct sctx *)ctx)->cqs++;
+    if (getenv("STUB_CONTEXT_MAP_ALIAS")) ((struct sctx *)ctx)->cq_map = 1;
+    pthread_mutex_unlock(&g_mu);
     return &c->cq;
 }
 int ibv_destroy_cq(struct ibv_cq *cq) {
@@ -466,6 +489,12 @@ int ibv_destroy_cq(struct ibv_cq *cq) {
         if (!g_qp[i]->destroyed && (g_qp[i]->qp.send_cq == cq || g_qp[i]->qp.recv_cq == cq))
             die("destroying a CQ that a live QP still uses");
     c->destroyed = 1;
+    struct sctx *ctx = (struct sctx *)cq->context;
+    if (getenv("STUB_CONTEXT_MAP_ALIAS")) {
+        if (!ctx->cq_map) die("provider context CQ mapping unmapped twice");
+        ctx->cq_map = 0;
+    }
+    ctx->cqs--;
     pthread_mutex_unlock(&g_mu);
     return 0;
 }
@@ -494,6 +523,8 @@ struct ibv_qp *ibv_create_qp(struct ibv_pd *pd, struct ibv_qp_init_attr *init) {
     q->send.v = calloc(q->send.cap, sizeof(struct swr));
     q->recv.v = calloc(q->recv.cap, sizeof(struct swr));
     g_qp[g_nqp++] = q;
+    ((struct sctx *)pd->context)->qps++;
+    if (getenv("STUB_CONTEXT_MAP_ALIAS")) ((struct sctx *)pd->context)->qp_map = 1;
     pthread_mutex_unlock(&g_mu);
     return &q->qp;
 }
@@ -542,6 +573,12 @@ int ibv_destroy_qp(struct ibv_qp *qp) {
     if (q->destroyed) die("double destroy of a QP");
     if (q->send.count || q->recv.count) die("destroying a QP with requests posted; move it to the error state first");
     q->destroyed = 1;
+    struct sctx *ctx = (struct sctx *)qp->context;
+    if (getenv("STUB_CONTEXT_MAP_ALIAS")) {
+        if (!ctx->qp_map) die("provider context QP mapping unmapped twice");
+        ctx->qp_map = 0;
+    }
+    ctx->qps--;
     if (is_tb(q->dev)) g_uc[q->dev]--;
     pthread_mutex_unlock(&g_mu);
     return 0;
