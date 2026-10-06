@@ -14,14 +14,14 @@
  *   bond-fail one failed child poisons the whole bonded peer
  *   bond-credit a bounded receiver's pending-signal queue backpressures the sender
  *   bond-small small writes stay on one link, also at tiny queue depths and registration boundaries; a
- *             16 KiB write-and-signal is cut across both
+ *             40 KiB write-and-signal is cut across both
  *   bond-wait a failed peer does not poison an unrelated live peer's flag wait
  *   bond-names public 19- and 20-character names fit the internal lane names
  *   zero      a zero-length write_signal is a signal on every link kind and leaves the peer up
  *   down      a failed link's end tells the other, which reports why within a second, even mid-flush
  *   bond-down one failed link of a bond takes the whole peer down at both ends, with the reason
  *   bond-plan the cut: both links finish together by rate and queue, whole packets, registrations, magic, limits
- *   bond-stripe 16 KiB to 3 MiB write-and-signals go as exactly one message on each link; the flag waits for both
+ *   bond-stripe below-threshold writes stay whole; larger parts post concurrently and their flag waits for both
  *   bond-pingpong a tensor-parallel exchange: both ranks write-and-signal 10-160 KB and spin on the flag word while
  *             another thread signals; every byte checked, both links carry the traffic, small ones alternate
  *   bond-later a later write-and-signal cut differently, or over a word an earlier signal stores, still wins
@@ -550,7 +550,7 @@ static void small_lanes(struct rank *a, struct rank *b, uint64_t off, uint64_t l
     uint64_t n1 = after[1].posted_bytes - before[1].posted_bytes;
     if (links == 1)
         CHECK((n0 == len && !n1) || (n1 == len && !n0), "all chunks of one small call use one physical link");
-    else CHECK(n0 && n1 && n0 + n1 == len, "a write-and-signal of 16 KiB is cut across both links");
+    else CHECK(n0 && n1 && n0 + n1 == len, "a write-and-signal at the split threshold is cut across both links");
     CHECK(after[0].completed_bytes == after[0].posted_bytes && after[1].completed_bytes == after[1].posted_bytes,
           "bounded small writes leave no outstanding payload");
 }
@@ -558,12 +558,13 @@ static void small_lanes(struct rank *a, struct rank *b, uint64_t off, uint64_t l
 static void scenario_bond_small(void) {
     struct rank a, b;
     open_bond_pair(&a, &b);
-    /* Parallel parts keep using both links when a shallow queue cuts each part into smaller payload messages. */
+    /* Small calls keep one member even at registration and shallow-queue boundaries. */
     small_lanes(&a, &b, WINDOW / 2 + MCDMA_FABRIC_WS_ROOM, 16384, 1, 0, 1);
-    small_lanes(&a, &b, WINDOW / 2 + MCDMA_FABRIC_WS_ROOM, 16384, 2, 1, 2);
+    small_lanes(&a, &b, WINDOW / 2 + MCDMA_FABRIC_WS_ROOM, 16384, 2, 1, 1);
     small_lanes(&a, &b, WINDOW / 2 + MCDMA_FABRIC_WS_ROOM, 16383, 3, 1, 1);
     small_lanes(&a, &b, (12ull << 20) - 4096, 8192, 4, 0, 1);
     small_lanes(&a, &b, (12ull << 20) - 4096, 8192, 5, 1, 1);
+    small_lanes(&a, &b, (12ull << 20) - 4096, 40959, 6, 1, 1);
     close_pair(&a, &b);
 }
 
@@ -764,13 +765,13 @@ static void scenario_bond_plan(void) {
     const uint64_t off = WINDOW / 2 + MCDMA_FABRIC_WS_ROOM;
     unsigned turn = 0, head = 9, prev;
     uint64_t first = 0;
-    /* under 16 KiB: whole, and idle links of one speed take turns */
+    /* under 40 KiB: whole, and idle links of one speed take turns */
     CHECK(!mcdma_fabric_test_plan(&win, idle, even, max, off, 10240, &turn, &head, &first) && first == 10240,
           "a 10 KB write-and-signal goes whole");
     prev = head;
     CHECK(!mcdma_fabric_test_plan(&win, idle, even, max, off, 10240, &turn, &head, &first) && head != prev,
           "the next one takes the other idle link");
-    const uint64_t sizes[] = {16384, 40960, 163840, 1ull << 20, 3ull << 20};
+    const uint64_t sizes[] = {40960, 163840, 1ull << 20, 3ull << 20};
     for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
         uint64_t len = sizes[i];
         CHECK(!mcdma_fabric_test_plan(&win, idle, even, max, off, len, &turn, &head, &first), "a cut is planned");
@@ -850,14 +851,15 @@ static void scenario_bond_stripe(void) {
         for (unsigned k = 0; k < 2; ++k) CHECK(!mcdma_fabric_link_stats(a.p, k, &before[k]), "counters before");
         fill(&a, src, len, i + 1);
         CHECK(!mcdma_fabric_write_signal(a.p, src, 0, len, FLAG, i + 1), "a bonded write-and-signal posts");
-        CHECK(!whole || (stub_tb_sends("tb0") >= sends[0] + 2 && stub_tb_sends("tb2") >= sends[1] + 2),
+        CHECK(!whole || len < 40960 || (stub_tb_sends("tb0") >= sends[0] + 2 && stub_tb_sends("tb2") >= sends[1] + 2),
               "each link posts a control header and payload");
         spin_flag(&b, FLAG, i + 1, "the flag arrives");
         CHECK(landed(&b, 0, len, 0, i + 1), "every byte precedes the flag");
         for (unsigned k = 0; k < 2; ++k) CHECK(!mcdma_fabric_link_stats(a.p, k, &after[k]), "counters after");
         uint64_t n0 = after[0].posted_bytes - before[0].posted_bytes;
         uint64_t n1 = after[1].posted_bytes - before[1].posted_bytes;
-        CHECK(n0 && n1 && n0 + n1 == len, "both links carry a share and nothing else");
+        CHECK(n0 + n1 == len, "payload accounting excludes headers");
+        CHECK(len < 40960 ? ((!n0) != (!n1)) : (n0 && n1), "below threshold stays whole, otherwise both links carry a share");
     }
     /* the flag waits for the part on a link whose receiver is held, whichever part that is (writes too large to
      * cut would instead fence the overlap and wait for the held link inside the call) */

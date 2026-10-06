@@ -104,7 +104,7 @@ at `port` and `peer_port`, with zero peer_port meaning the local base. The addit
 `mcdma_fabric_max_links` reports the supported maximum. Old single-link callers retain their ABI and wire protocol.
 Bonds negotiate a new mode and N plus lane position; both ends must use this build. Mixed old/new bonds refuse.
 
-Each member owns a progress thread. `write_signal` of at least 16 KiB divides the source into N contiguous parts,
+Each member owns a progress thread. `write_signal` of at least 40 KiB divides the source into N contiguous parts,
 with at least 2 KiB per part and 64-byte cuts. Recent rates influence the cut, clamped to 3:1. All workers prepare
 before one release lets them post concurrently. Each part carries an ordered control header and ordinary payload,
 split further at registration or message boundaries. A final signal names all N placement watermarks. This costs
@@ -162,10 +162,10 @@ How a write lands:
 4. On one physical link, `mcdma_fabric_write_signal` sends the head, the signal's offset and the bytes as one message
    from the window, its head written into the 64 bytes before the source, so a write and its flag cost one send
    instead of three. One that would span two registrations or outgrow the peer's ring goes as a write, then a signal.
-   A bond cuts one of 16 KiB or more into such a message on one link and a tail with no head on the other.
+   A bond splits writes of 40 KiB or more across N members with headers and a final watermarked signal.
 5. Each link's receiver takes whole messages from the ring in arrival order and copies each write's bytes into place.
-   A single-link signal is applied when its header is taken; a bonded signal waits for placement counts from both
-   links, and a tail for its announcement from the other link. Overlapping writes retain later-write-wins order, as
+   A single-link signal is applied when its header is taken; a bonded signal waits for placement counts from all
+   members. Overlapping writes retain later-write-wins order, as
    RC ordering gives on RoCE.
 6. Every header carries a sequence number. A lost or reordered message, bytes whose length differs from their header,
    a write outside the window or any unexpected completion fails the link instead of landing anywhere else.

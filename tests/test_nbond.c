@@ -89,7 +89,7 @@ int main(int argc, char **argv) {
     connect_peer(&r[0]); pthread_join(th, NULL);
     CHECK(!r[0].status && !r[1].status);
     CHECK(mcdma_fabric_link_count(r[0].p) == n);
-    const size_t sizes[] = {64, 16384, 32769, 40960, 163840, 1 << 20};
+    const size_t sizes[] = {64, 16384, 32769, 40959, 40960, 40961, 163840, 1 << 20};
     unsigned tag = 0;
     for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
         size_t len = sizes[i], src = WINDOW / 2 + 64;
@@ -99,14 +99,16 @@ int main(int argc, char **argv) {
         CHECK(!mcdma_fabric_write_signal(r[0].p, src, 0, len, FLAG, tag));
         CHECK(!mcdma_fabric_wait(r[1].f, FLAG, tag, 5 * NS));
         CHECK(!memcmp(r[0].w + src, r[1].w, len));
-        uint64_t total = 0;
+        uint64_t total = 0; unsigned active = 0;
         for (unsigned k = 0; k < n; ++k) {
             CHECK(!mcdma_fabric_link_stats(r[0].p, k, &after[k]));
             uint64_t bytes = after[k].posted_bytes - before[k].posted_bytes;
-            if (len >= 16384) CHECK(bytes > 0);
+            active += bytes > 0;
+            if (len >= 40960) CHECK(bytes > 0);
             total += bytes;
         }
         CHECK(total == len);
+        if (len < 40960) CHECK(active == 1); /* no split overhead below the chosen threshold */
         CHECK(!mcdma_fabric_flush(r[0].p, 5 * NS));
     }
     /* One held member prevents publication, and a later overlapping write posts without a sender-side fence. */

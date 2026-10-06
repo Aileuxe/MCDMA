@@ -28,7 +28,7 @@
 #define BOND_CHUNK (256ull << 10)
 #define BOND_BACKLOG (4 * BOND_CHUNK) /* bound the slow-link tail instead of queueing half a large write there */
 #define BOND_SMALL (16ull << 10)
-#define BOND_SPLIT (16ull << 10)    /* a write_signal this long goes as one message on each link */
+#define BOND_SPLIT (40ull << 10)    /* measured endpoints predict a crossover near 32-36 KiB; qualify 40 KiB */
 #define BOND_PART 2048ull           /* the least either link carries of a write_signal cut across both */
 #define BOND_RATE 8000ull           /* bytes per microsecond assumed of a link that has not measured itself yet */
 #define BOND_ASK_NS 3000ull         /* a tail its link's thread has not taken by then, the sender posts itself */
@@ -1155,8 +1155,13 @@ static int bond_write_signal_locked(struct mcdma_fabric_peer *p, uint64_t off, u
         }
         if (bond_poll(p)) return -1;
     }
-    return bond_prepare(p, roff, len) || bond_write_locked(p, off, roff, len) || bond_signal_locked(p, soff, value) ? -1
-                                                                                                                  : 0;
+    if (bond_prepare(p, roff, len)) return -1;
+    if (len < BOND_SPLIT && p->affinity < 0) {
+        struct bond_load load[BOND_LINKS];
+        if (bond_look(p, load)) return -1;
+        p->affinity = (int)bond_pick(&p->turn, load, len);
+    }
+    return bond_write_locked(p, off, roff, len) || bond_signal_locked(p, soff, value) ? -1 : 0;
 }
 
 unsigned mcdma_fabric_link_count(const struct mcdma_fabric_peer *p) { return !p ? 0 : p->bonded ? (unsigned)p->bonded : 1; }
