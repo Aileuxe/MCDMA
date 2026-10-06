@@ -273,7 +273,8 @@ Every node must print `wrong=0`, `stalls=0` and the same hash; each ends with `P
 `build/rpc/fabric-check` runs on both machines of one link:
 
 ```bash
-fabric-check DEVICE GID_INDEX VIA PORT NAME RANK [ROUNDS [SIZES [SECONDS [PEER_PORT [MODE [PROGRESS [WAIT]]]]]]]
+fabric-check DEVICE GID_INDEX VIA PORT NAME RANK
+             [ROUNDS [SIZES [SECONDS [PEER_PORT [MODE [PROGRESS [WAIT [PATTERN [GAP_US]]]]]]]]]
 ```
 
 Both ranks give the same name, rounds and sizes (bytes, comma-separated; default `64,4096,14336,1048576`). At each size
@@ -287,9 +288,15 @@ calls, or `combined`, the Thunderbolt-only `write_signal` call. `PROGRESS` is `0
 progress thread; its default remains `0`, and a bond always has one thread per physical link. `WAIT` is `library`, the
 default, which waits in `mcdma_fabric_wait`, or `spin`, which spins on the window word as an engine does and leaves
 placement to the progress threads, so it needs `PROGRESS` 1; a spinning wait asks `mcdma_fabric_peer_status` every
-few thousand reads and fails at once if the peer is down. Metadata records ABI, device, interface, link count, mode,
-progress flag, QoS, cooperative polling, wait, requested stream duration and `build`, a checksum of the sources that
-`make` passes in (`unknown` otherwise), so two ranks can be checked for the same build.
+few thousand reads and fails at once if the peer is down. `PATTERN` is `pingpong`, the default, or `swap`, a
+tensor-parallel engine's exchange: both ranks write-and-signal their bytes at once and wait for each other's, and
+each rank times its own rounds from its send to the other's flag. Before each round each rank spins `GAP_US`
+microseconds, a stand-in for the GPU work between exchanges, or with `GAP_US` as `A,B` rank 0 spins A and rank 1
+spins B, as when one side's work runs longer. Nothing else sits between a flag and the next send: three slots a side
+let each rank fill its next bytes and check every byte of the other's previous round while a round is in flight, so
+swap sizes are capped at 2 MiB. Metadata records ABI, device, interface, link count, mode, progress flag, QoS,
+cooperative polling, wait, pattern, gap, requested stream duration and `build`, a checksum of the sources that `make`
+passes in (`unknown` otherwise), so two ranks can be checked for the same build.
 Both ping-pong source addresses leave the 64-byte header inside their registration, including the source near the
 48 MiB boundary of the Thunderbolt 12 MiB pieces, so small combined pings can use the fused send on both parities.
 

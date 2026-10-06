@@ -14,16 +14,17 @@
 
 int fabric_check(int argc, char **argv);
 uint64_t fabric_check_test_source(unsigned parity);
+uint64_t fabric_check_test_swap(uint64_t n, int src);
 
 struct rank {
-    char *argv[14];
+    char *argv[16];
     char port[8], peer[8], name[8];
     int status;
 };
 
 static void *run(void *arg) {
     struct rank *r = arg;
-    r->status = fabric_check(14, r->argv);
+    r->status = fabric_check(16, r->argv);
     return NULL;
 }
 
@@ -66,10 +67,21 @@ static int invalid_arguments(void) {
     }
     /* WAIT is library or spin, and spinning leaves placement to progress threads, so it needs PROGRESS 1 */
     char *w[] = {"fabric-check", "unused", "0", "unused", "20000", "check", "0", "1", "64", "0", "0", "split", "0",
-                 "spin"};
+                 "spin", "swap", "5"};
     if (fabric_check(14, w) != 2) return 1;
     w[12] = "1", w[13] = "nope";
-    return fabric_check(14, w) != 2;
+    if (fabric_check(14, w) != 2) return 1;
+    /* PATTERN is pingpong or swap, and GAP_US a number of microseconds up to a second */
+    w[13] = "spin", w[14] = "trade";
+    if (fabric_check(15, w) != 2) return 1;
+    w[14] = "swap", w[15] = "1000001";
+    if (fabric_check(16, w) != 2) return 1;
+    const char *gaps[] = {"-5", "5,", ",5", "5,6,7", "5,x", "1,1000001"};
+    for (unsigned i = 0; i < sizeof(gaps) / sizeof(*gaps); ++i) {
+        w[15] = (char *)gaps[i];
+        if (fabric_check(16, w) != 2) return 1;
+    }
+    return 0;
 }
 
 static int source_preflight(void) {
@@ -82,10 +94,21 @@ static int source_preflight(void) {
     }
     /* The former odd-parity address crosses this registration boundary with its source header. */
     uint64_t old = 3 * slot;
-    return (old - MCDMA_FABRIC_WS_ROOM) / TB_SEG == (old + sizes[1] - 1) / TB_SEG;
+    if ((old - MCDMA_FABRIC_WS_ROOM) / TB_SEG == (old + sizes[1] - 1) / TB_SEG) return 1;
+    /* a swap's three sources keep their heads and up to 2 MiB in one registration; its three landing slots hold 2 MiB
+     * each below the sources, and nothing reaches the flags */
+    for (uint64_t n = 0; n < 3; ++n) {
+        uint64_t src = fabric_check_test_swap(n, 1), dst = fabric_check_test_swap(n, 0);
+        if ((src - MCDMA_FABRIC_WS_ROOM) / TB_SEG != (src + (2ull << 20) - 1) / TB_SEG) return 1;
+        if (dst + (2ull << 20) > 2 * slot || src + (2ull << 20) > 4 * slot) return 1;
+        for (uint64_t m = 0; m < n; ++m)
+            if (fabric_check_test_swap(m, 1) + (2ull << 20) > src || fabric_check_test_swap(m, 0) + (2ull << 20) > dst)
+                return 1;
+    }
+    return 0;
 }
 
-static int pair(const char *lo, int tb, int bonded, int combined, int reverse, int spin) {
+static int pair(const char *lo, int tb, int bonded, int combined, int reverse, int spin, int swapping) {
     int lanes = bonded ? 2 : 1, ports[2];
     do { ports[0] = free_ports(lanes); } while (ports[0] < 0);
     do { ports[1] = free_ports(lanes); } while (ports[1] < 0 || abs(ports[0] - ports[1]) < lanes);
@@ -101,10 +124,10 @@ static int pair(const char *lo, int tb, int bonded, int combined, int reverse, i
         snprintf(r[i].name, sizeof(r[i].name), "%d", i);
         char *device = bonded ? (device_rank ? "tb1+tb3" : "tb0+tb2") :
                        tb ? (device_rank ? "tb1" : "tb0") : (device_rank ? "roce1" : "roce0");
-        char *args[14] = {"fabric-check", device, "0", via, r[i].port, "check", r[i].name, "8",
+        char *args[16] = {"fabric-check", device, "0", via, r[i].port, "check", r[i].name, "8",
                           "1,64,4096,10240,14336,40960,163840,1048576,13631491,16777216", "0.2", r[i].peer,
                           tb && combined ? "combined" : "split", combined || spin ? "1" : "0",
-                          spin ? "spin" : "library"};
+                          spin ? "spin" : "library", swapping ? "swap" : "pingpong", swapping ? "3,9" : "0"};
         memcpy(r[i].argv, args, sizeof(args));
         if (pthread_create(&t[i], NULL, run, &r[i])) return 1;
     }
@@ -127,7 +150,8 @@ int main(int argc, char **argv) {
     }
     if (!lo[0]) return 77;
     int tb = !strcmp(argv[1], "tb");
-    if (pair(lo, tb, 0, 0, 0, 0) || pair(lo, tb, 0, 1, 1, 0) || pair(lo, tb, 0, 1, 0, 1)) return 1;
-    return tb && (pair(lo, tb, 1, 0, 0, 0) || pair(lo, tb, 1, 1, 1, 0) || pair(lo, tb, 1, 1, 0, 1) ||
-                  pair(lo, tb, 1, 1, 1, 1));
+    if (pair(lo, tb, 0, 0, 0, 0, 0) || pair(lo, tb, 0, 1, 1, 0, 0) || pair(lo, tb, 0, 1, 0, 1, 0) ||
+        pair(lo, tb, 0, 1, 1, 1, 1) || pair(lo, tb, 0, 0, 0, 0, 1)) return 1;
+    return tb && (pair(lo, tb, 1, 0, 0, 0, 0) || pair(lo, tb, 1, 1, 1, 0, 0) || pair(lo, tb, 1, 1, 0, 1, 0) ||
+                  pair(lo, tb, 1, 1, 1, 1, 0) || pair(lo, tb, 1, 1, 0, 1, 1) || pair(lo, tb, 1, 0, 1, 0, 1));
 }

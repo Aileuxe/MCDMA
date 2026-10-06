@@ -1,9 +1,12 @@
 /* fabric-check: qualify a libmcdma-fabric link. Two ranks ping-pong writes and signals at each size, each checking
  * every byte the moment the signal arrives, then rank 0 streams to rank 1 for a bandwidth figure. Exit 0 only when
  * every byte checked out.
- *   fabric-check DEVICE GID_INDEX VIA PORT NAME RANK [ROUNDS [SIZES [SECONDS [PEER_PORT [MODE [PROGRESS [WAIT]]]]]]]
+ *   fabric-check DEVICE GID_INDEX VIA PORT NAME RANK
+ *                [ROUNDS [SIZES [SECONDS [PEER_PORT [MODE [PROGRESS [WAIT [PATTERN [GAP_US]]]]]]]]]
  * Both ranks give the same NAME, ROUNDS and SIZES; RANK is 0 or 1. SIZES are bytes, comma-separated. WAIT is library
- * (mcdma_fabric_wait) or spin: spin on the window word as an engine does, leaving placement to progress threads. */
+ * (mcdma_fabric_wait) or spin: spin on the window word as an engine does, leaving placement to progress threads.
+ * PATTERN is pingpong, or swap: both ranks send at once and wait for each other's, after GAP_US of work, or with
+ * GAP_US as A,B after A microseconds of work at rank 0 and B at rank 1, as when one side's work runs longer. */
 #ifdef __APPLE__
 #define _DARWIN_C_SOURCE 1
 #else
@@ -142,6 +145,40 @@ static uint64_t ping_source(unsigned parity) { return (2 + parity) * SLOT + MCDM
 uint64_t fabric_check_test_source(unsigned parity) { return ping_source(parity); }
 #endif
 
+/* Swap `rounds` rounds of `len` bytes (at most SWAP_MAX), as a tensor-parallel engine exchanges partials: each rank
+ * spins `gap_ns`, its stand-in for the GPU work between exchanges, then write-and-signals its bytes and waits for the
+ * other's, which posted at the same moment. Each rank times its own rounds from its send to the other's flag. As in an
+ * engine, no CPU work sits between the flag and the next send: three slots a side let each rank fill its next bytes
+ * and check every byte of the other's previous round while this round is in flight (the other writes a slot again
+ * only three rounds on, after this rank's next send). */
+#define SWAP_MAX (2ull << 20)
+#define SWAP_STRIDE (8ull << 20)    /* three slots in each half: sources keep their heads in one registration */
+static uint64_t swap_dst(uint64_t n) { return (n % 3) * SWAP_STRIDE; }
+static uint64_t swap_src(uint64_t n) { return 2 * SLOT + (n % 3) * SWAP_STRIDE + MCDMA_FABRIC_WS_ROOM; }
+
+static uint64_t swap(struct mcdma_fabric *f, struct mcdma_fabric_peer *p, unsigned char *w, int rank, uint64_t len,
+                     uint32_t rounds, uint64_t *round, uint64_t *times, int combined, int spin, uint64_t gap_ns) {
+    uint64_t bad = 0, first = *round + 1;
+    if (rounds) fill(w + swap_src(first), len, first, rank);
+    for (uint32_t r = 0; r < rounds; ++r) {
+        uint64_t n = ++*round;
+        for (uint64_t until = clock_ns() + gap_ns; gap_ns && clock_ns() < until;) {
+        }
+        uint64_t began = clock_ns();
+        if (send_payload(p, swap_src(n), swap_dst(n), len, PING, n, combined)) return ~0ull;
+        if (r + 1 < rounds) fill(w + swap_src(n + 1), len, n + 1, rank);
+        if (r) bad += wrong(w + swap_dst(n - 1), len, n - 1, !rank);
+        if (report(await(f, p, w, PING, n, 10 * SECOND, spin), "waiting for the other rank")) return ~0ull;
+        times[r] = clock_ns() - began;
+    }
+    if (rounds) bad += wrong(w + swap_dst(*round), len, *round, !rank);
+    return bad;
+}
+
+#ifdef FABRIC_CHECK_NO_MAIN
+uint64_t fabric_check_test_swap(uint64_t n, int src) { return src ? swap_src(n) : swap_dst(n); }
+#endif
+
 /* Ping-pong `rounds` rounds of `len` bytes; rank 0 times each round trip. Returns the words that landed wrong. The
  * round trip times the transport, as an engine's exchange runs: each rank fills its bytes before its round, rank 1
  * answers the moment the flag lands and checks every byte after answering (rank 0 writes that slot again only after
@@ -261,14 +298,15 @@ static int valid_sizes(const char *s) {
 }
 
 int fabric_check(int argc, char **argv) {
-    if (argc < 7 || argc > 14) {
+    if (argc < 7 || argc > 16) {
         fprintf(stderr, "usage: fabric-check DEVICE GID_INDEX VIA PORT NAME RANK "
-                        "[ROUNDS [SIZES [SECONDS [PEER_PORT [MODE [PROGRESS [WAIT]]]]]]]\n"
+                        "[ROUNDS [SIZES [SECONDS [PEER_PORT [MODE [PROGRESS [WAIT [PATTERN [GAP_US]]]]]]]]]\n"
                         "MODE is split or combined; PROGRESS is 0 or 1; SECONDS defaults to 60, 0 skips streaming.\n"
-                        "WAIT is library or spin; spin needs PROGRESS 1, which a bond always has.\n");
+                        "WAIT is library or spin; spin needs PROGRESS 1, which a bond always has.\n"
+                        "PATTERN is pingpong or swap; GAP_US is the work each rank does before each swap.\n");
         return 2;
     }
-    uint64_t rank_arg, gid, port, peer_port = 0, rounds_arg = 10000, progress = 0;
+    uint64_t rank_arg, gid, port, peer_port = 0, rounds_arg = 10000, progress = 0, gap_us = 0, gaps[2] = {0, 0};
     if (!number(argv[6], 1, &rank_arg) || !number(argv[2], INT_MAX, &gid) ||
         !number(argv[4], 65535, &port) || !port ||
         (argc > 7 && !number(argv[7], UINT32_MAX, &rounds_arg)) ||
@@ -278,6 +316,16 @@ int fabric_check(int argc, char **argv) {
     if (argc > 11 && !combined && strcmp(argv[11], "split")) return 2;
     int spin = argc > 13 && !strcmp(argv[13], "spin");
     if (argc > 13 && ((!spin && strcmp(argv[13], "library")) || (spin && !progress))) return 2;
+    int swapping = argc > 14 && !strcmp(argv[14], "swap");
+    if (argc > 14 && !swapping && strcmp(argv[14], "pingpong")) return 2;
+    if (argc > 15) {
+        char first[24], *comma = strchr(argv[15], ',');
+        size_t n = comma ? (size_t)(comma - argv[15]) : strlen(argv[15]);
+        if (n >= sizeof(first)) return 2;
+        memcpy(first, argv[15], n), first[n] = 0;
+        if (!number(first, 1000000, &gaps[0]) || !number(comma ? comma + 1 : first, 1000000, &gaps[1])) return 2;
+        gap_us = gaps[rank_arg];
+    }
     uint32_t rounds = (uint32_t)rounds_arg;
     const char *sizes = argc > 8 ? argv[8] : "64,4096,14336,1048576";
     char *end = NULL;
@@ -302,22 +350,26 @@ int fabric_check(int argc, char **argv) {
     printf("fabric-check: rank %d connected over %s\n", rank,
            mcdma_fabric_link(p) == MCDMA_FABRIC_THUNDERBOLT ? "thunderbolt" : "roce");
     printf("fabric-check: metadata abi=%u device=%s via=%s gid_index=%llu links=%u mode=%s progress=%llu "
-           "qos=%s wait_poll=%s wait=%s stream_seconds=%.3f verification=every_byte build=%s\n", mcdma_fabric_abi(),
-           argv[1], argv[3], (unsigned long long)gid, mcdma_fabric_link_count(p), combined ? "combined" : "split",
-           (unsigned long long)progress, getenv("MCDMA_FABRIC_QOS") ? getenv("MCDMA_FABRIC_QOS") : "0",
+           "qos=%s wait_poll=%s wait=%s pattern=%s gap_us=%llu stream_seconds=%.3f verification=every_byte build=%s\n",
+           mcdma_fabric_abi(), argv[1], argv[3], (unsigned long long)gid, mcdma_fabric_link_count(p),
+           combined ? "combined" : "split", (unsigned long long)progress,
+           getenv("MCDMA_FABRIC_QOS") ? getenv("MCDMA_FABRIC_QOS") : "0",
            getenv("MCDMA_FABRIC_WAIT_POLL") ? getenv("MCDMA_FABRIC_WAIT_POLL") : "1", spin ? "spin" : "library",
-           seconds, MCDMA_BUILD_ID);
+           swapping ? "swap" : "pingpong", (unsigned long long)gap_us, seconds, MCDMA_BUILD_ID);
     for (const char *s = sizes; s && *s && bad != ~0ull; s = strchr(s, ',') ? strchr(s, ',') + 1 : NULL) {
-        uint64_t len = strtoull(s, NULL, 10), wrong_words = 0;
-        len = len < 1 ? 1 : len > SLOT ? SLOT : len;
-        if ((wrong_words = pingpong(f, p, w, rank, len, rounds, &round, times, combined, spin)) == ~0ull) {
+        uint64_t len = strtoull(s, NULL, 10), wrong_words = 0, most = swapping ? SWAP_MAX : SLOT;
+        len = len < 1 ? 1 : len > most ? most : len;
+        wrong_words = swapping ? swap(f, p, w, rank, len, rounds, &round, times, combined, spin, gap_us * 1000)
+                               : pingpong(f, p, w, rank, len, rounds, &round, times, combined, spin);
+        if (wrong_words == ~0ull) {
             bad = ~0ull;
             break;
         }
         bad += wrong_words;
         qsort(times, rounds, sizeof(uint64_t), by_value);
-        /* gb_s: the size each way over half the median round trip, the rate one direction runs at */
-        if (rank == 0 && rounds)
+        /* gb_s: twice the size over the median round, the rate one direction runs at in a ping-pong and both
+         * directions together in a swap; both ranks time a swap */
+        if ((rank == 0 || swapping) && rounds)
             printf("fabric-check: size=%llu rounds=%u wrong_words=%llu rtt_median_us=%.2f rtt_p99_us=%.2f "
                    "rtt_max_us=%.2f rtt_p50_us=%.2f gb_s=%.3f\n",
                    (unsigned long long)len, rounds, (unsigned long long)wrong_words, times[rounds / 2] / 1e3,
