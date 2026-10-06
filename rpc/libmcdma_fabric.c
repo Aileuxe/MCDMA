@@ -31,6 +31,10 @@
 #define BOND_SIGNALS 4096u
 #define BOND_RANGES 128u
 #define BOND_MODE (MODE_DIRECT | 0x80)
+#define WRITE_FAILED "a write failed"   /* reasons for a failure that no link explained */
+#define WRITE_SIGNAL_FAILED "a write-and-signal failed"
+#define SIGNAL_FAILED "a signal failed"
+#define FLUSH_FAILED "a flush failed"
 #ifdef __APPLE__
 #define ROCE_WINDOW 4
 #else
@@ -72,6 +76,9 @@ struct mcdma_fabric_peer {
     struct ibv_mr *slots_mr;
     uint64_t signals;
     int down;
+    int failing, why_done, tell;    /* the first failure claimed and its reason written; tell the other end */
+    char name[X_NAME];
+    char why[96];
     struct mcdma_fabric_peer *part[BOND_LINKS], *bond;
     unsigned lane;
     int bonded;
@@ -91,9 +98,42 @@ static int peer_down(const struct mcdma_fabric_peer *p) {
            (p->bond && __atomic_load_n(&p->bond->down, __ATOMIC_ACQUIRE));
 }
 
-static void peer_failed(struct mcdma_fabric_peer *p) {
+static void mark_down(struct mcdma_fabric_peer *p) {
     __atomic_store_n(&p->down, 1, __ATOMIC_RELEASE);
     if (p->bond) __atomic_store_n(&p->bond->down, 1, __ATOMIC_RELEASE);
+}
+
+/* A peer goes down once and for good. The first reason is kept and logged in one line (a Thunderbolt link that failed
+ * has logged its own, so `why` NULL takes that line's reason), and each of its links is marked to tell the other end
+ * over the exchange socket, so that end fails at once instead of waiting out a timeout. `tell` 0: the news came from
+ * the other end. */
+static void peer_fail(struct mcdma_fabric_peer *p, const char *why, int tell) {
+    struct mcdma_fabric_peer *top = p->bond ? p->bond : p;
+    const char *link = p->e.tb ? tb_failure(&p->e) : NULL;
+    if (!__atomic_exchange_n(&top->failing, 1, __ATOMIC_ACQ_REL)) {
+        if (why) snprintf(top->why, sizeof(top->why), "%s", why);
+        else if (link) snprintf(top->why, sizeof(top->why), "%s: %s", p->e.device, link);
+        else snprintf(top->why, sizeof(top->why), "%s%sa link operation failed", p->e.device, *p->e.device ? ": " : "");
+        __atomic_store_n(&top->why_done, 1, __ATOMIC_RELEASE);
+        if (why || !link) link_log("%s: peer down: %s", top->name, top->why);
+        for (unsigned k = 0; tell && k < BOND_LINKS; ++k)
+            if (top->bonded ? top->part[k] != NULL : k == 0)
+                __atomic_store_n(&(top->bonded ? top->part[k] : top)->tell, 1, __ATOMIC_RELEASE);
+    }
+    mark_down(p);
+    mark_down(top);
+}
+
+/* With this link's lock held: send the other end the reason this peer went down, once. */
+static void tell_peer(struct mcdma_fabric_peer *p) {
+    static const uint8_t zero[16];
+    if (!__atomic_load_n(&p->tell, __ATOMIC_ACQUIRE) || !__atomic_exchange_n(&p->tell, 0, __ATOMIC_ACQ_REL)) return;
+    const struct mcdma_fabric_peer *top = p->bond ? p->bond : p;
+    if (p->x.fd < 0 || !memcmp(p->x.peer_session, zero, 16)) return;
+    struct xmsg err;
+    xchg_prepare(&p->x, &err, X_ERR, ROLE_PEER, 0);
+    snprintf(err.text, sizeof(err.text), "%s", __atomic_load_n(&top->why_done, __ATOMIC_ACQUIRE) ? top->why : "failed");
+    (void)xchg_send(&p->x, &err);
 }
 
 /* Exactly one optional '+', no whitespace, empty members or duplicate links. Leave provider names otherwise alone. */
@@ -150,7 +190,7 @@ static int bond_signal(void *arg, uint64_t seq, const uint64_t need[BOND_LINKS],
         *s = (struct bond_signal){seq, {need[0], need[1]}, off, value};
         __atomic_add_fetch(&p->waiting, 1, __ATOMIC_SEQ_CST);
         bond_drain(p);
-    } else peer_failed(p);
+    } else mark_down(p); /* publish nothing more; the link that carried it fails with the reason */
     pthread_mutex_unlock(&p->rx_lock);
     return bad ? -1 : 0;
 }
@@ -241,22 +281,30 @@ static void release_peer(struct mcdma_fabric_peer *p) {
     free(p);
 }
 
-/* Read each peer's exchange socket: offers again after ours was lost, goodbyes, a restarted peer. */
+/* Read each peer's exchange socket: offers again after ours was lost, goodbyes, failures, a restarted peer. */
 static void service(struct mcdma_fabric_peer *p) {
     struct xmsg m;
     while (!peer_down(p) && xchg_recv(&p->x, &m, 0) == 1) {
         if (m.role != ROLE_PEER) continue;
         int current = !memcmp(m.from, p->x.peer_session, 16);
         if ((m.kind == X_BYE || m.kind == X_ERR) && xchg_ours(&p->x, &m)) {
-            link_log("%s: the peer ended the link (%s)", p->x.name, m.kind == X_ERR ? m.text : "goodbye");
-            peer_failed(p);
+            char why[sizeof(p->why)];
+            snprintf(why, sizeof(why), "the other end %s", m.kind == X_ERR ? "failed: " : "said goodbye");
+            if (m.kind == X_ERR) snprintf(why + strlen(why), sizeof(why) - strlen(why), "%s", m.text);
+            peer_fail(p, why, 0);
         } else if (m.kind == X_OFFER && current) {
             (void)xchg_send(&p->x, &p->mine);
         } else if (m.kind == X_OFFER) {
-            link_log("%s: the peer restarted; this link is gone", p->x.name);
-            peer_failed(p);
+            peer_fail(p, "the other end restarted; this link is gone", 0);
         }
     }
+}
+
+/* Under its lock: has a waiting link's peer gone? Read its exchange socket to find out. */
+static int peer_gone(void *arg) {
+    struct mcdma_fabric_peer *p = arg;
+    service(p);
+    return peer_down(p);
 }
 
 /* Under the lock: place Thunderbolt writes, reap RoCE completions, and every millisecond read exchange sockets. */
@@ -265,10 +313,15 @@ static int progress_all(struct mcdma_fabric *f) {
     if (read_sockets) f->serviced = link_now_ns();
     for (int i = 0; i < f->npeers; ++i) {
         struct mcdma_fabric_peer *p = f->peers[i];
-        if (peer_down(p)) continue;
+        if (peer_down(p)) {
+            tell_peer(p);
+            continue;
+        }
         int n = p->e.kind == LINK_TB ? tb_progress(&p->e) : ep_reap(&p->e, 0, 0);
-        if (n < 0) peer_failed(p);
-        else handled += n;
+        if (n < 0) {
+            peer_fail(p, NULL, 1);
+            tell_peer(p);
+        } else handled += n;
         if (read_sockets) service(p);
     }
     return handled;
@@ -428,6 +481,7 @@ static int connect_lane(struct mcdma_fabric *f, const char *via, int port, int p
     struct mcdma_fabric_peer *p = calloc(1, sizeof(*p));
     if (!p) return MCDMA_FABRIC_NOMEM;
     p->f = f, p->bond = bond, p->lane = lane;
+    snprintf(p->name, sizeof(p->name), "%s", name);
     p->x.fd = -1;
     p->e = f->dev;
     p->e.qp = NULL, p->e.cq = NULL, p->e.tb = NULL, p->e.nmr = 0, p->e.outstanding = 0;
@@ -437,6 +491,7 @@ static int connect_lane(struct mcdma_fabric *f, const char *via, int port, int p
                                                              : MCDMA_FABRIC_OK;
     if (!status && p->e.kind == LINK_TB) {
         tb_accept(&p->e, &f->win, 0, f->win.length);
+        tb_watch(&p->e, p, peer_gone);
         if (bond) tb_bond_hooks(&p->e, p, bond_placed, bond_signal);
     }
     if (!status && p->e.kind == LINK_ROCE) {
@@ -473,6 +528,7 @@ int mcdma_fabric_connect(struct mcdma_fabric *f, const char *via, int port, int 
     struct mcdma_fabric_peer *p = calloc(1, sizeof(*p));
     if (!p) return MCDMA_FABRIC_NOMEM;
     p->f = f, p->bonded = BOND_LINKS, p->rx_signal = 1;
+    snprintf(p->name, sizeof(p->name), "%s", name);
     pthread_mutex_init(&p->rx_lock, NULL);
     p->pending = calloc(BOND_SIGNALS, sizeof(*p->pending));
     int status = p->pending ? MCDMA_FABRIC_OK : MCDMA_FABRIC_NOMEM;
@@ -496,7 +552,7 @@ int mcdma_fabric_connect(struct mcdma_fabric *f, const char *via, int port, int 
     if (!status) f->peers[f->npeers++] = p;
     pthread_mutex_unlock(&f->lock);
     if (status) {
-        peer_failed(p);
+        mark_down(p);
         for (int k = 0; k < BOND_LINKS; ++k) mcdma_fabric_disconnect(&p->part[k]);
         free(p->pending);
         pthread_mutex_destroy(&p->rx_lock);
@@ -512,6 +568,15 @@ int mcdma_fabric_link(const struct mcdma_fabric_peer *p) {
 }
 
 uint64_t mcdma_fabric_peer_length(const struct mcdma_fabric_peer *p) { return p ? p->remote_length : 0; }
+
+int mcdma_fabric_peer_status(const struct mcdma_fabric_peer *p, char *why, size_t n) {
+    if (!p) return MCDMA_FABRIC_INVALID;
+    if (why && n) *why = 0;
+    if (!peer_down(p)) return MCDMA_FABRIC_OK;
+    const struct mcdma_fabric_peer *top = p->bond ? p->bond : p;
+    if (why && n) snprintf(why, n, "%s", __atomic_load_n(&top->why_done, __ATOMIC_ACQUIRE) ? top->why : "down");
+    return MCDMA_FABRIC_PEER;
+}
 
 static int in(uint64_t off, uint64_t len, uint64_t limit) { return off <= limit && len <= limit - off; }
 
@@ -545,9 +610,13 @@ static int roce_signal(struct mcdma_fabric_peer *p, uint64_t roff, uint64_t valu
     return roce_post(p, IBV_WR_RDMA_WRITE, &piece);
 }
 
-/* Called with the lock held: a failed operation leaves the peer unusable. */
-static int settle(struct mcdma_fabric_peer *p, int failed) {
-    if (failed) peer_failed(p);
+/* Called with the lock held: a failed operation leaves the peer unusable. `what` names a failure no link explained.
+ * A single link's other end hears why at once, under this lock; a bond's links tell it from their own threads. */
+static int settle(struct mcdma_fabric_peer *p, int failed, const char *what) {
+    if (failed) {
+        peer_fail(p, p->e.tb && tb_failure(&p->e) ? NULL : what, 1);
+        if (!p->bonded) tell_peer(p);
+    }
     pthread_mutex_unlock(&p->f->lock);
     return failed ? MCDMA_FABRIC_PEER : MCDMA_FABRIC_OK;
 }
@@ -560,7 +629,7 @@ static int bond_flush_locked(struct mcdma_fabric_peer *p, uint64_t timeout_ns) {
     for (unsigned k = 0; k < BOND_LINKS; ++k) {
         uint64_t now = link_now_ns();
         if (peer_down(p) || now >= deadline || mcdma_fabric_flush(p->part[k], deadline - now)) {
-            peer_failed(p);
+            peer_fail(p, "a flush of both links did not complete", 1);
             return -1;
         }
     }
@@ -614,7 +683,7 @@ static int bond_rooms(struct mcdma_fabric_peer *p, uint64_t off, uint64_t len, i
             if (room[k].backlog >= BOND_BACKLOG) room[k].ready = 0;
             if (can < 0) bad = 1;
         }
-        if (bad) peer_failed(lane);
+        if (bad) peer_fail(lane, NULL, 1);
         pthread_mutex_unlock(&lane->f->lock);
         if (bad) return -1;
     }
@@ -650,7 +719,7 @@ static int bond_write_locked(struct mcdma_fabric_peer *p, uint64_t off, uint64_t
         struct mcdma_fabric_peer *lane = p->part[k];
         enter(lane->f);
         int r = peer_down(lane) ? -1 : tb_write_try(&lane->e, &lane->f->win, off, roff, rooms[k].take);
-        if (r < 0) peer_failed(lane);
+        if (r < 0) peer_fail(lane, NULL, 1);
         pthread_mutex_unlock(&lane->f->lock);
         if (r < 0) return -1;
         if (r == 1) {
@@ -689,7 +758,7 @@ static int bond_signal_locked(struct mcdma_fabric_peer *p, uint64_t off, uint64_
                 rooms[k].backlog = tb_posted_bytes(&lane->e) - tb_completed_bytes(&lane->e);
                 rooms[k].completed = tb_completed_payload(&lane->e);
             }
-            if (bad) peer_failed(lane);
+            if (bad) peer_fail(lane, NULL, 1);
             pthread_mutex_unlock(&lane->f->lock);
             if (bad) return -1;
         }
@@ -702,7 +771,7 @@ static int bond_signal_locked(struct mcdma_fabric_peer *p, uint64_t off, uint64_
         enter(lane->f);
         int can = peer_down(lane) ? -1 : tb_can_bond_signal(&lane->e);
         int bad = can < 0 || (can == 1 && tb_bond_signal(&lane->e, off, value, p->tx_signal + 1, need, OP_NS));
-        if (bad) peer_failed(lane);
+        if (bad) peer_fail(lane, NULL, 1);
         pthread_mutex_unlock(&lane->f->lock);
         if (bad) return -1;
         if (!can) {
@@ -733,7 +802,7 @@ static int bond_write_signal_locked(struct mcdma_fabric_peer *p, uint64_t off, u
             int can = peer_down(lane) ? -1 : tb_can_bond_write_signal(&lane->e, &lane->f->win, off, len);
             int r = can < 0 ? -1 : can != 1 ? 1 : tb_bond_write_signal(&lane->e, &lane->f->win, off, roff, len,
                                                                        soff, value, p->tx_signal + 1, need, OP_NS);
-            if (r < 0) peer_failed(lane);
+            if (r < 0) peer_fail(lane, NULL, 1);
             pthread_mutex_unlock(&lane->f->lock);
             if (r < 0) return -1;
             if (!r) {
@@ -766,28 +835,31 @@ int mcdma_fabric_write(struct mcdma_fabric_peer *p, uint64_t local_offset, uint6
         return MCDMA_FABRIC_BOUNDS;
     enter(p->f);
     if (p->bonded) return settle(p, peer_down(p) || bond_prepare(p, remote_offset, length) ||
-                                    bond_write_locked(p, local_offset, remote_offset, length));
+                                    bond_write_locked(p, local_offset, remote_offset, length), WRITE_FAILED);
     int failed = peer_down(p) || (length && (p->e.kind == LINK_TB ? tb_write(&p->e, &p->f->win, local_offset, remote_offset,
                                                                          length, OP_NS)
                                                              : roce_range(p, IBV_WR_RDMA_WRITE, local_offset,
                                                                           remote_offset, length)));
     if (!failed && p->e.kind == LINK_ROCE) p->payload_posted += length;
-    return settle(p, failed);
+    return settle(p, failed, WRITE_FAILED);
 }
 
 int mcdma_fabric_write_signal(struct mcdma_fabric_peer *p, uint64_t local_offset, uint64_t remote_offset,
                               uint64_t length, uint64_t signal_offset, uint64_t value) {
     if (!p) return MCDMA_FABRIC_INVALID;
-    if (local_offset < MCDMA_FABRIC_WS_ROOM || !in(local_offset, length, p->f->win.length) ||
+    if ((length && local_offset < MCDMA_FABRIC_WS_ROOM) || !in(local_offset, length, p->f->win.length) ||
         !in(remote_offset, length, p->remote_length) || signal_offset % 8 || !in(signal_offset, 8, p->remote_length))
         return MCDMA_FABRIC_BOUNDS;
+    /* No bytes: the signal alone, on every link kind (a zero-length SEND is lost on Thunderbolt) */
+    if (!length) return mcdma_fabric_signal(p, signal_offset, value);
     if (!p->bonded && p->e.kind != LINK_TB) return MCDMA_FABRIC_UNSUPPORTED;
     enter(p->f);
     if (p->bonded) return settle(p, peer_down(p) || bond_prepare(p, remote_offset, length) ||
-                                    bond_write_signal_locked(p, local_offset, remote_offset, length, signal_offset, value));
+                                    bond_write_signal_locked(p, local_offset, remote_offset, length, signal_offset, value),
+                                 WRITE_SIGNAL_FAILED);
     int failed = peer_down(p) || tb_write_signal(&p->e, &p->f->win, local_offset, remote_offset, length, signal_offset,
                                              value, OP_NS);
-    return settle(p, failed);
+    return settle(p, failed, WRITE_SIGNAL_FAILED);
 }
 
 int mcdma_fabric_signal(struct mcdma_fabric_peer *p, uint64_t remote_offset, uint64_t value) {
@@ -795,12 +867,12 @@ int mcdma_fabric_signal(struct mcdma_fabric_peer *p, uint64_t remote_offset, uin
     if (remote_offset % 8 || !in(remote_offset, 8, p->remote_length)) return MCDMA_FABRIC_BOUNDS;
     enter(p->f);
     if (p->bonded) {
-        if (p->nranges + 1 >= BOND_RANGES && bond_flush_locked(p, OP_NS)) return settle(p, 1);
-        return settle(p, bond_signal_locked(p, remote_offset, value));
+        if (p->nranges + 1 >= BOND_RANGES && bond_flush_locked(p, OP_NS)) return settle(p, 1, SIGNAL_FAILED);
+        return settle(p, bond_signal_locked(p, remote_offset, value), SIGNAL_FAILED);
     }
     int failed = peer_down(p) || (p->e.kind == LINK_TB ? tb_signal(&p->e, remote_offset, value, OP_NS)
                                                   : roce_signal(p, remote_offset, value));
-    return settle(p, failed);
+    return settle(p, failed, SIGNAL_FAILED);
 }
 
 int mcdma_fabric_read(struct mcdma_fabric_peer *p, uint64_t local_offset, uint64_t remote_offset, uint64_t length) {
@@ -809,7 +881,8 @@ int mcdma_fabric_read(struct mcdma_fabric_peer *p, uint64_t local_offset, uint64
     if (!in(local_offset, length, p->f->win.length) || !in(remote_offset, length, p->remote_length))
         return MCDMA_FABRIC_BOUNDS;
     enter(p->f);
-    return settle(p, peer_down(p) || roce_range(p, IBV_WR_RDMA_READ, local_offset, remote_offset, length));
+    return settle(p, peer_down(p) || roce_range(p, IBV_WR_RDMA_READ, local_offset, remote_offset, length),
+                  "a read failed");
 }
 
 int mcdma_fabric_fetch_add(struct mcdma_fabric_peer *p, uint64_t remote_offset, uint64_t add, uint64_t *old) {
@@ -821,11 +894,11 @@ int mcdma_fabric_fetch_add(struct mcdma_fabric_peer *p, uint64_t remote_offset, 
 int mcdma_fabric_flush(struct mcdma_fabric_peer *p, uint64_t timeout_ns) {
     if (!p) return MCDMA_FABRIC_INVALID;
     enter(p->f);
-    if (p->bonded) return settle(p, bond_flush_locked(p, timeout_ns));
+    if (p->bonded) return settle(p, bond_flush_locked(p, timeout_ns), FLUSH_FAILED);
     int failed = peer_down(p) || (p->e.kind == LINK_TB ? tb_fence(&p->e, timeout_ns)
                                                   : ep_reap(&p->e, p->e.outstanding, timeout_ns) < 0);
     if (!failed && p->e.kind == LINK_ROCE) p->payload_completed = p->payload_posted;
-    return settle(p, failed);
+    return settle(p, failed, FLUSH_FAILED);
 }
 
 int mcdma_fabric_progress(struct mcdma_fabric *f) {
@@ -881,7 +954,7 @@ int mcdma_fabric_wait(struct mcdma_fabric *f, uint64_t offset, uint64_t value, u
     while (__atomic_load_n(word, __ATOMIC_ACQUIRE) < value) {
         if (!(polls++ % 64)) {
             if (link_now_ns() > deadline) { status = MCDMA_FABRIC_TIMEOUT; break; }
-            if (f->bonded && fabric_down(f)) { status = MCDMA_FABRIC_PEER; break; }
+            if (fabric_down(f)) { status = MCDMA_FABRIC_PEER; break; }
         }
         if (!f->threaded && !f->bonded) mcdma_fabric_progress(f);
         else if (f->wait_poll) wait_progress(f);
@@ -899,7 +972,7 @@ void mcdma_fabric_disconnect(struct mcdma_fabric_peer **pp) {
         if (f->peers[i] == p) f->peers[i] = f->peers[--f->npeers];
     pthread_mutex_unlock(&f->lock);
     if (p->bonded) {
-        peer_failed(p);
+        mark_down(p);
         for (unsigned k = 0; k < BOND_LINKS; ++k) mcdma_fabric_disconnect(&p->part[k]);
         free(p->pending);
         pthread_mutex_destroy(&p->rx_lock);

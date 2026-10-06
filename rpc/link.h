@@ -151,6 +151,9 @@ int tb_write_signal(struct ep *e, const struct region *src, uint64_t off, uint64
 int tb_fence(struct ep *e, uint64_t timeout_ns);
 int tb_progress(struct ep *e);
 int tb_busy(const struct ep *e);
+const char *tb_failure(const struct ep *e); /* why the link failed, or NULL while it works */
+/* Waits for send room or a fence answer call `gone` about once a millisecond and give up when it returns nonzero. */
+void tb_watch(struct ep *e, void *arg, int (*gone)(void *arg));
 /* Bond hooks run under the endpoint's lock, after copying a complete write. The signal hook must copy `need`
  * if retaining it, return 0 on success/-1 on failure, and arrange the final release-store itself. No hook may
  * reenter this endpoint. Install both hooks before accepting bonded messages; ordinary wire messages are unchanged. */

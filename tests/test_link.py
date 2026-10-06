@@ -58,10 +58,14 @@ class LinkTests(unittest.TestCase):
 
     def run_case(self, binary, *args, timeout=180, **env):
         done = subprocess.run([os.path.join(self.work, binary), *args], capture_output=True, text=True,
-                              timeout=timeout, env=dict(os.environ, **QUIET, **env))
+                              timeout=timeout, env={**os.environ, **QUIET, **env})
         if done.returncode == SKIP:
             self.skipTest('the loopback interface has no link-local address')
         self.assertEqual(done.returncode, 0, (done.stdout + done.stderr)[-3000:])
+        return done
+
+    def library_lines(self, done):
+        return [line for line in done.stderr.splitlines() if line.startswith('mcdma-fabric: ')]
 
     def test_the_exchange_admits_only_on_link_peers(self):
         self.run_case('link-xchg')
@@ -155,6 +159,23 @@ class LinkTests(unittest.TestCase):
 
     def test_public_maximum_names_fit_bond_lane_suffixes(self):
         self.run_case('fabric', 'bond-names', STUB_STRICT='1')
+
+    def test_a_zero_length_write_signal_is_a_signal(self):
+        done = self.run_case('fabric', 'zero', STUB_SEED='5', STUB_STRICT='1', STUB_LAZY='1', MCDMA_FABRIC_LOG='1')
+        # nothing fails, so the only lines are the goodbyes of the closing pairs
+        self.assertEqual([line for line in self.library_lines(done) if 'said goodbye' not in line], [])
+
+    def test_a_failed_end_tells_the_other_why_in_one_line_each(self):
+        for scenario, link in (('down', 'tb1'), ('bond-down', 'tb3')):
+            with self.subTest(scenario=scenario):
+                done = self.run_case('fabric', scenario, STUB_SEED='5', STUB_STRICT='1', STUB_LAZY='1',
+                                     MCDMA_FABRIC_LOG='1')
+                failed = [line for line in self.library_lines(done) if 'thunderbolt link failed' in line]
+                heard = [line for line in self.library_lines(done) if 'peer down: the other end failed' in line]
+                self.assertEqual(len(failed), 1, done.stderr)
+                self.assertTrue(failed[0].startswith(f'mcdma-fabric: {link}: '), done.stderr)
+                self.assertEqual(len(heard), 1, done.stderr)
+                self.assertIn(f'{link}: an unexpected completion', heard[0])
 
     def test_fabric_check_passes_on_both_link_kinds(self):
         self.run_case('fabric-check', 'tb', STUB_SEED='3', STUB_LAZY='1')

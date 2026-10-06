@@ -61,6 +61,12 @@ MCDMA_FABRIC_API int mcdma_fabric_link(const struct mcdma_fabric_peer *p);
 /* The length of the peer's window. */
 MCDMA_FABRIC_API uint64_t mcdma_fabric_peer_length(const struct mcdma_fabric_peer *p);
 
+/* Additive ABI 1: MCDMA_FABRIC_OK while the peer is up, MCDMA_FABRIC_PEER once it is down for good, with the first
+ * reason copied into `why` (n bytes; NULL for none). A peer goes down when either end fails: the end that fails logs
+ * one line and tells the other, whose links report it within about a millisecond. An atomic load while the peer is
+ * up, so a caller spinning on a window word can poll it. */
+MCDMA_FABRIC_API int mcdma_fabric_peer_status(const struct mcdma_fabric_peer *p, char *why, size_t n);
+
 /* Additive ABI 1 diagnostics: one link for an ordinary peer, two for a bond; NULL has zero. Counts are write payload
  * bytes, excluding headers, signals and fence traffic. Local SEND completion is not proof of remote placement;
  * the API requires flush before source reuse. RoCE completed_bytes is published at successful flush. Index order
@@ -83,7 +89,8 @@ MCDMA_FABRIC_API int mcdma_fabric_signal(struct mcdma_fabric_peer *p, uint64_t r
 
 /* mcdma_fabric_write, then mcdma_fabric_signal, fused when representable on one Thunderbolt link. A large bonded
  * write spreads across links before its ordered signal. The library may overwrite the MCDMA_FABRIC_WS_ROOM bytes
- * before local_offset; both ends need a library that has this call. */
+ * before local_offset; both ends need a library that has this call. A length of 0 is mcdma_fabric_signal, on any
+ * link and with no room needed before local_offset. */
 #define MCDMA_FABRIC_WS_ROOM 64u
 MCDMA_FABRIC_API int mcdma_fabric_write_signal(struct mcdma_fabric_peer *p, uint64_t local_offset, uint64_t remote_offset,
                                                uint64_t length, uint64_t signal_offset, uint64_t value);
@@ -105,7 +112,8 @@ MCDMA_FABRIC_API int mcdma_fabric_flush(struct mcdma_fabric_peer *p, uint64_t ti
 MCDMA_FABRIC_API int mcdma_fabric_progress(struct mcdma_fabric *f);
 
 /* Wait until the 8-byte word at `offset` of this window reaches `value` (unsigned), making progress meanwhile:
- * monotonic flags such as step << 32 | bytes are never missed when a peer runs a step ahead. */
+ * monotonic flags such as step << 32 | bytes are never missed when a peer runs a step ahead. MCDMA_FABRIC_PEER once
+ * every peer of this fabric is down. */
 MCDMA_FABRIC_API int mcdma_fabric_wait(struct mcdma_fabric *f, uint64_t offset, uint64_t value, uint64_t timeout_ns);
 
 /* Tell the peer goodbye and destroy its queue pairs; *p becomes NULL. */

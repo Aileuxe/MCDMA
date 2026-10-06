@@ -54,13 +54,33 @@ struct tb {
     const struct region *rx;      /* the peer may write [lo, hi) of this region */
     uint64_t lo, hi;
     int poisoned;
+    char why[112];                /* the first reason, once poisoned */
+    void *watch_arg;              /* asked every millisecond while a send waits: has the peer gone? */
+    int (*watch)(void *arg);
 };
 
 static uint32_t packets(uint64_t len) { return (uint32_t)((len + TB_PACKET - 1) / TB_PACKET); }
 
 static void poison(struct ep *e, const char *why) {
-    if (!e->tb->poisoned) link_log("%s: thunderbolt link failed: %s", e->device, why);
+    if (!e->tb->poisoned) {
+        link_log("%s: thunderbolt link failed: %s", e->device, why);
+        snprintf(e->tb->why, sizeof(e->tb->why), "%s", why);
+    }
     e->tb->poisoned = 1;
+}
+
+const char *tb_failure(const struct ep *e) { return e->tb && e->tb->poisoned ? e->tb->why : NULL; }
+
+void tb_watch(struct ep *e, void *arg, int (*gone)(void *arg)) {
+    e->tb->watch_arg = arg;
+    e->tb->watch = gone;
+}
+
+/* A wait gives up early once the owner learns the peer has gone, so it does not run out its whole timeout. */
+static int gone(struct tb *t, uint64_t now, uint64_t *next) {
+    if (!t->watch || now < *next) return 0;
+    *next = now + 1000000ull;
+    return t->watch(t->watch_arg);
 }
 
 static int post_recv(struct ep *e, uint64_t slot) {
@@ -260,12 +280,15 @@ static int send_head(struct ep *e, uint16_t kind, uint64_t off, uint32_t len, ui
 /* Progress until there is room for `n` packets in `sends` sends. */
 static int room(struct ep *e, uint32_t n, uint32_t sends, uint64_t deadline) {
     struct tb *t = e->tb;
+    uint64_t next = 0;
     while (!has_room(t, n, sends, 0)) {
         if (tb_progress(e) < 0) return -1;
-        if (link_now_ns() > deadline) {
+        uint64_t now = link_now_ns();
+        if (now > deadline) {
             poison(e, "no room to send within the timeout: the peer stopped taking messages");
             return -1;
         }
+        if (gone(t, now, &next)) return -1;
     }
     return t->poisoned ? -1 : 0;
 }
@@ -407,13 +430,15 @@ int tb_bond_write_signal(struct ep *e, const struct region *src, uint64_t off, u
     int can = tb_can_bond_write_signal(e, src, off, len);
     if (can < 0) return -1;
     if (can == 2) return 1;
-    uint64_t deadline = link_now_ns() + timeout_ns;
+    uint64_t deadline = link_now_ns() + timeout_ns, next = 0;
     while (!can) {
         if (tb_progress(e) < 0) return -1;
-        if (link_now_ns() > deadline) {
+        uint64_t now = link_now_ns();
+        if (now > deadline) {
             poison(e, "no room for a bonded write-and-signal within the timeout");
             return -1;
         }
+        if (gone(t, now, &next)) return -1;
         can = tb_can_bond_write_signal(e, src, off, len);
         if (can < 0) return -1;
     }
@@ -433,13 +458,16 @@ int tb_fence(struct ep *e, uint64_t timeout_ns) {
     struct tb *t = e->tb;
     uint64_t deadline = link_now_ns() + timeout_ns;
     uint32_t mine = ++t->fences;
+    uint64_t next = 0;
     if (room(e, 1, 1, deadline) || send_head(e, C_FENCE, 0, 0, mine, NULL)) return -1;
     while ((int32_t)(t->fence_acked - mine) < 0) {
         if (tb_progress(e) < 0) return -1;
-        if (link_now_ns() > deadline) {
+        uint64_t now = link_now_ns();
+        if (now > deadline) {
             poison(e, "the peer did not acknowledge a fence within the timeout");
             return -1;
         }
+        if (gone(t, now, &next)) return -1;
     }
     return 0;
 }

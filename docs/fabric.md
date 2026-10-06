@@ -17,13 +17,14 @@ enforces RoCE keys and models Thunderbolt RDMA as two Studios on macOS 27.0 meas
 | `mcdma_fabric_connect` | Meets one peer over a Thunderbolt IP interface; both sides call it with the same name |
 | `mcdma_fabric_write` | Copies a range of this window to an offset in the peer's window |
 | `mcdma_fabric_signal` | Stores an 8-byte word in the peer's window after every earlier write to that peer |
-| `mcdma_fabric_write_signal` | A write and then a signal as one message on Thunderbolt; both ends need a library with it |
+| `mcdma_fabric_write_signal` | A write and then a signal as one message on Thunderbolt; both ends need a library with it. Length 0 is a signal |
 | `mcdma_fabric_flush` | Returns once everything posted to the peer has landed |
 | `mcdma_fabric_read` | Copies from the peer's window into this one; RoCE only |
 | `mcdma_fabric_fetch_add` | Always `MCDMA_FABRIC_UNSUPPORTED`: no MCDMA link has atomics |
 | `mcdma_fabric_progress` | Places incoming Thunderbolt writes and answers the peers' exchange messages |
 | `mcdma_fabric_wait` | Waits until a word of this window reaches a value, making progress meanwhile |
 | `mcdma_fabric_link_count`, `mcdma_fabric_link_stats` | Report each physical link's posted and completed write-payload bytes |
+| `mcdma_fabric_peer_status` | Whether the peer is still up, and if not the first reason it went down |
 | `mcdma_fabric_disconnect`, `mcdma_fabric_close` | Say goodbye and tear down; the window stays the caller's |
 
 `rpc/mcdma_fabric.h` has the exact signatures and statuses. These additions retain ABI 1 and the existing signatures.
@@ -42,6 +43,16 @@ enforces RoCE keys and models Thunderbolt RDMA as two Studios on macOS 27.0 meas
   posts nothing.
 - Any failed operation, refused exchange or goodbye from the peer leaves that peer down: every later call on it
   returns `MCDMA_FABRIC_PEER`. Disconnect it and connect again.
+- A peer that goes down says why, once. The end that fails logs one `mcdma-fabric:` line with the reason and sends it
+  to the other end over the exchange socket, if that still works. The other end reads its exchange socket every
+  millisecond while it progresses: in its progress threads, in `mcdma_fabric_progress` and `mcdma_fabric_wait`, and
+  in any flush or send waiting inside the library, which then gives up instead of running out its timeout. It logs
+  one line of its own and every later call on the peer returns `MCDMA_FABRIC_PEER`; `mcdma_fabric_wait` returns
+  `MCDMA_FABRIC_PEER` once every peer of its fabric is down. `mcdma_fabric_peer_status` returns the first reason at
+  either end. It is an atomic load while the peer is up, so a caller spinning on a window word can poll it and stop
+  waiting for a peer that has gone.
+- A zero-length `mcdma_fabric_write_signal` is `mcdma_fabric_signal`, on every link kind, and needs no room before its
+  local offset. Thunderbolt loses a zero-length SEND, so the library never sends one.
 - Calls on a single-link fabric are serialized by a lock, so several threads may share it. Callers spin for it rather
   than sleep. A bond has an independent progress thread and placement lock for each physical link, so receiving one
   link's payload does not hold the other link's placement lock.

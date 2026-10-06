@@ -16,6 +16,9 @@
  *   bond-small tiny queue depths and registration boundaries keep a small write on one link
  *   bond-wait a failed peer does not poison an unrelated live peer's flag wait
  *   bond-names public 19- and 20-character names fit the internal lane names
+ *   zero      a zero-length write_signal is a signal on every link kind and leaves the peer up
+ *   down      a failed link's end tells the other, which reports why within a second, even mid-flush
+ *   bond-down one failed link of a bond takes the whole peer down at both ends, with the reason
  * Exit 0 means pass, 77 that loopback has no usable IPv6 link-local or IPv4 address. */
 #include "../rpc/mcdma_fabric.h"
 
@@ -33,6 +36,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #define WINDOW (32ull << 20)
@@ -607,6 +611,124 @@ static void scenario_bond_names(void) {
     }
 }
 
+/* A zero-length write_signal stores its flag like a signal; it needs no room before local_offset and fails nothing. */
+static void zero_length(struct rank *a, struct rank *b, uint64_t value, int fused) {
+    CHECK(mcdma_fabric_write_signal(a->p, 0, 0, 0, FLAG + 4, value) == MCDMA_FABRIC_BOUNDS, "a misaligned empty signal");
+    CHECK(mcdma_fabric_write_signal(a->p, WINDOW + 1, 0, 0, FLAG, value) == MCDMA_FABRIC_BOUNDS,
+          "an empty write still names a place in this window");
+    CHECK(!mcdma_fabric_write_signal(a->p, 0, 0, 0, FLAG, value), "a zero-length write-and-signal posts");
+    CHECK(!mcdma_fabric_wait(b->f, FLAG, value, 5 * SECOND) && flag_of(b) == value, "its flag lands as a signal's would");
+    CHECK(mcdma_fabric_peer_status(a->p, NULL, 0) == MCDMA_FABRIC_OK, "the peer stays up");
+    unsigned char *src = a->mem + WINDOW / 2 + MCDMA_FABRIC_WS_ROOM;
+    for (size_t i = 0; i < 300; ++i) src[i] = pattern(0, value, i);
+    if (fused) {
+        CHECK(!mcdma_fabric_write_signal(a->p, WINDOW / 2 + MCDMA_FABRIC_WS_ROOM, 0, 300, FLAG, value + 1),
+              "the next write-and-signal still works");
+    } else {
+        CHECK(mcdma_fabric_write_signal(a->p, WINDOW / 2 + MCDMA_FABRIC_WS_ROOM, 0, 300, FLAG, value + 1) ==
+              MCDMA_FABRIC_UNSUPPORTED, "RoCE still has no joined write");
+        CHECK(!mcdma_fabric_write(a->p, WINDOW / 2 + MCDMA_FABRIC_WS_ROOM, 0, 300) &&
+              !mcdma_fabric_signal(a->p, FLAG, value + 1), "the next write and signal still work");
+    }
+    CHECK(!mcdma_fabric_wait(b->f, FLAG, value + 1, 5 * SECOND) && !memcmp(b->mem, src, 300), "and land in order");
+    CHECK(!mcdma_fabric_flush(a->p, 5 * SECOND), "the peer flushes");
+}
+
+static void scenario_zero(void) {
+    struct rank a, b;
+    open_rank(&a, 0, "tb0", 0);
+    open_rank(&b, 1, "tb1", MCDMA_FABRIC_PROGRESS_THREAD);
+    meet(&a, &b);
+    CHECK(!a.status && !b.status, "both ranks connect");
+    zero_length(&a, &b, 10, 1);
+    close_pair(&a, &b);
+    open_rank(&a, 0, "roce0", 0);
+    open_rank(&b, 1, "roce1", 0);
+    meet(&a, &b);
+    CHECK(!a.status && !b.status, "both RoCE ranks connect");
+    zero_length(&a, &b, 20, 0);
+    close_pair(&a, &b);
+    open_bond_pair(&a, &b);
+    zero_length(&a, &b, 30, 1);
+    close_pair(&a, &b);
+}
+
+/* Wait until `p` reports itself down and return its reason, or fail after `seconds`. */
+static void wait_down(struct mcdma_fabric_peer *p, double seconds, char *why, size_t n, const char *what) {
+    uint64_t deadline = (uint64_t)(seconds * SECOND), waited = 0;
+    while (mcdma_fabric_peer_status(p, why, n) == MCDMA_FABRIC_OK) {
+        CHECK(waited < deadline, what);
+        usleep(1000);
+        waited += 1000000;
+    }
+    CHECK(mcdma_fabric_peer_status(p, why, n) == MCDMA_FABRIC_PEER && why[0], what);
+}
+
+struct flush_job {
+    struct mcdma_fabric_peer *p;
+    int status;
+};
+
+static void *flush_peer(void *arg) {
+    struct flush_job *j = arg;
+    j->status = mcdma_fabric_flush(j->p, 8 * SECOND);
+    return NULL;
+}
+
+static uint64_t now_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * SECOND + (uint64_t)t.tv_nsec;
+}
+
+/* b's link fails while a waits in a flush that b will never answer: a hears why and gives up long before its
+ * timeout, and both ends report the same cause. */
+static void scenario_down(void) {
+    struct rank a, b;
+    char why[128];
+    open_rank(&a, 0, "tb0", 0);
+    open_rank(&b, 1, "tb1", MCDMA_FABRIC_PROGRESS_THREAD);
+    meet(&a, &b);
+    CHECK(!a.status && !b.status, "both ranks connect");
+    CHECK(!mcdma_fabric_signal(a.p, FLAG, 1) && !mcdma_fabric_wait(b.f, FLAG, 1, 5 * SECOND), "the link starts live");
+    CHECK(!mcdma_fabric_flush(a.p, 5 * SECOND), "the live link flushes");
+    stub_tb_hold("tb1", 1);
+    CHECK(!mcdma_fabric_signal(a.p, FLAG, 2), "a signal waits for a receiver that has stopped");
+    struct flush_job job = {.p = a.p};
+    pthread_t thread;
+    uint64_t began = now_ns();
+    CHECK(!pthread_create(&thread, NULL, flush_peer, &job), "the flushing thread starts");
+    usleep(50000);
+    stub_tb_fail("tb1");
+    pthread_join(thread, NULL);
+    CHECK(job.status == MCDMA_FABRIC_PEER && now_ns() - began < 3 * SECOND,
+          "a flush waiting on a failed end returns PEER at once, not after its timeout");
+    wait_down(b.p, 2, why, sizeof(why), "the failed end reports itself down");
+    CHECK(strstr(why, "unexpected completion") != NULL, "the failed end keeps its link's reason");
+    wait_down(a.p, 2, why, sizeof(why), "the other end hears the failure");
+    CHECK(strstr(why, "other end failed") && strstr(why, "unexpected completion"), "and reports the failed end's reason");
+    CHECK(mcdma_fabric_signal(a.p, FLAG, 3) == MCDMA_FABRIC_PEER, "later calls on it return PEER");
+    CHECK(mcdma_fabric_wait(a.f, FLAG, 99, 5 * SECOND) == MCDMA_FABRIC_PEER,
+          "a single link's wait reports PEER once its only peer is down");
+    stub_tb_hold("tb1", 0);
+    close_pair(&a, &b);
+}
+
+static void scenario_bond_down(void) {
+    struct rank a, b;
+    char why[128];
+    open_bond_pair(&a, &b);
+    CHECK(!mcdma_fabric_signal(a.p, FLAG, 1) && !mcdma_fabric_wait(b.f, FLAG, 1, 5 * SECOND), "the bond starts live");
+    stub_tb_fail("tb3");
+    wait_down(b.p, 2, why, sizeof(why), "the end with the failed link reports the bond down");
+    CHECK(strstr(why, "tb3") && strstr(why, "unexpected completion"), "naming the link and its reason");
+    wait_down(a.p, 2, why, sizeof(why), "the other end of the bond hears it");
+    CHECK(strstr(why, "other end failed") && strstr(why, "tb3"), "with the failed link's reason");
+    CHECK(mcdma_fabric_write_signal(a.p, 0, 0, 0, FLAG, 2) == MCDMA_FABRIC_PEER &&
+          mcdma_fabric_flush(a.p, SECOND) == MCDMA_FABRIC_PEER, "neither end keeps using the surviving link");
+    close_pair(&a, &b);
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
     g_mode = argv[1];
@@ -643,6 +765,9 @@ int main(int argc, char **argv) {
     else if (!strcmp(g_mode, "bond-small")) scenario_bond_small();
     else if (!strcmp(g_mode, "bond-wait")) scenario_bond_wait();
     else if (!strcmp(g_mode, "bond-names")) scenario_bond_names();
+    else if (!strcmp(g_mode, "zero")) scenario_zero();
+    else if (!strcmp(g_mode, "down")) scenario_down();
+    else if (!strcmp(g_mode, "bond-down")) scenario_bond_down();
     else return 2;
     printf("test_fabric %s: ok\n", g_mode);
     return 0;
