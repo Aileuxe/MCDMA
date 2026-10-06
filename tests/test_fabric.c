@@ -834,8 +834,12 @@ static void spin_flag(const struct rank *r, uint64_t off, uint64_t value, const 
     }
 }
 
+extern int mcdma_fabric_test_no_ask;
+
 static void scenario_bond_stripe(void) {
     struct rank a, b;
+    /* with "asleep" the links' threads never take a handed tail, so every one goes by the sender's fallback */
+    if (getenv("BOND_ASLEEP")) mcdma_fabric_test_no_ask = 1;
     open_bond_pair(&a, &b);
     /* a granted queue of a few packets takes smaller messages, so larger writes go as several */
     int whole = !getenv("STUB_TB_DEPTH");
@@ -961,8 +965,9 @@ static void scenario_bond_pingpong(void) {
     uint64_t b0 = link_bytes(&b, 0), b1 = link_bytes(&b, 1);
     exchanges(&a, &b, 201, 400, 0);
     a0 = link_bytes(&a, 0) - a0, a1 = link_bytes(&a, 1) - a1, b0 = link_bytes(&b, 0) - b0, b1 = link_bytes(&b, 1) - b1;
-    CHECK(a0 * 4 > a0 + a1 && a1 * 4 > a0 + a1 && b0 * 4 > b0 + b1 && b1 * 4 > b0 + b1,
-          "both links carry at least a quarter of each rank's exchanges");
+    /* measured rates can differ up to 3:1, and whole messages favour the faster link */
+    CHECK(a0 * 6 > a0 + a1 && a1 * 6 > a0 + a1 && b0 * 6 > b0 + b1 && b1 * 6 > b0 + b1,
+          "both links carry at least a sixth of each rank's exchanges");
     CHECK(!mcdma_fabric_flush(a.p, 5 * SECOND) && !mcdma_fabric_flush(b.p, 5 * SECOND), "both ranks flush");
     close_pair(&a, &b);
 }

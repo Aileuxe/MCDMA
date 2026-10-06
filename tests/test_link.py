@@ -171,6 +171,11 @@ class LinkTests(unittest.TestCase):
     def test_public_maximum_names_fit_bond_lane_suffixes(self):
         self.run_case('fabric', 'bond-names', STUB_STRICT='1')
 
+    def test_receives_go_back_after_a_reply_has_posted(self):
+        for seed, lazy in (('1', {'STUB_LAZY': '1'}), ('2', {})):
+            with self.subTest(seed=seed, lazy=bool(lazy)):
+                self.run_case('link-tb', 'repost', STUB_SEED=seed, **lazy)
+
     def test_bond_write_signals_are_cut_one_message_a_link(self):
         self.run_case('link-tb', 'tail', STUB_SEED='2', STUB_LAZY='1')
         self.run_case('fabric', 'bond-plan')
@@ -178,6 +183,8 @@ class LinkTests(unittest.TestCase):
             with self.subTest(seed=seed, depth=depth):
                 depth_env = {'STUB_TB_DEPTH': depth} if depth else {}
                 self.run_case('fabric', 'bond-stripe', STUB_SEED=seed, STUB_STRICT='1', STUB_LAZY='1', **depth_env)
+        with self.subTest(fallback='a tail its link thread never takes is posted by the sender'):
+            self.run_case('fabric', 'bond-stripe', STUB_SEED='3', STUB_STRICT='1', STUB_LAZY='1', BOND_ASLEEP='1')
 
     def test_bond_carries_tensor_parallel_exchanges_on_both_links(self):
         for seed, lazy in (('1', {'STUB_LAZY': '1'}), ('3', {'STUB_LAZY': '1'}), ('5', {})):
@@ -202,6 +209,9 @@ class LinkTests(unittest.TestCase):
                          'bond-pingpong', 'bond-later', 'bond-magic', 'bond-down', 'down', 'zero'):
             with self.subTest(scenario=scenario):
                 self.run_case('fabric-tsan', scenario, STUB_SEED='4', STUB_STRICT='1', STUB_LAZY='1', timeout=300)
+        with self.subTest(scenario='bond-stripe, sender fallback'):
+            self.run_case('fabric-tsan', 'bond-stripe', STUB_SEED='4', STUB_STRICT='1', STUB_LAZY='1', BOND_ASLEEP='1',
+                          timeout=300)
 
     def test_a_zero_length_write_signal_is_a_signal(self):
         done = self.run_case('fabric', 'zero', STUB_SEED='5', STUB_STRICT='1', STUB_LAZY='1', MCDMA_FABRIC_LOG='1')

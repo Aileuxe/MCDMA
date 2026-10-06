@@ -8,6 +8,8 @@
  *   bond      transport hooks see complete writes and exact signal metadata; nonblocking credit is bounded
  *   tail      a headless tail waits for its announcement, lands where it says and counts as its write; a joined part
  *             waits for the bond's go-ahead, announces its tail, and a mismatched tail fails the link
+ *   repost    a progress thread leaves a landed message's receives for a reply's moment, holds them back while a
+ *             caller waits for the lock, then puts them back; plain progress puts them back at once
  * Exit 0 means pass; STUB_SEED changes the delivery order across queue pairs. */
 #include "../rpc/link.h"
 
@@ -471,6 +473,43 @@ static void scenario_tail(struct side *a, struct side *b) {
     b->failed = 1;
 }
 
+/* Send one write from a to b and progress b with `wanted` until it lands. */
+static void land(struct side *a, struct side *b, uint64_t len, const int *wanted) {
+    uint64_t before = tb_writes_placed(&b->e), deadline = link_now_ns() + TIMEOUT;
+    CHECK(!tb_write(&a->e, &a->r, 1ull << 20, 2ull << 20, len, TIMEOUT), "a write posts");
+    while (tb_writes_placed(&b->e) == before) {
+        CHECK((wanted ? tb_progress_some(&b->e, wanted) : tb_progress(&b->e)) >= 0 && tb_progress(&a->e) >= 0,
+              "both ends progress");
+        CHECK(link_now_ns() < deadline, "the write never landed");
+    }
+}
+
+static void scenario_repost(struct side *a, struct side *b) {
+    stop(b);
+    int wanted = 0;
+    /* the receives a landed message used wait a moment, so a reply posted right away does not queue behind them */
+    land(a, b, 40960, &wanted);
+    CHECK(tb_unposted(&b->e) >= 10, "a progress thread leaves the landed message's receives for a moment");
+    /* while a caller waits for the lock, they stay back, however long it waits */
+    wanted = 1;
+    uint64_t until = link_now_ns() + 3 * TB_REPOST_WAIT_NS;
+    while (link_now_ns() < until) CHECK(tb_progress_some(&b->e, &wanted) >= 0, "progress while a caller waits");
+    CHECK(tb_unposted(&b->e) >= 10, "a waiting caller keeps the receives back");
+    /* then they go back, a batch a pass */
+    wanted = 0;
+    uint64_t deadline = link_now_ns() + TIMEOUT;
+    while (tb_unposted(&b->e)) {
+        CHECK(tb_progress_some(&b->e, &wanted) >= 0, "progress puts the receives back");
+        CHECK(link_now_ns() < deadline, "the receives never went back");
+    }
+    /* plain progress, as a sender waiting for room uses, puts them back at once */
+    land(a, b, 40960, NULL);
+    CHECK(!tb_unposted(&b->e), "plain progress puts every receive back at once");
+    /* a ring more than a quarter used refills at once, as a stream needs */
+    for (int i = 0; i < 3; ++i) land(a, b, 1ull << 20, &wanted);
+    CHECK(tb_unposted(&b->e) < 512, "a quarter-used ring refills without waiting");
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
     g_mode = argv[1];
@@ -491,6 +530,7 @@ int main(int argc, char **argv) {
     }
     else if (!strcmp(g_mode, "bond")) scenario_bond(&a, &b);
     else if (!strcmp(g_mode, "tail")) scenario_tail(&a, &b);
+    else if (!strcmp(g_mode, "repost")) scenario_repost(&a, &b);
     else if (!strcmp(g_mode, "random")) scenario_random(&a, &b);
     else if (bounds) g_quiet = 1, scenario_bounds(&a, &b);
     else if (!strcmp(g_mode, "teardown")) scenario_teardown(&a, &b);

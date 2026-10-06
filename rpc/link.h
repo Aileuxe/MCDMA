@@ -30,6 +30,7 @@
 #define TB_MSG (4ull << 20)         /* largest message */
 #define TB_DEPTH 4095               /* send queue depth in packets that Thunderbolt allows */
 #define TB_TRY_MAX (256ull << 10)    /* largest bounded, nonblocking bonded write chunk */
+#define TB_REPOST_WAIT_NS 5000ull   /* how long a progress thread leaves a landed message's receives for a reply */
 #define LINK_REGION_MAX 128         /* registrations per region, and keys per exchange datagram */
 #define LINK_MRS (LINK_REGION_MAX + 4)
 #define LINK_RC_DEPTH 31            /* RoCE CQ and send queue: the CX5 provider refuses 63 */
@@ -150,6 +151,9 @@ int tb_write_signal(struct ep *e, const struct region *src, uint64_t off, uint64
                     uint64_t value, uint64_t timeout_ns);
 int tb_fence(struct ep *e, uint64_t timeout_ns);
 int tb_progress(struct ep *e);
+/* tb_progress, but reposting receives stops while *wanted is nonzero: a caller waits for the endpoint's lock. */
+int tb_progress_some(struct ep *e, const int *wanted);
+uint64_t tb_unposted(const struct ep *e); /* receive slots taken and not yet posted again */
 int tb_busy(const struct ep *e);
 const char *tb_failure(const struct ep *e); /* why the link failed, or NULL while it works */
 /* Waits for send room or a fence answer call `gone` about once a millisecond and give up when it returns nonzero. */

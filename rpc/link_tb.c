@@ -25,7 +25,8 @@ enum { C_WRITE = 1, C_INLINE, C_SIGNAL, C_FENCE, C_FENCE_ACK, C_WRITE_SIGNAL, C_
 #define BOND_SIGNAL_HEAD 48
 #define BOND_WS_HEAD 64
 #define TB_STALL_NS 10000000000ull /* a bonded message waiting this long on the other link fails its link */
-#define TB_RATE_MIN 16384u        /* a send this large measures its link's rate */
+#define TB_RATE_MIN 65536u        /* a send this large measures its link's rate; smaller ones are mostly latency */
+#define TB_RECV_BATCH 8u          /* receives a progress thread posts again between checks for a waiting caller */
 enum { T_SEND = 1, T_RECV };
 
 struct head {
@@ -53,6 +54,7 @@ struct tb {
     uint64_t done_ns, rate;       /* rate: bytes per microsecond, from large sends */
     struct tb_bond bond;          /* no hooks: not bonded */
     uint64_t stalled;             /* when the bonded message at the ring's head began waiting on the other link */
+    uint64_t taken_ns;            /* when the last message was taken from the ring */
     /* receiving: slots whose completion arrived, slots consumed, slots posted */
     uint64_t filled, used, posted;
     uint16_t rx_len[TB_RING];
@@ -136,7 +138,8 @@ static int post_send(struct ep *e, void *addr, uint32_t len, uint32_t lkey, int 
     }
     t->tx_packets[i] = (uint16_t)n, t->tx_staged[i] = (uint8_t)staged;
     t->tx_ns[i] = len >= TB_RATE_MIN ? link_now_ns() : 0;
-    t->tx_bytes[i] = len, t->sent_bytes += len;
+    t->tx_bytes[i] = len;
+    __atomic_store_n(&t->sent_bytes, t->sent_bytes + len, __ATOMIC_RELAXED);
     t->tx_payload[i] = payload, t->sent_payload += payload;
     t->packets += n, t->tx_posted++;
     return 0;
@@ -255,11 +258,17 @@ void tb_bond_hooks(struct ep *e, const struct tb_bond *hooks) {
 
 uint64_t tb_writes_posted(const struct ep *e) { return e->tb ? e->tb->writes_posted : 0; }
 uint64_t tb_writes_placed(const struct ep *e) { return e->tb ? e->tb->writes_placed : 0; }
-uint64_t tb_posted_bytes(const struct ep *e) { return e->tb ? e->tb->sent_bytes : 0; }
-uint64_t tb_completed_bytes(const struct ep *e) { return e->tb ? e->tb->completed_bytes : 0; }
+/* Readable without the endpoint's lock: a scheduler only needs a recent value. */
+uint64_t tb_posted_bytes(const struct ep *e) {
+    return e->tb ? __atomic_load_n(&e->tb->sent_bytes, __ATOMIC_RELAXED) : 0;
+}
+uint64_t tb_completed_bytes(const struct ep *e) {
+    return e->tb ? __atomic_load_n(&e->tb->completed_bytes, __ATOMIC_RELAXED) : 0;
+}
 uint64_t tb_posted_payload(const struct ep *e) { return e->tb ? e->tb->sent_payload : 0; }
 uint64_t tb_completed_payload(const struct ep *e) { return e->tb ? e->tb->completed_payload : 0; }
-uint64_t tb_rate(const struct ep *e) { return e->tb ? e->tb->rate : 0; }
+uint64_t tb_unposted(const struct ep *e) { return e->tb ? e->tb->used + e->tb->slots - e->tb->posted : 0; }
+uint64_t tb_rate(const struct ep *e) { return e->tb ? __atomic_load_n(&e->tb->rate, __ATOMIC_RELAXED) : 0; }
 
 static void placed(struct tb *t) {
     t->writes_placed++;
@@ -276,7 +285,7 @@ static void measure(struct tb *t, uint32_t i, uint64_t now) {
         uint64_t sample = (uint64_t)t->tx_bytes[i] * 1000 / (now - start);
         if (t->rate && sample > 4 * t->rate) sample = 4 * t->rate;
         if (t->rate && sample < t->rate / 4) sample = t->rate / 4;
-        t->rate = t->rate ? t->rate - t->rate / 8 + sample / 8 : sample;
+        __atomic_store_n(&t->rate, t->rate ? t->rate - t->rate / 8 + sample / 8 : sample, __ATOMIC_RELAXED);
     }
     t->done_ns = now;
 }
@@ -715,8 +724,31 @@ static int take(struct ep *e, uint64_t first, uint64_t count, uint64_t bytes) {
     return 1;
 }
 
-/* Take every whole message in order, then post the slots they used again, in ring order. */
-static void drain(struct ep *e) {
+/* Post the slots taken messages used again, in ring order. On a live Thunderbolt queue pair each receive costs
+ * 0.25-0.5 us (0.01-0.03 us on a fresh one), and a reply posted while they go back waits behind them. So a progress
+ * thread (`wanted`) leaves them for TB_REPOST_WAIT_NS after a message lands, when a reply would post, then puts
+ * back a batch a pass between polls, and stops while a caller waits for the lock. A ring more than a quarter used,
+ * as in a stream, refills at once. Without `wanted` every slot goes back now. */
+static void repost(struct ep *e, const int *wanted) {
+    struct tb *t = e->tb;
+    uint64_t want = t->used + t->slots - t->posted;
+    if (!want) return;
+    if (wanted) {
+        int low = t->posted - t->filled < (uint64_t)t->slots * 3 / 4;
+        if (!low && link_now_ns() - t->taken_ns < TB_REPOST_WAIT_NS) return;
+        if (!low && want > TB_RECV_BATCH) want = TB_RECV_BATCH;
+    }
+    while (want && !t->poisoned) {
+        if (wanted && __atomic_load_n(wanted, __ATOMIC_ACQUIRE)) break;
+        uint32_t most = wanted ? TB_RECV_BATCH : 64, n = want < most ? (uint32_t)want : most;
+        int got = post_recvs(e, t->posted, n);
+        if (got <= 0) break;
+        t->posted += (uint64_t)got, want -= (uint64_t)got;
+    }
+}
+
+/* Take every whole message in order, then post the slots they used again. */
+static void drain(struct ep *e, const int *wanted) {
     struct tb *t = e->tb;
     while (t->used < t->filled && !t->poisoned) {
         uint64_t end = t->used;
@@ -729,12 +761,9 @@ static void drain(struct ep *e) {
         if (take(e, t->used, count, bytes) <= 0) break;
         t->used = end + 1;
         t->stalled = 0;
+        t->taken_ns = link_now_ns();
     }
-    while (!t->poisoned && t->posted < t->used + t->slots) {
-        int n = post_recvs(e, t->posted, (uint32_t)(t->used + t->slots - t->posted));
-        if (n <= 0) break;
-        t->posted += (uint64_t)n;
-    }
+    repost(e, wanted);
 }
 
 static void complete(struct ep *e, const struct ibv_wc *wc, uint64_t now) {
@@ -752,7 +781,7 @@ static void complete(struct ep *e, const struct ibv_wc *wc, uint64_t now) {
                t->tx_done < t->tx_posted) {
         t->packets -= t->tx_packets[index];
         t->unstaged += t->tx_staged[index];
-        t->completed_bytes += t->tx_bytes[index];
+        __atomic_store_n(&t->completed_bytes, t->completed_bytes + t->tx_bytes[index], __ATOMIC_RELAXED);
         t->completed_payload += t->tx_payload[index];
         measure(t, (uint32_t)index, now);
         t->tx_done++;
@@ -764,7 +793,9 @@ static void complete(struct ep *e, const struct ibv_wc *wc, uint64_t now) {
 }
 
 /* Handle what has completed and apply what can take effect: the number of completions, or -1 once failed. */
-int tb_progress(struct ep *e) {
+int tb_progress(struct ep *e) { return tb_progress_some(e, NULL); }
+
+int tb_progress_some(struct ep *e, const int *wanted) {
     struct tb *t = e->tb;
     if (!t) return -1;
     struct ibv_wc wc[32];
@@ -777,7 +808,7 @@ int tb_progress(struct ep *e) {
         handled += n > 0 ? n : 0;
         if (n < 32) break;
     }
-    if (!t->poisoned) drain(e);
+    if (!t->poisoned) drain(e, wanted);
     return t->poisoned ? -1 : handled;
 }
 

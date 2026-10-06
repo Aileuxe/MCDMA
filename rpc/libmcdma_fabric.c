@@ -31,6 +31,7 @@
 #define BOND_SPLIT (16ull << 10)    /* a write_signal this long goes as one message on each link */
 #define BOND_PART 2048ull           /* the least either link carries of a write_signal cut across both */
 #define BOND_RATE 8000ull           /* bytes per microsecond assumed of a link that has not measured itself yet */
+#define BOND_ASK_NS 3000ull         /* a tail its link's thread has not taken by then, the sender posts itself */
 #define BOND_SIGNALS 4096u
 #define BOND_RANGES 128u
 #define BOND_MODE (MODE_DIRECT | 0x90) /* bonded (0x80) with tails (0x10): a bond end without them refuses this one */
@@ -56,7 +57,22 @@ struct mcdma_fabric {
     int npeers;
     struct mcdma_fabric *part[BOND_LINKS]; /* a bond owns two ordinary fabrics, each with its own progress lock */
     int bonded, wait_poll, waiters;
+    /* A bond's sender hands a cut write's tail to its link's progress thread, so the two links' sends post at once;
+     * a send's first barrier after posting waits 0.4-1.2 us for the device on macOS 27, and from one thread the
+     * second send would wait behind the first's. */
+    struct mcdma_fabric_peer *ask_lane;
+    uint64_t ask_off, ask_len;
+    int ask;
 };
+
+enum { ASK_NONE, ASK_OPEN, ASK_TAKEN, ASK_DONE, ASK_FAILED };
+
+#ifdef MCDMA_FABRIC_TESTING
+int mcdma_fabric_test_no_ask; /* progress threads leave handed tails alone, so the sender's fallback posts them */
+#define ASKS_TAKEN() (!__atomic_load_n(&mcdma_fabric_test_no_ask, __ATOMIC_RELAXED))
+#else
+#define ASKS_TAKEN() 1
+#endif
 
 struct bond_signal {
     uint64_t seq, need[BOND_LINKS], off, value;
@@ -367,7 +383,8 @@ static int peer_gone(void *arg) {
     return peer_down(p);
 }
 
-/* Under the lock: place Thunderbolt writes, reap RoCE completions, and every millisecond read exchange sockets. */
+/* Under the lock: place Thunderbolt writes, reap RoCE completions, and every millisecond read exchange sockets.
+ * Reposting receives waits for a later pass while a caller waits for the lock, so a reply is not held behind it. */
 static int progress_all(struct mcdma_fabric *f) {
     int handled = 0, read_sockets = link_now_ns() - f->serviced > SERVICE_NS;
     if (read_sockets) f->serviced = link_now_ns();
@@ -377,7 +394,7 @@ static int progress_all(struct mcdma_fabric *f) {
             tell_peer(p);
             continue;
         }
-        int n = p->e.kind == LINK_TB ? tb_progress(&p->e) : ep_reap(&p->e, 0, 0);
+        int n = p->e.kind == LINK_TB ? tb_progress_some(&p->e, &f->wanted) : ep_reap(&p->e, 0, 0);
         if (n < 0) {
             peer_fail(p, NULL, 1);
             tell_peer(p);
@@ -399,6 +416,14 @@ static void enter(struct mcdma_fabric *f) {
     __atomic_sub_fetch(&f->wanted, 1, __ATOMIC_ACQ_REL);
 }
 
+/* With the link's lock held: post the tail a bond's sender handed to this link. ASK_DONE or ASK_FAILED. */
+static int post_ask(struct mcdma_fabric *f) {
+    struct mcdma_fabric_peer *lane = f->ask_lane;
+    int r = peer_down(lane) ? -1 : tb_bond_tail(&lane->e, &f->win, f->ask_off, f->ask_len);
+    if (r) peer_fail(lane, r < 0 ? NULL : "a tail no longer fitted the link it was planned for", 1);
+    return r ? ASK_FAILED : ASK_DONE;
+}
+
 static void *progress_main(void *arg) {
     struct mcdma_fabric *f = arg;
 #ifdef __APPLE__
@@ -408,6 +433,13 @@ static void *progress_main(void *arg) {
 #endif
     uint64_t active = link_now_ns();
     while (!__atomic_load_n(&f->stop, __ATOMIC_ACQUIRE)) {
+        int open = ASK_OPEN, asked = __atomic_load_n(&f->ask, __ATOMIC_ACQUIRE) == ASK_OPEN && ASKS_TAKEN();
+        if (asked && !pthread_mutex_trylock(&f->lock)) {
+            if (__atomic_compare_exchange_n(&f->ask, &open, ASK_TAKEN, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                __atomic_store_n(&f->ask, post_ask(f), __ATOMIC_RELEASE);
+            pthread_mutex_unlock(&f->lock);
+            active = link_now_ns();
+        }
         if (__atomic_load_n(&f->wanted, __ATOMIC_ACQUIRE) || pthread_mutex_trylock(&f->lock)) continue;
         int handled = progress_all(f);
         pthread_mutex_unlock(&f->lock);
@@ -829,22 +861,14 @@ static int bond_write_locked(struct mcdma_fabric_peer *p, uint64_t off, uint64_t
 
 struct bond_load { uint64_t backlog, rate, max; };
 
-/* Each link's bytes sent and not yet completed, its recent rate and its largest message, under its own lock and
- * without making progress: the links' threads reap. A link that has not measured itself yet is taken to run like
- * the other. */
+/* Each link's bytes sent and not yet completed, its recent rate and its largest message, read without the links'
+ * locks: their threads reap, and a slightly old figure only shifts a cut. A link that has not measured itself yet is
+ * taken to run like the other. */
 static int bond_look(struct mcdma_fabric_peer *p, struct bond_load load[BOND_LINKS]) {
+    if (peer_down(p)) return -1;
     for (unsigned k = 0; k < BOND_LINKS; ++k) {
-        struct mcdma_fabric_peer *lane = p->part[k];
-        enter(lane->f);
-        int bad = peer_down(lane) || tb_failure(&lane->e) != NULL;
-        if (!bad) {
-            load[k].backlog = tb_posted_bytes(&lane->e) - tb_completed_bytes(&lane->e);
-            load[k].rate = tb_rate(&lane->e);
-            load[k].max = tb_message_max(&lane->e);
-        }
-        if (bad) peer_fail(lane, NULL, 1);
-        pthread_mutex_unlock(&lane->f->lock);
-        if (bad) return -1;
+        const struct ep *e = &p->part[k]->e;
+        load[k] = (struct bond_load){tb_posted_bytes(e) - tb_completed_bytes(e), tb_rate(e), tb_message_max(e)};
     }
     for (unsigned k = 0; k < BOND_LINKS; ++k)
         if (!load[k].rate) load[k].rate = load[!k].rate ? load[!k].rate : BOND_RATE;
@@ -893,7 +917,10 @@ static int bond_plan(const struct region *win, const struct bond_load load[BOND_
     if (start / seg != off / seg) return 1;
     uint64_t room = (start / seg + 1) * seg - off; /* bytes the head's message can carry in its registration */
     if (len >= BOND_SPLIT) {
+        /* rates no further apart than 3:1, so a noisy estimate cannot push a write wholly onto one link */
         int64_t r0 = (int64_t)load[0].rate, r1 = (int64_t)load[1].rate;
+        if (r0 > 3 * r1) r0 = 3 * r1;
+        if (r1 > 3 * r0) r1 = 3 * r0;
         int64_t x = (r0 * (int64_t)(load[1].backlog + len) - r1 * (int64_t)load[0].backlog) / (r0 + r1);
         uint64_t zero = x < 0 ? 0 : (uint64_t)x > len ? len : (uint64_t)x;
         unsigned h = *turn;
@@ -924,39 +951,67 @@ static int bond_plan(const struct region *win, const struct bond_load load[BOND_
     return 1;
 }
 
-/* Room on both links first, so a cut write never goes half posted; then the tail, then the head with the signal,
- * whose watermarks count the tail. The head waits at the receiver for the other link's earlier writes that it
- * overlaps, and for earlier signals when it covers a signalled word. 0 posted, 1 no room yet, 2 not representable
- * after all (nothing posted), -1 failed. */
+/* Wait for the tail handed to a link's progress thread; take it back and post it here if the thread has not taken it
+ * by BOND_ASK_NS, as when it sleeps after a long idle. 0 posted, -1 failed. */
+static int bond_ask_wait(struct mcdma_fabric *f) {
+    uint64_t give_up = link_now_ns() + BOND_ASK_NS;
+    int state;
+    while ((state = __atomic_load_n(&f->ask, __ATOMIC_ACQUIRE)) == ASK_OPEN || state == ASK_TAKEN) {
+        int open = ASK_OPEN;
+        if (state == ASK_OPEN && link_now_ns() > give_up &&
+            __atomic_compare_exchange_n(&f->ask, &open, ASK_TAKEN, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            enter(f);
+            __atomic_store_n(&f->ask, post_ask(f), __ATOMIC_RELEASE);
+            pthread_mutex_unlock(&f->lock);
+        }
+    }
+    __atomic_store_n(&f->ask, ASK_NONE, __ATOMIC_RELAXED);
+    return state == ASK_DONE ? 0 : -1;
+}
+
+/* Room on both links first, so a cut write never goes half posted. With both links locked, the watermarks count the
+ * tail and the head; then the tail goes to its link's progress thread while this thread posts the head with the
+ * signal, so both links' sends post at once (only this parent lock's holder nests the links' locks, so the order
+ * cannot deadlock). The head waits at the receiver for the other link's earlier writes that it overlaps, and for
+ * earlier signals when it covers a signalled word. 0 posted, 1 no room yet, 2 not representable after all (nothing
+ * posted), -1 failed. */
 static int bond_post(struct mcdma_fabric_peer *p, const struct bond_plan *plan, uint64_t off, uint64_t roff,
                      uint64_t len, uint64_t soff, uint64_t value) {
     unsigned h = plan->head, t = !h;
-    uint64_t first = plan->first, rest = len - first;
+    uint64_t first = plan->first, rest = len - first, need[BOND_LINKS], ord[BOND_LINKS], mine[BOND_LINKS] = {0, 0};
     struct mcdma_fabric_peer *head = p->part[h], *tail = p->part[t];
+    int signal = 0, asked = 0, tail_locked = 0;
     enter(head->f);
-    int can = peer_down(head) ? -1 : tb_can_bond_write_signal(&head->e, &head->f->win, off, first);
-    if (can < 0) peer_fail(head, NULL, 1);
-    pthread_mutex_unlock(&head->f->lock);
-    if (can != 1) return can < 0 ? -1 : can ? 2 : 1;
-    if (rest) {
-        enter(tail->f);
-        can = peer_down(tail) ? -1 : tb_bond_tail(&tail->e, &tail->f->win, off + first, rest);
-        if (can < 0) peer_fail(tail, NULL, 1);
-        pthread_mutex_unlock(&tail->f->lock);
-        if (can) return can;
+    int r = peer_down(head) ? -1 : tb_can_bond_write_signal(&head->e, &head->f->win, off, first);
+    r = r < 0 ? -1 : r == 1 ? 0 : r == 0 ? 1 : 2;
+    if (r < 0) peer_fail(head, NULL, 1);
+    if (!r && rest) {
+        enter(tail->f), tail_locked = 1;
+        r = peer_down(tail) ? -1 : tb_can_bond_tail(&tail->e, &tail->f->win, off + first, rest);
+        r = r < 0 ? -1 : r == 1 ? 0 : r == 0 ? 1 : 2;
+        if (r < 0) peer_fail(tail, NULL, 1);
     }
-    uint64_t need[BOND_LINKS], ord[BOND_LINKS], mine[BOND_LINKS] = {0, 0};
-    int signal;
-    bond_watermarks(p, need);
-    need[h]++;
-    bond_overlap(p, roff, len, ord, &signal);
-    unsigned flags = (ord[t] ? BOND_WAIT_LINK : 0) | (signal ? BOND_WAIT_SIGNALS : 0);
-    enter(head->f);
-    int r = peer_down(head) ? -1 : tb_bond_write_signal(&head->e, &head->f->win, off, roff, first, soff, value,
-                                                         p->tx_signal + 1, need, (uint32_t)rest, flags, ord[t], OP_NS);
-    if (r) peer_fail(head, r < 0 ? NULL : "a joined write could not follow its tail", 1);
+    if (!r) {
+        bond_watermarks(p, need);
+        need[h]++;
+        if (rest) {
+            need[t]++;
+            tail->f->ask_lane = tail, tail->f->ask_off = off + first, tail->f->ask_len = rest;
+            __atomic_store_n(&tail->f->ask, ASK_OPEN, __ATOMIC_RELEASE);
+            asked = 1;
+        }
+    }
+    if (tail_locked) pthread_mutex_unlock(&tail->f->lock);
+    if (!r) {
+        bond_overlap(p, roff, len, ord, &signal);
+        unsigned flags = (ord[t] ? BOND_WAIT_LINK : 0) | (signal ? BOND_WAIT_SIGNALS : 0);
+        r = tb_bond_write_signal(&head->e, &head->f->win, off, roff, first, soff, value, p->tx_signal + 1, need,
+                                 (uint32_t)rest, flags, ord[t], OP_NS);
+        if (r) peer_fail(head, r < 0 ? NULL : "a joined write could not follow its tail", 1), r = -1;
+    }
     pthread_mutex_unlock(&head->f->lock);
-    if (r) return -1;
+    if (asked && bond_ask_wait(tail->f)) r = -1;
+    if (r) return r;
     p->tx_signal++;
     mine[h] = need[h];
     if (rest) mine[t] = need[t];

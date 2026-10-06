@@ -102,10 +102,16 @@ fabric. Both ends need a library with tails, described next; an end without them
 
 `mcdma_fabric_write_signal` of 16 KiB or more is cut into one message on each link, so a write and its flag still cost
 one send per link. The library cuts the source so both links finish together, from what each has queued and the
-rate each measured on its own recent sends of 16 KiB and up: equal links each carry about half, and a link running
-at half the other's rate carries about a third. Link one's part goes as a joined message, its 64-byte head written
+rate each measured on its own recent sends of 64 KiB and up, counted no further apart than 3:1 so a noisy estimate
+cannot push a write onto one link: equal links each carry about half, and a link running at half the other's rate
+carries about a third. Link one's part goes as a joined message, its 64-byte head written
 into the room before the source as on one link. Link two's part, the bytes after it, goes as a tail: a message with
-no head, sent straight from the window. At the receiver the joined part announces the tail to the other link's
+no head, sent straight from the window. The sender reads each link's queue and rate without the links' locks. With
+both links locked it checks room for both parts and sets the watermarks; then it hands the tail to its link's progress
+thread and posts the joined part itself, so the two sends post at once: on macOS 27 the first memory barrier after a
+Thunderbolt send waits 0.4-1.2 µs for the device, and from one thread the second send would wait behind the first. A
+tail the thread has not taken within 3 µs, as when it sleeps after a long idle, the sender takes back and posts. At
+the receiver the joined part announces the tail to the other link's
 placement thread, both copy at once, and the signal publishes when both parts are in place. The joined part names
 the tail's write count on its link, so a lost or reordered tail fails the link. The receiver tells a tail from a
 head by its first four bytes, so the sender moves the cut one byte when the bytes there begin with a head's magic.
@@ -174,7 +180,10 @@ sends' frame counts. Two M3 Ultra Studios on macOS 27.0 (build 26A428) behaved d
 How a write lands:
 
 1. Each link keeps a ring of 2,048 one-packet receives (8 MiB) posted, so a message lands at once whatever the
-   receiver is doing.
+   receiver is doing. Posting a receive on a live Thunderbolt queue pair costs 0.25-0.5 µs (0.01-0.03 µs on a fresh
+   one), and a send posted meanwhile waits for the link's lock. So a progress thread puts a landed message's receives
+   back 5 µs later, when a reply has usually posted, in batches of eight between polls, and stops while a caller
+   waits for the lock; a ring more than a quarter used refills at once, as a stream needs.
 2. A write of up to 4,064 bytes travels inside one header message, a single packet.
 3. A larger write is a header message with its offset and length, then its bytes as a message of their own, sent
    straight from the window with no copy, in pieces of at most 4 MiB that never cross a registration.
