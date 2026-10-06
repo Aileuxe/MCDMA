@@ -13,7 +13,8 @@ enforces RoCE keys and models Thunderbolt RDMA as two Studios on macOS 27.0 meas
 
 | Call | What it does |
 | --- | --- |
-| `mcdma_fabric_open` | Opens one device, or two Thunderbolt devices joined by `+`, and registers the same window on each |
+| `mcdma_fabric_open` | Opens one device, or N Thunderbolt devices joined by `+`, and registers the same window on each |
+| `mcdma_fabric_connect_links`, `mcdma_fabric_max_links` | Explicit N UDP ports and supported member limit |
 | `mcdma_fabric_connect` | Meets one peer over a Thunderbolt IP interface; both sides call it with the same name |
 | `mcdma_fabric_write` | Copies a range of this window to an offset in the peer's window |
 | `mcdma_fabric_signal` | Stores an 8-byte word in the peer's window after every earlier write to that peer |
@@ -61,7 +62,7 @@ enforces RoCE keys and models Thunderbolt RDMA as two Studios on macOS 27.0 meas
 
 A window is page aligned and a whole number of pages: 16 KiB pages on Apple silicon. `mcdma_fabric_open` registers it
 once per device, and every peer on that device shares the registration. A bonded fabric registers that same memory
-on both devices. Separate fabrics on the same memory still represent separate peers and have no cross-peer ordering.
+on all devices. Separate fabrics on the same memory still represent separate peers and have no cross-peer ordering.
 
 | Link | Registration |
 | --- | --- |
@@ -86,80 +87,49 @@ returns once it has heard that the other holds its own. Each side binds UDP `por
 which is the same port unless two ranks share one host. The same admission rules apply as for the daemons, and on a
 Mac `via` must be the Thunderbolt port of a Thunderbolt device, or a Thunderbolt port at all for a CX5 device.
 
-## Two Thunderbolt links as one peer
+## N Thunderbolt links as one peer
 
-Join two devices with `+` in `mcdma_fabric_open`, for example `rdma_en2+rdma_en3`, and join their corresponding
-interfaces in the same order in `mcdma_fabric_connect`, for example `en2/192.0.2.10+en3/198.51.100.10`.
-Those addresses are documentation examples. Supply the peer's actual IPv4 address on each cable, or its admitted
-IPv6 link-local address. A single device and interface keep their existing meaning; `+` is an explicit opt-in.
-Both endpoints must open two Thunderbolt devices and give two matching interface entries. A bond needs two
-consecutive UDP ports: physical link zero uses `port`/`peer_port`, and physical link one uses each port plus one.
-A zero `peer_port` still means the local base port. Reserve both ports on both endpoints.
+Join two through eight distinct Thunderbolt devices with `+` in `mcdma_fabric_open`. Register the same window
+on every device. `gid_index = -1` scans each data device's GID table, skips zero entries and prefers IPv6 link-local.
+`fabric-check --gids DEVICE` prints its port state, limits and GID table. A data interface needs a usable GID and an
+ACTIVE port, but its QP does not require IPv4. Meeting traffic can use another existing member's interface and IP.
 
-One bonded peer owns both physical links, and each link has its own receive-placement thread, including when the
-caller did not request a progress thread. A caller can still explicitly request progress threads for a single-link
-fabric. Both ends need a library with tails, described next; an end without them refuses the bond at connect.
+Connect with one `via` shared by all members, or N entries in device order. For example, four devices
+`rdma_en4+rdma_en3+rdma_en2+rdma_en13` can meet entirely over `en4/192.0.2.2`. The address is an example.
+The meeting interface must expose an ACTIVE Thunderbolt RDMA device, which can be outside the data list.
+An external meeting device is opened briefly for validation, without creating a QP or registering a window. Each physical cable must connect
+matching positions in the two device lists. The old connect signature reserves N consecutive UDP ports starting
+at `port` and `peer_port`, with zero peer_port meaning the local base. The additive ABI 1
+`mcdma_fabric_connect_links` accepts N explicit nonzero, distinct local ports and N corresponding remote ports.
+`mcdma_fabric_max_links` reports the supported maximum. Old single-link callers retain their ABI and wire protocol.
+Bonds negotiate a new mode and N plus lane position; both ends must use this build. Mixed old/new bonds refuse.
 
-`mcdma_fabric_write_signal` of 16 KiB or more is cut into one message on each link, so a write and its flag still cost
-one send per link. The library cuts the source so both links finish together, from what each has queued and the
-rate each measured on its own recent sends of 64 KiB and up, counted no further apart than 3:1 so a noisy estimate
-cannot push a write onto one link: equal links each carry about half, and a link running at half the other's rate
-carries about a third. Link one's part goes as a joined message, its 64-byte head written
-into the room before the source as on one link. Link two's part, the bytes after it, goes as a tail: a message with
-no head, sent straight from the window. The sender reads each link's queue and rate without the links' locks. With
-both links locked it checks room for both parts and sets the watermarks; then it hands the tail to its link's progress
-thread and posts the joined part itself, so the two sends post at once: on macOS 27 the first memory barrier after a
-Thunderbolt send waits 0.4-1.2 µs for the device, and from one thread the second send would wait behind the first. A
-tail the thread has not taken within 3 µs, as when it sleeps after a long idle, the sender takes back and posts. At
-the receiver the joined part announces the tail to the other link's
-placement thread, both copy at once, and the signal publishes when both parts are in place. The joined part names
-the tail's write count on its link, so a lost or reordered tail fails the link. The receiver tells a tail from a
-head by its first four bytes, so the sender moves the cut one byte when the bytes there begin with a head's magic.
-The head's message is a whole number of 4 KiB packets where it can be, the links take turns carrying it, each part
-stays inside one source registration (a source that crosses one is cut at the boundary), and each fits the peer's
-ring. A write either link would carry almost all of goes whole on the link that finishes it first; one too large
-for one message a link, at most about 8 MiB, goes as writes and then a signal.
+Each member owns a progress thread. `write_signal` of at least 16 KiB divides the source into N contiguous parts,
+with at least 2 KiB per part and 64-byte cuts. Recent rates influence the cut, clamped to 3:1. All workers prepare
+before one release lets them post concurrently. Each part carries an ordered control header and ordinary payload,
+split further at registration or message boundaries. A final signal names all N placement watermarks. This costs
+more headers than the old two-link tail encoding, but avoids serializing the parts of one mid-size exchange.
 
-A write_signal under 16 KiB goes whole on the link that would finish it first. Links whose finish times are within a
-quarter of each other take turns, so traffic that leaves both idle between messages, such as a ping-pong, uses both;
-a link measured at half the other's rate gets small messages only when the other has a queue. A link that has not
-measured itself yet is taken to run like the other. Signals pick their link the same way.
+If a worker has not prepared within 100 us, the caller claims it and posts it after releasing the prepared workers.
+That fallback preserves correctness but may serialize some parts. A peer logs its first fallback so qualification
+can distinguish a warm concurrent path from scheduler delay. Smaller messages stay on one member; N greater than
+two uses a staged single-packet write and signal where the payload plus its 48 + 8*N bytes of metadata fits.
+The two-link small-message path keeps its joined encoding. The API still reserves only WS_ROOM bytes before the source.
 
-Plain writes are split into chunks of up to 256 KiB, assigned by each link's posted but not yet completed wire bytes;
-equal backlogs alternate. Small writes stay whole on one link. Each link's bulk backlog is bounded to roughly 1 MiB,
-so posting a large burst cannot leave half its bytes queued behind a degraded link.
+A signal publishes after all N prefixes cover its watermarks, in signal sequence order. Placement counts advance
+after payload copies. Overlapping write_signal calls carry the prior prefixes they must wait for at the receiver,
+and an overwrite of a signalled word also waits for prior signals. Plain overlapping writes retain their ordered
+member or fence every member first. `flush` fences remote placement on all members; local SEND completion is
+insufficient. Source bytes must remain unchanged through flush or the application's equivalent peer acknowledgement.
 
-A signal covers earlier writes on both links, not only the link carrying the signal. The receiver waits for the
-signal's per-link placement counts before publishing its word, and publishes later signals in order. A write with
-its signal has the same rule. Placement counters publish only after the payload copy; acquire/release word
-publication makes both links' earlier bytes visible to the waiting caller. The bounded signal reorder queue also
-has sender credit: after 4,096 signals without a fence, the sender fences both links before posting another, so a
-slow link cannot overflow that queue.
+Plain writes use bounded chunks and the least queued eligible member. Small operations retain one member's affinity.
+`link_count` returns N; `link_stats` reports posted and completed payload bytes in device order, excluding headers.
+A missing or inactive device refuses open and unwinds already opened members. A failed member poisons the entire
+peer and sends its reason. There is no silent reduced-width mode because both ends must agree on every watermark.
+Disconnect and explicitly reconnect with the same smaller list on both ends if reduced width is wanted.
 
-Overlapping writes retain posting order across the bond. The sender records the remote ranges of writes and
-signalled words the receiver may not have placed yet, with the latest write on each link into each range;
-overlapping ranges merge, and a full table folds into one range that every later call treats as overlapping until a
-flush empties it. A joined write_signal that overlaps earlier writes on the other link carries that link's write
-count, and its receiver places it only once that many are placed; one that covers a word an earlier signal stores
-also waits for every earlier signal to publish. That wait happens at the receiver, beside data already arriving, so
-a tensor-parallel exchange that rewrites the same slots every other step pays no fence. A plain write cannot wait that
-way: one over bytes only one link carried stays on that link's ordered queue, and one over bytes both links carried,
-or over a signalled word, first fences both links. `flush` completes both links and waits for the receiving side's
-placement fence; send completion alone is not proof of remote placement on Thunderbolt. A bonded message that waits
-10 s on the other link fails its link, since only a lost message keeps it waiting that long. A failed physical link
-fails the entire peer, so later writes, signals and flushes report failure rather than silently using only the
-surviving link. Disconnect and reconnect the peer after resolving the failed link.
-
-`mcdma_fabric_link_count(peer)` returns one or two. `mcdma_fabric_link_stats(peer, index, &stats)` reports payload
-bytes posted and completed on that physical link, excluding protocol headers and control signals. On RoCE the
-completed counter is published at successful flush. Snapshot before
-and after a workload to get its per-link bytes. Flush before taking the final snapshot. Completion counters measure
-send completion; the flush fence supplies the separate remote-placement guarantee.
-
-On macOS, `MCDMA_FABRIC_QOS=1` gives progress threads user-interactive QoS; `0` leaves the default QoS.
-`MCDMA_FABRIC_WAIT_POLL=1`, the default, lets a caller waiting in `mcdma_fabric_wait` poll completions cooperatively
-instead of waiting only for the progress thread's handoff; `0` selects the thread-only comparison when a progress
-thread exists. A caller that spins on its window word, as the qualification does, relies on the progress threads.
+`MCDMA_FABRIC_QOS=1` gives progress threads user-interactive QoS on macOS. Cooperative wait polling remains available
+through `MCDMA_FABRIC_WAIT_POLL`; a caller spinning directly on its word relies on the progress threads.
 
 ## Thunderbolt links
 

@@ -76,7 +76,24 @@ int ep_open(struct ep *e, const char *device, int gid_index, int mtu) {
     }
     e->kind = port.link_layer == LINK_LAYER_TB ? LINK_TB : LINK_ROCE;
     e->lid = port.lid;
-    if (ibv_query_gid(e->ctx, 1, gid_index, &e->gid)) {
+    if (gid_index == -1 && e->kind == LINK_TB) {
+        int found = -1;
+        union ibv_gid candidate;
+        for (int i = 0; i < port.gid_tbl_len && i < 256; ++i) {
+            if (ibv_query_gid(e->ctx, 1, i, &candidate)) continue;
+            int nonzero = 0;
+            for (int j = 0; j < 16; ++j) nonzero |= candidate.raw[j];
+            if (!nonzero) continue;
+            if (found < 0) { found = i; e->gid = candidate; }
+            if (candidate.raw[0] == 0xfe && (candidate.raw[1] & 0xc0) == 0x80) {
+                found = i; e->gid = candidate; break;
+            }
+        }
+        if (found < 0) { link_log("%s: no usable GID; the owner must provide an address on this port", device); return -1; }
+        e->gid_index = found;
+        link_log("%s: selected GID index %d (%s)", device, found,
+                 e->gid.raw[0] == 0xfe && (e->gid.raw[1] & 0xc0) == 0x80 ? "IPv6 link-local" : "nonzero");
+    } else if (gid_index < 0 || ibv_query_gid(e->ctx, 1, gid_index, &e->gid)) {
         link_log("%s: gid %d", device, gid_index);
         return -1;
     }

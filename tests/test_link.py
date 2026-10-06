@@ -50,6 +50,7 @@ class LinkTests(unittest.TestCase):
             'link-xchg': [*LINK, *STUB, 'tests/test_link_xchg.c'],
             'rpcd-tb': [*dirs, '-DRPC_ECHO_NO_MAIN', *DAEMON, *LINK, *STUB, 'rpc/rpc_echo.c', 'tests/test_rpcd_tb.c'],
             'fabric': FABRIC,
+            'nbond': ['-DMCDMA_FABRIC_TEST_DMABUF', '-DMCDMA_FABRIC_TESTING', 'rpc/libmcdma_fabric.c', *LINK, *STUB, 'tests/test_nbond.c'],
             'fabric-check': ['-DFABRIC_CHECK_NO_MAIN', 'rpc/fabric_check.c', 'rpc/libmcdma_fabric.c', *LINK, *STUB,
                              'tests/test_fabric_check.c'],
             'mesh-check': ['-DMESH_CHECK_NO_MAIN', 'rpc/mesh_check.c', 'rpc/libmcdma_fabric.c', *LINK, *STUB,
@@ -62,6 +63,8 @@ class LinkTests(unittest.TestCase):
         if cls.threads:
             subprocess.run([*cls.threads, *FABRIC, '-lpthread', '-o', os.path.join(cls.work, 'fabric-tsan')], cwd=ROOT,
                            check=True)
+            subprocess.run([*cls.threads, *builds['nbond'], '-lpthread', '-o', os.path.join(cls.work, 'nbond-tsan')],
+                           cwd=ROOT, check=True)
 
     @classmethod
     def tearDownClass(cls):
@@ -77,6 +80,11 @@ class LinkTests(unittest.TestCase):
 
     def library_lines(self, done):
         return [line for line in done.stderr.splitlines() if line.startswith('mcdma-fabric: ')]
+
+    def test_n_link_completion_and_fail_closed(self):
+        for n in ('3', '4', '8'):
+            with self.subTest(links=n):
+                self.run_case('nbond', n, STUB_SEED='7', STUB_STRICT='1', STUB_LAZY='1')
 
     def test_the_exchange_admits_only_on_link_peers(self):
         self.run_case('link-xchg')
@@ -205,6 +213,8 @@ class LinkTests(unittest.TestCase):
     def test_bond_threads_are_race_free(self):
         if not self.threads:
             self.skipTest('the compiler has no ThreadSanitizer')
+        self.run_case('nbond-tsan', '4', STUB_SEED='4', STUB_STRICT='1', STUB_LAZY='1')
+        self.run_case('nbond-tsan', '4', STUB_SEED='4', STUB_STRICT='1', STUB_LAZY='1', BOND_ASLEEP='1')
         for scenario in ('bond', 'bond-order', 'bond-overlap', 'bond-fail', 'bond-credit', 'bond-stripe',
                          'bond-pingpong', 'bond-later', 'bond-magic', 'bond-down', 'down', 'zero'):
             with self.subTest(scenario=scenario):

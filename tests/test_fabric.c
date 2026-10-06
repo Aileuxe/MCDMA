@@ -340,7 +340,7 @@ static void scenario_bond_args(void) {
     unsigned char *mem = window();
     struct mcdma_fabric *f = NULL;
     struct mcdma_fabric_peer *p = NULL;
-    const char *bad[] = {"+tb0", "tb0+", "tb0++tb2", "tb0+tb2+tb4", "tb0+tb0", "tb0 +tb2", "tb0+ tb2"};
+    const char *bad[] = {"+tb0", "tb0+", "tb0++tb2", "tb0+tb0", "tb0 +tb2", "tb0+ tb2"};
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i)
         CHECK(mcdma_fabric_open(bad[i], 0, 4096, mem, WINDOW, -1, 0, 0, &f) == MCDMA_FABRIC_INVALID && !f,
               "a malformed bond device list");
@@ -349,8 +349,8 @@ static void scenario_bond_args(void) {
     CHECK(mcdma_fabric_open("roce0+roce1", 0, 4096, mem, WINDOW, -1, 0, 0, &f) == MCDMA_FABRIC_UNSUPPORTED && !f,
           "a RoCE pair is unsupported");
     CHECK(!mcdma_fabric_open("tb0+tb2", 0, 4096, mem, WINDOW, -1, 0, 0, &f), "a valid bond opens");
-    CHECK(mcdma_fabric_connect(f, g_lo, 18000, 18002, "pair", SECOND, &p) == MCDMA_FABRIC_INVALID && !p,
-          "a bond requires two via entries");
+    CHECK(mcdma_fabric_connect(f, g_lo, 18000, 18002, "pair", 1000000, &p) == MCDMA_FABRIC_TIMEOUT && !p,
+          "one meeting via is accepted but nobody answers");
     const char *bad_via[] = {"+lo", "lo+", "lo++lo", "lo+lo+lo", "lo +lo", "lo+ lo"};
     for (size_t i = 0; i < sizeof(bad_via) / sizeof(bad_via[0]); ++i)
         CHECK(mcdma_fabric_connect(f, bad_via[i], 18000, 18002, "pair", SECOND, &p) == MCDMA_FABRIC_INVALID && !p,
@@ -558,10 +558,9 @@ static void small_lanes(struct rank *a, struct rank *b, uint64_t off, uint64_t l
 static void scenario_bond_small(void) {
     struct rank a, b;
     open_bond_pair(&a, &b);
-    /* A queue too shallow for 8 KiB messages cannot carry 16 KiB as one message a link: it goes as writes. */
-    int deep = !getenv("STUB_TB_DEPTH") || atoi(getenv("STUB_TB_DEPTH")) >= 64;
+    /* Parallel parts keep using both links when a shallow queue cuts each part into smaller payload messages. */
     small_lanes(&a, &b, WINDOW / 2 + MCDMA_FABRIC_WS_ROOM, 16384, 1, 0, 1);
-    small_lanes(&a, &b, WINDOW / 2 + MCDMA_FABRIC_WS_ROOM, 16384, 2, 1, deep ? 2 : 1);
+    small_lanes(&a, &b, WINDOW / 2 + MCDMA_FABRIC_WS_ROOM, 16384, 2, 1, 2);
     small_lanes(&a, &b, WINDOW / 2 + MCDMA_FABRIC_WS_ROOM, 16383, 3, 1, 1);
     small_lanes(&a, &b, (12ull << 20) - 4096, 8192, 4, 0, 1);
     small_lanes(&a, &b, (12ull << 20) - 4096, 8192, 5, 1, 1);
@@ -851,8 +850,8 @@ static void scenario_bond_stripe(void) {
         for (unsigned k = 0; k < 2; ++k) CHECK(!mcdma_fabric_link_stats(a.p, k, &before[k]), "counters before");
         fill(&a, src, len, i + 1);
         CHECK(!mcdma_fabric_write_signal(a.p, src, 0, len, FLAG, i + 1), "a bonded write-and-signal posts");
-        CHECK(!whole || (stub_tb_sends("tb0") == sends[0] + 1 && stub_tb_sends("tb2") == sends[1] + 1),
-              "it is exactly one message on each link");
+        CHECK(!whole || (stub_tb_sends("tb0") >= sends[0] + 2 && stub_tb_sends("tb2") >= sends[1] + 2),
+              "each link posts a control header and payload");
         spin_flag(&b, FLAG, i + 1, "the flag arrives");
         CHECK(landed(&b, 0, len, 0, i + 1), "every byte precedes the flag");
         for (unsigned k = 0; k < 2; ++k) CHECK(!mcdma_fabric_link_stats(a.p, k, &after[k]), "counters after");
@@ -878,8 +877,8 @@ static void scenario_bond_stripe(void) {
     uint64_t at = (24ull << 20) - 100000, sends[2] = {stub_tb_sends("tb0"), stub_tb_sends("tb2")};
     fill(&a, at, 300000, 200);
     CHECK(!mcdma_fabric_write_signal(a.p, at, 4096, 300000, FLAG, 200), "a write-and-signal across a registration");
-    CHECK(!whole || (stub_tb_sends("tb0") == sends[0] + 1 && stub_tb_sends("tb2") == sends[1] + 1),
-          "one message on each link");
+    CHECK(!whole || (stub_tb_sends("tb0") >= sends[0] + 2 && stub_tb_sends("tb2") >= sends[1] + 2),
+          "both links post a payload message");
     spin_flag(&b, FLAG, 200, "its flag arrives");
     CHECK(landed(&b, 4096, 300000, 0, 200), "and its bytes");
     /* larger than one message a link can carry: writes, then the signal, still in order */
@@ -1039,7 +1038,7 @@ static void scenario_bond_magic(void) {
     for (unsigned round = 1; round <= 4; ++round) {
         uint64_t sends[2] = {stub_tb_sends("tb0"), stub_tb_sends("tb2")};
         CHECK(!mcdma_fabric_write_signal(a.p, src, 0, len, FLAG, round), "a write of nothing but magic posts");
-        CHECK(stub_tb_sends("tb0") == sends[0] + 1 && stub_tb_sends("tb2") == sends[1] + 1, "one message a link");
+        CHECK(stub_tb_sends("tb0") >= sends[0] + 2 && stub_tb_sends("tb2") >= sends[1] + 2, "framed payloads on both links");
         spin_flag(&b, FLAG, round, "its flag arrives");
         CHECK(!memcmp(b.mem, a.mem + src, len), "every byte lands");
     }

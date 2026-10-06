@@ -27,6 +27,7 @@
 #define TB_RING 2048                /* one-packet receives each link keeps posted: 8 MiB */
 #define TB_STAGE 64                 /* header messages in flight */
 #define TB_SEND_WR 1024             /* sends in flight */
+#define TB_BOND_MAX 8u
 #define TB_MSG (4ull << 20)         /* largest message */
 #define TB_DEPTH 4095               /* send queue depth in packets that Thunderbolt allows */
 #define TB_TRY_MAX (256ull << 10)    /* largest bounded, nonblocking bonded write chunk */
@@ -178,6 +179,8 @@ struct tb_bond {
     int (*ready)(void *arg, uint64_t seq, unsigned flags, uint32_t wait);
     int (*announce)(void *arg, uint64_t off, uint32_t len, uint32_t ordinal);
     int (*tail)(void *arg, uint64_t *off, uint32_t *len, uint32_t *ordinal);
+    unsigned links;             /* 0 is the legacy two-link hook; otherwise the negotiated count */
+    int (*ready_n)(void *arg, uint64_t seq, unsigned flags, const uint32_t *wait);
 };
 void tb_bond_hooks(struct ep *e, const struct tb_bond *hooks);
 uint64_t tb_writes_posted(const struct ep *e);
@@ -195,6 +198,13 @@ int tb_can_write(const struct ep *e, const struct region *src, uint64_t off, uin
 int tb_write_try(struct ep *e, const struct region *src, uint64_t off, uint64_t roff, uint64_t len);
 int tb_bond_signal(struct ep *e, uint64_t soff, uint64_t value, uint64_t seq, const uint64_t need[2],
                     uint64_t timeout_ns);
+int tb_bond_signal_n(struct ep *e, uint64_t soff, uint64_t value, uint64_t seq, const uint64_t *need,
+                      unsigned links, uint64_t timeout_ns);
+int tb_bond_write_n(struct ep *e, const struct region *src, uint64_t off, uint64_t roff, uint64_t len,
+                     uint64_t seq, const uint64_t *wait, unsigned links, unsigned flags, uint64_t timeout_ns);
+int tb_bond_inline_n(struct ep *e, const struct region *src, uint64_t off, uint64_t roff, uint64_t len,
+                      uint64_t soff, uint64_t value, uint64_t seq, const uint64_t *need, const uint64_t *wait,
+                      unsigned links, unsigned flags, uint64_t timeout_ns);
 int tb_can_bond_signal(const struct ep *e); /* -1 invalid/failed, 0 no staged-header room, 1 ready */
 /* -1 invalid/failed, 0 no room, 1 fused ready, 2 not representable; no progress or source changes. */
 int tb_can_bond_write_signal(const struct ep *e, const struct region *src, uint64_t off, uint64_t len);

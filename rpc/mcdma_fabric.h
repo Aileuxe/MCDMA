@@ -10,6 +10,7 @@
 #include <stdint.h>
 
 #define MCDMA_FABRIC_ABI 1u
+#define MCDMA_FABRIC_MAX_LINKS 8u
 #if defined(__GNUC__)
 #define MCDMA_FABRIC_API __attribute__((visibility("default")))
 #else
@@ -41,19 +42,28 @@ extern "C" {
 /* The ABI this library implements; callers refuse any other value. */
 MCDMA_FABRIC_API uint32_t mcdma_fabric_abi(void);
 
-/* Open `device` and register `window`, page aligned and a whole number of pages, for it. Exactly one '+' bonds two
- * Thunderbolt devices, e.g. "rdma_en3+rdma_en4", and registers the same window on both. A bond always starts one
+/* Open `device` and register `window`, page aligned and a whole number of pages, for it. '+' bonds up to MAX_LINKS
+ * distinct Thunderbolt devices and registers the same window on all. A bond always starts one
  * progress thread per link. Single-link strings and ABI 1 are unchanged. On Linux, dmabuf_fd >= 0 registers that
- * DMA-BUF from dmabuf_offset instead, `window` being its CPU mapping; elsewhere it is UNSUPPORTED. */
+ * DMA-BUF from dmabuf_offset instead, `window` being its CPU mapping; elsewhere it is UNSUPPORTED.
+ * gid_index -1 scans each Thunderbolt data device for a nonzero GID, preferring IPv6 link-local. */
 MCDMA_FABRIC_API int mcdma_fabric_open(const char *device, int gid_index, int path_mtu, void *window, size_t length,
                                        int dmabuf_fd, uint64_t dmabuf_offset, uint32_t flags, struct mcdma_fabric **out);
 
-/* Meet over `via`: IFACE, IFACE/fe80::ADDR or IFACE/IPv4 to admit only that address. A bond requires two entries
+/* Meet over `via`: IFACE, IFACE/fe80::ADDR or IFACE/IPv4 to admit only that address. A bond accepts N entries
  * joined by '+', in device order, e.g. "en3/192.0.2.10+en4/198.51.100.10". Both ends must bond the corresponding links
- * and call with the same name. Lane k binds UDP port+k and sends to peer_port+k (0 means port); a bond therefore
- * needs two consecutive ports. Returns once every queue pair is at RTS and both links name the same remote peer. */
+ * and call with the same name. One meeting via on an existing active Thunderbolt interface also works for all data devices,
+ * even when that device is outside the data list.
+ * Lane k binds UDP port+k and sends to peer_port+k (0 means port). Both ends must use the same N-aware wire build.
+ * Returns once every queue pair is at RTS and all links name the same remote peer. */
 MCDMA_FABRIC_API int mcdma_fabric_connect(struct mcdma_fabric *f, const char *via, int port, int peer_port,
                                           const char *name, uint64_t timeout_ns, struct mcdma_fabric_peer **out);
+
+/* Additive ABI 1: physical ports in device order, with one via for the meeting or one per device. */
+MCDMA_FABRIC_API int mcdma_fabric_connect_links(struct mcdma_fabric *f, const char *via, const uint16_t *ports,
+                                               const uint16_t *peer_ports, unsigned nports, const char *name,
+                                               uint64_t timeout_ns, struct mcdma_fabric_peer **out);
+MCDMA_FABRIC_API unsigned mcdma_fabric_max_links(void);
 
 /* MCDMA_FABRIC_ROCE or MCDMA_FABRIC_THUNDERBOLT. */
 MCDMA_FABRIC_API int mcdma_fabric_link(const struct mcdma_fabric_peer *p);
@@ -67,7 +77,7 @@ MCDMA_FABRIC_API uint64_t mcdma_fabric_peer_length(const struct mcdma_fabric_pee
  * up, so a caller spinning on a window word can poll it. */
 MCDMA_FABRIC_API int mcdma_fabric_peer_status(const struct mcdma_fabric_peer *p, char *why, size_t n);
 
-/* Additive ABI 1 diagnostics: one link for an ordinary peer, two for a bond; NULL has zero. Counts are write payload
+/* Additive ABI 1 diagnostics: one link for an ordinary peer, N for a bond; NULL has zero. Counts are write payload
  * bytes, excluding headers, signals and fence traffic. Local SEND completion is not proof of remote placement;
  * the API requires flush before source reuse. RoCE completed_bytes is published at successful flush. Index order
  * is the device/via string order. */
@@ -88,7 +98,7 @@ MCDMA_FABRIC_API int mcdma_fabric_write(struct mcdma_fabric_peer *p, uint64_t lo
 MCDMA_FABRIC_API int mcdma_fabric_signal(struct mcdma_fabric_peer *p, uint64_t remote_offset, uint64_t value);
 
 /* mcdma_fabric_write, then mcdma_fabric_signal, fused when representable on one Thunderbolt link. A bond sends 16 KiB
- * or more as one message on each link, cut so both finish together, and the peer publishes the signal once both parts
+ * or more as concurrent parts on every link, and the peer publishes the signal once all parts
  * are placed; less goes whole on one link. The library may overwrite the MCDMA_FABRIC_WS_ROOM bytes
  * before local_offset; both ends need a library that has this call. A length of 0 is mcdma_fabric_signal, on any
  * link and with no room needed before local_offset. */

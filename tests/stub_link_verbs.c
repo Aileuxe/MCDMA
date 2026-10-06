@@ -16,7 +16,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#define NDEV 14
+#define NDEV 18
 #define TB_FIRST 2
 #define MAXQP 512
 #define MAXMR 8192
@@ -34,7 +34,7 @@ struct sq { struct swr *v; uint32_t cap, head, count, packets; };
 struct sqp { struct ibv_qp qp; int dev, destroyed; uint32_t dest, cap_send, cap_recv; struct sq send, recv; };
 
 static const char *g_names[NDEV] = {"roce0", "roce1", "tb0", "tb1", "tb2", "tb3", "tb4",
-                                    "tb5", "tb6", "tb7", "tb8", "tb9", "tb10", "tb11"};
+                                    "tb5", "tb6", "tb7", "tb8", "tb9", "tb10", "tb11", "tb12", "tb13", "tb14", "tb15"};
 static struct ibv_device g_dev[NDEV];
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static struct smr *g_mr[MAXMR];
@@ -332,14 +332,28 @@ int ibv_query_port(struct ibv_context *c, uint8_t port, struct _compat_ibv_port_
     if (port != 1) die("only port 1 exists");
     memset(p, 0, sizeof(*p));
     p->state = IBV_PORT_ACTIVE;
+    const char *down = getenv("STUB_PORT_DOWN");
+    if (down && !strcmp(down, c->device->name)) p->state = IBV_PORT_DOWN;
     p->max_mtu = p->active_mtu = IBV_MTU_4096;
     p->link_layer = is_tb(dev) ? 100 : IBV_LINK_LAYER_ETHERNET;
     p->lid = is_tb(dev) ? 1 : 0;
+    p->gid_tbl_len = getenv("STUB_GID_SCAN") ? 3 : 2;
+    return 0;
+}
+int ibv_query_device(struct ibv_context *c, struct ibv_device_attr *a) {
+    memset(a, 0, sizeof(*a));
+    a->max_qp = is_tb(((struct sctx *)c)->dev) ? TB_QPS : MAXQP;
+    a->max_qp_wr = 4095; a->max_mr_size = TB_MR_MAX;
     return 0;
 }
 int ibv_query_gid(struct ibv_context *c, uint8_t port, int index, union ibv_gid *g) {
-    (void)port, (void)index;
+    (void)port;
     memset(g, 0, sizeof(*g));
+    if (getenv("STUB_ZERO_GIDS")) return 0;
+    if (getenv("STUB_GID_SCAN")) {
+        if (index == 0) return 0;
+        if (index == 1) { g->raw[10] = 255; g->raw[11] = 255; g->raw[15] = 2; return 0; }
+    }
     g->raw[0] = 0xfe, g->raw[1] = 0x80, g->raw[15] = (uint8_t)(((struct sctx *)c)->dev + 1);
     return 0;
 }
