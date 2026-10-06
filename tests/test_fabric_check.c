@@ -16,14 +16,14 @@ int fabric_check(int argc, char **argv);
 uint64_t fabric_check_test_source(unsigned parity);
 
 struct rank {
-    char *argv[13];
+    char *argv[14];
     char port[8], peer[8], name[8];
     int status;
 };
 
 static void *run(void *arg) {
     struct rank *r = arg;
-    r->status = fabric_check(13, r->argv);
+    r->status = fabric_check(14, r->argv);
     return NULL;
 }
 
@@ -64,7 +64,12 @@ static int invalid_arguments(void) {
         a[bad[i].index] = was;
         if (result != 2) return 1;
     }
-    return 0;
+    /* WAIT is library or spin, and spinning leaves placement to progress threads, so it needs PROGRESS 1 */
+    char *w[] = {"fabric-check", "unused", "0", "unused", "20000", "check", "0", "1", "64", "0", "0", "split", "0",
+                 "spin"};
+    if (fabric_check(14, w) != 2) return 1;
+    w[12] = "1", w[13] = "nope";
+    return fabric_check(14, w) != 2;
 }
 
 static int source_preflight(void) {
@@ -80,7 +85,7 @@ static int source_preflight(void) {
     return (old - MCDMA_FABRIC_WS_ROOM) / TB_SEG == (old + sizes[1] - 1) / TB_SEG;
 }
 
-static int pair(const char *lo, int tb, int bonded, int combined, int reverse) {
+static int pair(const char *lo, int tb, int bonded, int combined, int reverse, int spin) {
     int lanes = bonded ? 2 : 1, ports[2];
     do { ports[0] = free_ports(lanes); } while (ports[0] < 0);
     do { ports[1] = free_ports(lanes); } while (ports[1] < 0 || abs(ports[0] - ports[1]) < lanes);
@@ -96,9 +101,10 @@ static int pair(const char *lo, int tb, int bonded, int combined, int reverse) {
         snprintf(r[i].name, sizeof(r[i].name), "%d", i);
         char *device = bonded ? (device_rank ? "tb1+tb3" : "tb0+tb2") :
                        tb ? (device_rank ? "tb1" : "tb0") : (device_rank ? "roce1" : "roce0");
-        char *args[13] = {"fabric-check", device, "0", via, r[i].port, "check", r[i].name, "8",
-                          "1,64,4096,14336,1048576,13631491,16777216", "0.2", r[i].peer,
-                          tb && combined ? "combined" : "split", combined ? "1" : "0"};
+        char *args[14] = {"fabric-check", device, "0", via, r[i].port, "check", r[i].name, "8",
+                          "1,64,4096,10240,14336,40960,163840,1048576,13631491,16777216", "0.2", r[i].peer,
+                          tb && combined ? "combined" : "split", combined || spin ? "1" : "0",
+                          spin ? "spin" : "library"};
         memcpy(r[i].argv, args, sizeof(args));
         if (pthread_create(&t[i], NULL, run, &r[i])) return 1;
     }
@@ -121,6 +127,7 @@ int main(int argc, char **argv) {
     }
     if (!lo[0]) return 77;
     int tb = !strcmp(argv[1], "tb");
-    if (pair(lo, tb, 0, 0, 0) || pair(lo, tb, 0, 1, 1)) return 1;
-    return tb && (pair(lo, tb, 1, 0, 0) || pair(lo, tb, 1, 1, 1));
+    if (pair(lo, tb, 0, 0, 0, 0) || pair(lo, tb, 0, 1, 1, 0) || pair(lo, tb, 0, 1, 0, 1)) return 1;
+    return tb && (pair(lo, tb, 1, 0, 0, 0) || pair(lo, tb, 1, 1, 1, 0) || pair(lo, tb, 1, 1, 0, 1) ||
+                  pair(lo, tb, 1, 1, 1, 1));
 }

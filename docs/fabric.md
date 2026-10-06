@@ -151,9 +151,9 @@ and after a workload to get its per-link bytes. Flush before taking the final sn
 send completion; the flush fence supplies the separate remote-placement guarantee.
 
 On macOS, `MCDMA_FABRIC_QOS=1` gives progress threads user-interactive QoS; `0` leaves the default QoS.
-`MCDMA_FABRIC_WAIT_POLL=1`, the default, lets a waiting caller poll completions cooperatively instead of waiting only
-for the progress thread's handoff; `0` selects the thread-only comparison when a progress thread exists.
-The qualification script compares both settings without changing system or interface configuration.
+`MCDMA_FABRIC_WAIT_POLL=1`, the default, lets a caller waiting in `mcdma_fabric_wait` poll completions cooperatively
+instead of waiting only for the progress thread's handoff; `0` selects the thread-only comparison when a progress
+thread exists. A caller that spins on its window word, as the qualification does, relies on the progress threads.
 
 ## Thunderbolt links
 
@@ -264,16 +264,21 @@ Every node must print `wrong=0`, `stalls=0` and the same hash; each ends with `P
 `build/rpc/fabric-check` runs on both machines of one link:
 
 ```bash
-fabric-check DEVICE GID_INDEX VIA PORT NAME RANK [ROUNDS [SIZES [SECONDS [PEER_PORT [MODE [PROGRESS]]]]]]
+fabric-check DEVICE GID_INDEX VIA PORT NAME RANK [ROUNDS [SIZES [SECONDS [PEER_PORT [MODE [PROGRESS [WAIT]]]]]]]
 ```
 
 Both ranks give the same name, rounds and sizes (bytes, comma-separated; default `64,4096,14336,1048576`). At each size
 the ranks ping-pong a write and a signal `ROUNDS` times (default 10,000), and the receiver checks every word of the
 write the moment the signal lands, which tests that data lands before its flag under load. Rank 0 prints the round-trip
-median, p99 and maximum; `rtt_p50_us` is an additive alias for `rtt_median_us`. `MODE` is `split`, the existing write
-then signal calls, or `combined`, the Thunderbolt-only `write_signal` call. `PROGRESS` is `0` or `1`, selecting the single-link progress
-thread; its default remains `0`, and a bond always has one thread per physical link. Metadata records ABI, device,
-interface, link count, mode, progress flag, QoS, cooperative polling and requested stream duration.
+median, p99 and maximum; `rtt_p50_us` is an additive alias for `rtt_median_us`, and `gb_s` is twice the size over the
+median round trip, the rate one direction runs at while it sends. `MODE` is `split`, the existing write then signal
+calls, or `combined`, the Thunderbolt-only `write_signal` call. `PROGRESS` is `0` or `1`, selecting the single-link
+progress thread; its default remains `0`, and a bond always has one thread per physical link. `WAIT` is `library`, the
+default, which waits in `mcdma_fabric_wait`, or `spin`, which spins on the window word as an engine does and leaves
+placement to the progress threads, so it needs `PROGRESS` 1; a spinning wait asks `mcdma_fabric_peer_status` every
+few thousand reads and fails at once if the peer is down. Metadata records ABI, device, interface, link count, mode,
+progress flag, QoS, cooperative polling, wait, requested stream duration and `build`, a checksum of the sources that
+`make` passes in (`unknown` otherwise), so two ranks can be checked for the same build.
 Both ping-pong source addresses leave the 64-byte header inside their registration, including the source near the
 48 MiB boundary of the Thunderbolt 12 MiB pieces, so small combined pings can use the fused send on both parities.
 
@@ -291,29 +296,41 @@ for each physical link. The receiver independently prints checked bytes and wron
 
 ```text
 fabric-check: rank 0 connected over thunderbolt
-fabric-check: size=4096 rounds=10000 wrong_words=0 rtt_median_us=... rtt_p99_us=... rtt_max_us=... rtt_p50_us=...
-fabric-check: stream bytes=... seconds=60.0xx gbit_s=... checked_bytes=...
+fabric-check: size=4096 rounds=10000 wrong_words=0 rtt_median_us=... rtt_p99_us=... rtt_max_us=... rtt_p50_us=... gb_s=...
+fabric-check: stream bytes=... seconds=60.0xx gbit_s=... checked_bytes=... gb_s=...
 fabric-check: stream link=0 posted_bytes=... completed_bytes=...
 fabric-check: rank 0 PASS
 ```
 
 `tests/dual_pipe_qualify.py` prepares one two-host hardware qualification plan. It is review-only by default and
-does not invoke SSH until `--execute` is supplied. Give `--host-a` and `--host-b`, each host's already-built checker
-path as `--program-a` and `--program-b`, and two values per host for `--devices-a/b`, `--interfaces-a/b` and
-`--addresses-a/b`. Addresses are the local addresses on the two cables; the script uses the other endpoint's address
-in each `via` string. The argument order identifies link one and link two at both hosts.
+does not invoke SSH until `--execute` is supplied. Give `--host-a` and `--host-b`, each host's checker as built by
+`make -C rpc all` from the same commit as `--program-a` and `--program-b`, and two values per host for
+`--devices-a/b`, `--interfaces-a/b` and `--addresses-a/b`. Addresses are the local addresses on the two cables; the
+script uses the other endpoint's address in each `via` string. The argument order identifies link one and link two
+at both hosts. `--ssh-option-a` and `--ssh-option-b` pass `ssh -o` options, such as `ProxyJump=HOST` for a host
+reached through the other, and may be repeated.
 
 Choose `--condition healthy` or `--condition degraded`, `--gid-index`, and a free `--base-port` and its successor.
-The script streams over each cable and then the bond for at least 60 seconds, repeats in the opposite direction,
-and records 64-byte and 4096-byte RTTs. It then runs latency-only QoS, cooperative-polling and split/combined-call
-comparisons. Both ranks must report the requested mode, progress, QoS, polling, duration and round count.
-Transferred and checked byte counts must agree, completed per-link payload bytes
-must sum to the stream, and both bond links must carry payload. Healthy acceptance is at least 1.8 times the faster
-single-link rate; degraded acceptance is at least 0.9 times their sum. Bonded p50 must be within 1 microsecond of the
-better single-link p50 at both small sizes in both directions. The script exits unsuccessfully if any criterion fails.
-The script derives throughput from transferred bytes and elapsed seconds, and checks that the separately printed
-rate agrees within its two-decimal rate and three-decimal time rounding. A verified stream must contain whole
-4 MiB pieces and at least 64 MiB, the checker's minimum two slot cycles.
+The script measures what a tensor-parallel engine does: each cable alone and then the bond, with each host as rank 0
+in turn, ping-pong `write_signal` at 64 bytes, 10, 40 and 160 KB and 1 MiB with both ranks spinning on the window
+word (`WAIT` spin), progress threads at `MCDMA_FABRIC_QOS=1`, every byte checked, then a byte-checked stream of at
+least 60 seconds. Before it starts it refuses to run while a `fabric-check` is still running on either host. Both
+ranks must report the requested configuration, round count and the same make-built `build`, and every case must
+come from that one build. Transferred and checked byte counts must agree, completed per-link payload bytes must sum
+to the stream, and both bond links must carry payload. The bond passes, in each direction, when:
+
+| Check | Healthy cables | One cable degraded |
+| --- | --- | --- |
+| Ping-pong p50 at 64 B and 10 KB | at most the better cable's plus 1 µs | the same |
+| Ping-pong p50 at 40 KB, 160 KB and 1 MiB | below the better cable's | the same |
+| Ping-pong p99 at every size | at most 1.25 times the better cable's plus 2 µs | the same |
+| Ping-pong `gb_s` at 1 MiB | at least 1.6 times the faster cable's | at least 0.85 times the two cables' added |
+| Stream | at least 1.8 times the faster cable's | at least 0.9 times the two cables' added |
+
+It prints p50, p99 and GB/s for every size and link, the stream rates and each check, and exits unsuccessfully if
+any check fails. The script derives stream throughput from transferred bytes and elapsed seconds, and checks that
+the separately printed rate agrees within its two-decimal rate and three-decimal time rounding. A verified stream
+must contain whole 4 MiB pieces and at least 64 MiB, the checker's minimum two slot cycles.
 
 `python3 -B tests/dual_pipe_qualify.py --self-test` checks parsing and acceptance thresholds offline, with no SSH.
 An executed plan stores its runtime configuration and raw logs under ignored `results/` by default. Those logs

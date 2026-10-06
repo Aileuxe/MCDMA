@@ -1,8 +1,9 @@
 /* fabric-check: qualify a libmcdma-fabric link. Two ranks ping-pong writes and signals at each size, each checking
  * every byte the moment the signal arrives, then rank 0 streams to rank 1 for a bandwidth figure. Exit 0 only when
  * every byte checked out.
- *   fabric-check DEVICE GID_INDEX VIA PORT NAME RANK [ROUNDS [SIZES [SECONDS [PEER_PORT [MODE [PROGRESS]]]]]]
- * Both ranks give the same NAME, ROUNDS and SIZES; RANK is 0 or 1. SIZES are bytes, comma-separated. */
+ *   fabric-check DEVICE GID_INDEX VIA PORT NAME RANK [ROUNDS [SIZES [SECONDS [PEER_PORT [MODE [PROGRESS [WAIT]]]]]]]
+ * Both ranks give the same NAME, ROUNDS and SIZES; RANK is 0 or 1. SIZES are bytes, comma-separated. WAIT is library
+ * (mcdma_fabric_wait) or spin: spin on the window word as an engine does, leaving placement to progress threads. */
 #ifdef __APPLE__
 #define _DARWIN_C_SOURCE 1
 #else
@@ -32,6 +33,9 @@
 #define CHECKED (FLAGS + 200)
 #define FINISHED (FLAGS + 208)
 #define SECOND 1000000000ull
+#ifndef MCDMA_BUILD_ID
+#define MCDMA_BUILD_ID "unknown"    /* the Makefile passes a checksum of the sources, so both ranks can compare */
+#endif
 
 static uint64_t clock_ns(void) {
 #ifdef __APPLE__
@@ -95,6 +99,26 @@ static uint64_t check_and_poison(unsigned char *p, uint64_t marker, int check) {
 
 static int report(int status, const char *what);
 
+/* Wait for the word at `off` to reach `value`, in the library or, with `spin`, by reading only the window as an
+ * engine does; a spinning wait asks the library about the peer every few thousand reads, so a peer that went down
+ * fails it at once. */
+static int await(struct mcdma_fabric *f, struct mcdma_fabric_peer *p, const unsigned char *w, uint64_t off,
+                 uint64_t value, uint64_t timeout_ns, int spin) {
+    if (!spin) return mcdma_fabric_wait(f, off, value, timeout_ns);
+    const uint64_t *word = (const uint64_t *)(const void *)(w + off);
+    uint64_t deadline = clock_ns() + timeout_ns;
+    for (unsigned spins = 1; __atomic_load_n(word, __ATOMIC_ACQUIRE) < value; ++spins) {
+        if (spins % 4096) continue;
+        char why[96];
+        if (mcdma_fabric_peer_status(p, why, sizeof(why))) {
+            fprintf(stderr, "fabric-check: the peer is down: %s\n", why);
+            return MCDMA_FABRIC_PEER;
+        }
+        if (clock_ns() > deadline) return MCDMA_FABRIC_TIMEOUT;
+    }
+    return MCDMA_FABRIC_OK;
+}
+
 static int send_payload(struct mcdma_fabric_peer *p, uint64_t src, uint64_t dst, uint64_t len,
                         uint64_t flag, uint64_t value, int combined) {
     if (combined) return report(mcdma_fabric_write_signal(p, src, dst, len, flag, value), "write_signal");
@@ -120,17 +144,17 @@ uint64_t fabric_check_test_source(unsigned parity) { return ping_source(parity);
 
 /* Ping-pong `rounds` rounds of `len` bytes; rank 0 times each round trip. Returns the words that landed wrong. */
 static uint64_t pingpong(struct mcdma_fabric *f, struct mcdma_fabric_peer *p, unsigned char *w, int rank, uint64_t len,
-                         uint32_t rounds, uint64_t *round, uint64_t *times, int combined) {
+                         uint32_t rounds, uint64_t *round, uint64_t *times, int combined, int spin) {
     uint64_t bad = 0;
     for (uint32_t r = 0; r < rounds; ++r) {
         uint64_t n = ++*round, parity = n % 2, src = ping_source((unsigned)parity), began = 0;
-        if (rank == 1 && report(mcdma_fabric_wait(f, PING, n, 10 * SECOND), "waiting for rank 0")) return ~0ull;
+        if (rank == 1 && report(await(f, p, w, PING, n, 10 * SECOND, spin), "waiting for rank 0")) return ~0ull;
         if (rank == 1) bad += wrong(w + parity * SLOT, len, n, 0);
         fill(w + src, len, n, rank);
         began = clock_ns();
         if (send_payload(p, src, parity * SLOT, len, PING, n, combined)) return ~0ull;
         if (rank == 1) continue;
-        if (report(mcdma_fabric_wait(f, PING, n, 10 * SECOND), "waiting for rank 1")) return ~0ull;
+        if (report(await(f, p, w, PING, n, 10 * SECOND, spin), "waiting for rank 1")) return ~0ull;
         times[r] = clock_ns() - began;
         bad += wrong(w + parity * SLOT, len, n, 1);
     }
@@ -139,7 +163,7 @@ static uint64_t pingpong(struct mcdma_fabric *f, struct mcdma_fabric_peer *p, un
 
 /* Eight credited landing slots. Rank 1 checks and poisons each complete piece before acknowledging its reuse. */
 static uint64_t stream(struct mcdma_fabric *f, struct mcdma_fabric_peer *p, unsigned char *w, int rank,
-                       double seconds, int combined) {
+                       double seconds, int combined, int spin) {
     const uint64_t marker = 0xfeed;
     if (seconds == 0) return 0;
     if (rank == 1) {
@@ -148,7 +172,7 @@ static uint64_t stream(struct mcdma_fabric *f, struct mcdma_fabric_peer *p, unsi
         if (report(mcdma_fabric_signal(p, START, 1), "stream ready")) return ~0ull;
         for (uint64_t k = 0;; ++k) {
             uint64_t slot = k % STREAM_SLOTS, seq = k / STREAM_SLOTS + 1;
-            if (report(mcdma_fabric_wait(f, READY + slot * 8, seq, 60 * SECOND), "stream piece")) return ~0ull;
+            if (report(await(f, p, w, READY + slot * 8, seq, 60 * SECOND, spin), "stream piece")) return ~0ull;
             uint64_t total = __atomic_load_n((uint64_t *)(void *)(w + DONE), __ATOMIC_ACQUIRE);
             if (total && checked == total) break;
             bad += check_and_poison(w + slot * PIECE, marker + slot, 1);
@@ -170,25 +194,26 @@ static uint64_t stream(struct mcdma_fabric *f, struct mcdma_fabric_peer *p, unsi
         if (report(mcdma_fabric_link_stats(p, i, &before[i]), "initial link stats")) { free(before); return ~0ull; }
     for (uint64_t s = 0; s < STREAM_SLOTS; ++s)
         fill(w + 2 * SLOT + s * (PIECE + MCDMA_FABRIC_WS_ROOM) + MCDMA_FABRIC_WS_ROOM, PIECE, marker + s, 0);
-    if (report(mcdma_fabric_wait(f, START, 1, 60 * SECOND), "stream start")) { free(before); return ~0ull; }
+    if (report(await(f, p, w, START, 1, 60 * SECOND, spin), "stream start")) { free(before); return ~0ull; }
     uint64_t total = 0, began = clock_ns(), end = began + (uint64_t)(seconds * SECOND);
     for (uint64_t k = 0; clock_ns() < end || total < 4 * SLOT; ++k, total += PIECE) {
         uint64_t slot = k % STREAM_SLOTS, seq = k / STREAM_SLOTS + 1;
-        if ((seq > 1 && report(mcdma_fabric_wait(f, ACK + slot * 8, seq - 1, 60 * SECOND), "stream credit")) ||
+        if ((seq > 1 && report(await(f, p, w, ACK + slot * 8, seq - 1, 60 * SECOND, spin), "stream credit")) ||
             send_payload(p, 2 * SLOT + slot * (PIECE + MCDMA_FABRIC_WS_ROOM) + MCDMA_FABRIC_WS_ROOM,
                          slot * PIECE, PIECE, READY + slot * 8, seq, combined)) { free(before); return ~0ull; }
     }
     uint64_t chunks = total / PIECE;
     for (uint64_t s = 0; s < STREAM_SLOTS; ++s) {
         uint64_t seq = (chunks - 1 - s) / STREAM_SLOTS + 1;
-        if (report(mcdma_fabric_wait(f, ACK + s * 8, seq, 60 * SECOND), "final stream credit")) {
+        if (report(await(f, p, w, ACK + s * 8, seq, 60 * SECOND, spin), "final stream credit")) {
             free(before); return ~0ull;
         }
     }
     if (report(mcdma_fabric_flush(p, 60 * SECOND), "stream flush")) { free(before); return ~0ull; }
     double elapsed = (double)(clock_ns() - began) / SECOND;
-    printf("fabric-check: stream bytes=%llu seconds=%.3f gbit_s=%.2f checked_bytes=%llu\n",
-           (unsigned long long)total, elapsed, (double)total * 8 / elapsed / 1e9, (unsigned long long)total);
+    printf("fabric-check: stream bytes=%llu seconds=%.3f gbit_s=%.2f checked_bytes=%llu gb_s=%.3f\n",
+           (unsigned long long)total, elapsed, (double)total * 8 / elapsed / 1e9, (unsigned long long)total,
+           (double)total / elapsed / 1e9);
     for (unsigned i = 0; i < links; ++i) {
         struct mcdma_fabric_link_stats after;
         if (report(mcdma_fabric_link_stats(p, i, &after), "final link stats")) { free(before); return ~0ull; }
@@ -200,8 +225,8 @@ static uint64_t stream(struct mcdma_fabric *f, struct mcdma_fabric_peer *p, unsi
     if (report(mcdma_fabric_signal(p, DONE, total), "stream signal") ||
         report(mcdma_fabric_signal(p, READY + (chunks % STREAM_SLOTS) * 8, UINT64_MAX), "stream end") ||
         report(mcdma_fabric_flush(p, 60 * SECOND), "final flush") ||
-        report(mcdma_fabric_wait(f, CHECKED, 1, 60 * SECOND), "stream check result") ||
-        report(mcdma_fabric_wait(f, FINISHED, 1, 60 * SECOND), "receiver result flush")) return ~0ull;
+        report(await(f, p, w, CHECKED, 1, 60 * SECOND, spin), "stream check result") ||
+        report(await(f, p, w, FINISHED, 1, 60 * SECOND, spin), "receiver result flush")) return ~0ull;
     return __atomic_load_n((uint64_t *)(void *)(w + CHECKED), __ATOMIC_ACQUIRE) - 1;
 }
 
@@ -229,10 +254,11 @@ static int valid_sizes(const char *s) {
 }
 
 int fabric_check(int argc, char **argv) {
-    if (argc < 7 || argc > 13) {
+    if (argc < 7 || argc > 14) {
         fprintf(stderr, "usage: fabric-check DEVICE GID_INDEX VIA PORT NAME RANK "
-                        "[ROUNDS [SIZES [SECONDS [PEER_PORT [MODE [PROGRESS]]]]]]\n"
-                        "MODE is split or combined; PROGRESS is 0 or 1; SECONDS defaults to 60, 0 skips streaming.\n");
+                        "[ROUNDS [SIZES [SECONDS [PEER_PORT [MODE [PROGRESS [WAIT]]]]]]]\n"
+                        "MODE is split or combined; PROGRESS is 0 or 1; SECONDS defaults to 60, 0 skips streaming.\n"
+                        "WAIT is library or spin; spin needs PROGRESS 1, which a bond always has.\n");
         return 2;
     }
     uint64_t rank_arg, gid, port, peer_port = 0, rounds_arg = 10000, progress = 0;
@@ -243,6 +269,8 @@ int fabric_check(int argc, char **argv) {
         (argc > 12 && !number(argv[12], 1, &progress))) return 2;
     int rank = (int)rank_arg, combined = argc > 11 && !strcmp(argv[11], "combined");
     if (argc > 11 && !combined && strcmp(argv[11], "split")) return 2;
+    int spin = argc > 13 && !strcmp(argv[13], "spin");
+    if (argc > 13 && ((!spin && strcmp(argv[13], "library")) || (spin && !progress))) return 2;
     uint32_t rounds = (uint32_t)rounds_arg;
     const char *sizes = argc > 8 ? argv[8] : "64,4096,14336,1048576";
     char *end = NULL;
@@ -267,30 +295,33 @@ int fabric_check(int argc, char **argv) {
     printf("fabric-check: rank %d connected over %s\n", rank,
            mcdma_fabric_link(p) == MCDMA_FABRIC_THUNDERBOLT ? "thunderbolt" : "roce");
     printf("fabric-check: metadata abi=%u device=%s via=%s gid_index=%llu links=%u mode=%s progress=%llu "
-           "qos=%s wait_poll=%s stream_seconds=%.3f verification=every_byte\n", mcdma_fabric_abi(), argv[1], argv[3],
-           (unsigned long long)gid, mcdma_fabric_link_count(p), combined ? "combined" : "split",
+           "qos=%s wait_poll=%s wait=%s stream_seconds=%.3f verification=every_byte build=%s\n", mcdma_fabric_abi(),
+           argv[1], argv[3], (unsigned long long)gid, mcdma_fabric_link_count(p), combined ? "combined" : "split",
            (unsigned long long)progress, getenv("MCDMA_FABRIC_QOS") ? getenv("MCDMA_FABRIC_QOS") : "0",
-           getenv("MCDMA_FABRIC_WAIT_POLL") ? getenv("MCDMA_FABRIC_WAIT_POLL") : "1", seconds);
+           getenv("MCDMA_FABRIC_WAIT_POLL") ? getenv("MCDMA_FABRIC_WAIT_POLL") : "1", spin ? "spin" : "library",
+           seconds, MCDMA_BUILD_ID);
     for (const char *s = sizes; s && *s && bad != ~0ull; s = strchr(s, ',') ? strchr(s, ',') + 1 : NULL) {
         uint64_t len = strtoull(s, NULL, 10), wrong_words = 0;
         len = len < 1 ? 1 : len > SLOT ? SLOT : len;
-        if ((wrong_words = pingpong(f, p, w, rank, len, rounds, &round, times, combined)) == ~0ull) {
+        if ((wrong_words = pingpong(f, p, w, rank, len, rounds, &round, times, combined, spin)) == ~0ull) {
             bad = ~0ull;
             break;
         }
         bad += wrong_words;
         qsort(times, rounds, sizeof(uint64_t), by_value);
+        /* gb_s: the size each way over half the median round trip, the rate one direction runs at */
         if (rank == 0 && rounds)
             printf("fabric-check: size=%llu rounds=%u wrong_words=%llu rtt_median_us=%.2f rtt_p99_us=%.2f "
-                   "rtt_max_us=%.2f rtt_p50_us=%.2f\n",
+                   "rtt_max_us=%.2f rtt_p50_us=%.2f gb_s=%.3f\n",
                    (unsigned long long)len, rounds, (unsigned long long)wrong_words, times[rounds / 2] / 1e3,
-                   times[(uint64_t)rounds * 99 / 100] / 1e3, times[rounds - 1] / 1e3, times[rounds / 2] / 1e3);
+                   times[(uint64_t)rounds * 99 / 100] / 1e3, times[rounds - 1] / 1e3, times[rounds / 2] / 1e3,
+                   2.0 * (double)len / (double)(times[rounds / 2] ? times[rounds / 2] : 1));
         else
             printf("fabric-check: size=%llu rounds=%u wrong_words=%llu\n", (unsigned long long)len, rounds,
                    (unsigned long long)wrong_words);
     }
     if (bad != ~0ull) {
-        uint64_t streamed = stream(f, p, w, rank, seconds, combined);
+        uint64_t streamed = stream(f, p, w, rank, seconds, combined, spin);
         bad = streamed == ~0ull ? ~0ull : bad + streamed;
     }
     /* rank 1 lingers so rank 0's last flush is answered before the link goes away */

@@ -6,6 +6,7 @@ import pathlib
 import platform
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -222,6 +223,11 @@ class LinkTests(unittest.TestCase):
     def test_fabric_check_passes_on_both_link_kinds(self):
         self.run_case('fabric-check', 'tb', STUB_SEED='3', STUB_LAZY='1')
         self.run_case('fabric-check', 'roce', STUB_STRICT='1')
+
+    def test_the_dual_pipe_qualifier_parses_and_gates_offline(self):
+        done = subprocess.run([sys.executable, '-B', 'tests/dual_pipe_qualify.py', '--self-test'], cwd=ROOT,
+                              capture_output=True, text=True, timeout=120)
+        self.assertEqual(done.returncode, 0, (done.stdout + done.stderr)[-3000:])
 
     def test_four_node_mesh_all_reduces_in_node_order(self):
         self.run_case('mesh-check', '1,16,300', '1', STUB_SEED='4', timeout=600)

@@ -27,6 +27,8 @@ endif
 
 LINK := link_verbs.c link_tb.c link_xchg.c
 DAEMON := mcdma-rpcd.c rpcd_common.c rpcd_verbs.c rpcd_listen.c rpcd_connect.c $(LINK)
+# A checksum of the fabric's sources, which fabric-check prints so a qualification can refuse two different builds.
+BUILD_ID := $(shell cat libmcdma_fabric.c mcdma_fabric.h $(LINK) link.h fabric_check.c | cksum | cut -d' ' -f1)
 
 all: $(OUT)/mcdma-rpcd $(OUT)/$(HELPER) $(OUT)/$(FABRIC) $(OUT)/rpc-echo $(OUT)/fabric-check $(OUT)/mesh-check \
      $(GPU_TOOLS)
@@ -50,7 +52,8 @@ $(OUT)/rpc-echo: rpc_echo.c rpcd_common.c rpcd.h link.h | $(OUT)
 
 # fabric-check carries the library's code itself, so it runs from the build directory with nothing installed.
 $(OUT)/fabric-check: fabric_check.c libmcdma_fabric.c mcdma_fabric.h $(LINK) link.h | $(OUT)
-	$(CC) $(CFLAGS) -o $@ fabric_check.c libmcdma_fabric.c $(LINK) $(VERBS) -lpthread $(FABRIC_EXTRA)
+	$(CC) $(CFLAGS) -DMCDMA_BUILD_ID='"$(BUILD_ID)"' -o $@ fabric_check.c libmcdma_fabric.c $(LINK) $(VERBS) -lpthread \
+		$(FABRIC_EXTRA)
 
 # Four-node mesh qualification, and on a Mac the GPU hand-off check (docs/fabric.md).
 $(OUT)/mesh-check: mesh_check.c libmcdma_fabric.c mcdma_fabric.h $(LINK) link.h | $(OUT)
