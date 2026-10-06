@@ -142,19 +142,26 @@ static uint64_t ping_source(unsigned parity) { return (2 + parity) * SLOT + MCDM
 uint64_t fabric_check_test_source(unsigned parity) { return ping_source(parity); }
 #endif
 
-/* Ping-pong `rounds` rounds of `len` bytes; rank 0 times each round trip. Returns the words that landed wrong. */
+/* Ping-pong `rounds` rounds of `len` bytes; rank 0 times each round trip. Returns the words that landed wrong. The
+ * round trip times the transport, as an engine's exchange runs: each rank fills its bytes before its round, rank 1
+ * answers the moment the flag lands and checks every byte after answering (rank 0 writes that slot again only after
+ * the next answer), and rank 0 checks every byte the moment the answer's flag lands, after stopping its clock. The
+ * qualifier swaps the ranks, so each end's placement is checked at its flag in one direction. */
 static uint64_t pingpong(struct mcdma_fabric *f, struct mcdma_fabric_peer *p, unsigned char *w, int rank, uint64_t len,
                          uint32_t rounds, uint64_t *round, uint64_t *times, int combined, int spin) {
     uint64_t bad = 0;
     for (uint32_t r = 0; r < rounds; ++r) {
         uint64_t n = ++*round, parity = n % 2, src = ping_source((unsigned)parity), began = 0;
-        if (rank == 1 && report(await(f, p, w, PING, n, 10 * SECOND, spin), "waiting for rank 0")) return ~0ull;
-        if (rank == 1) bad += wrong(w + parity * SLOT, len, n, 0);
         fill(w + src, len, n, rank);
+        if (rank == 1) {
+            if (report(await(f, p, w, PING, n, 10 * SECOND, spin), "waiting for rank 0") ||
+                send_payload(p, src, parity * SLOT, len, PING, n, combined)) return ~0ull;
+            bad += wrong(w + parity * SLOT, len, n, 0);
+            continue;
+        }
         began = clock_ns();
-        if (send_payload(p, src, parity * SLOT, len, PING, n, combined)) return ~0ull;
-        if (rank == 1) continue;
-        if (report(await(f, p, w, PING, n, 10 * SECOND, spin), "waiting for rank 1")) return ~0ull;
+        if (send_payload(p, src, parity * SLOT, len, PING, n, combined) ||
+            report(await(f, p, w, PING, n, 10 * SECOND, spin), "waiting for rank 1")) return ~0ull;
         times[r] = clock_ns() - began;
         bad += wrong(w + parity * SLOT, len, n, 1);
     }

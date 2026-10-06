@@ -277,8 +277,10 @@ fabric-check DEVICE GID_INDEX VIA PORT NAME RANK [ROUNDS [SIZES [SECONDS [PEER_P
 ```
 
 Both ranks give the same name, rounds and sizes (bytes, comma-separated; default `64,4096,14336,1048576`). At each size
-the ranks ping-pong a write and a signal `ROUNDS` times (default 10,000), and the receiver checks every word of the
-write the moment the signal lands, which tests that data lands before its flag under load. Rank 0 prints the round-trip
+the ranks ping-pong a write and a signal `ROUNDS` times (default 10,000). The round trip times the transport, as an
+engine's exchange runs: each rank fills its bytes before its round, rank 1 answers the moment the flag lands and then
+checks every word, and rank 0 checks every word the moment the answer's flag lands, after stopping its clock, which
+tests that data lands before its flag under load. Rank 0 prints the round-trip
 median, p99 and maximum; `rtt_p50_us` is an additive alias for `rtt_median_us`, and `gb_s` is twice the size over the
 median round trip, the rate one direction runs at while it sends. `MODE` is `split`, the existing write then signal
 calls, or `combined`, the Thunderbolt-only `write_signal` call. `PROGRESS` is `0` or `1`, selecting the single-link
