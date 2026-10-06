@@ -133,6 +133,21 @@ Disconnect and explicitly reconnect with the same smaller list on both ends if r
 `MCDMA_FABRIC_QOS=1` gives progress threads user-interactive QoS on macOS. Cooperative wait polling remains available
 through `MCDMA_FABRIC_WAIT_POLL`; a caller spinning directly on its word relies on the progress threads.
 
+## Opt-in phase tracing
+
+`MCDMA_TRACE=1` records per-SEND post, local SEND CQ observation, receive completion, payload copy, flag
+publication and local consumer-poll observations. `fabric-check` prints bounded raw records and p50/p99 phase
+intervals at the end, after timing. Off allocates no trace buffers and performs no trace clocks or counter updates.
+Timestamps use each host's monotonic clock; they are not synchronized across hosts. A SEND CQ observation is
+not a hardware wire timestamp. Use short, single-size trace runs and require `dropped_events=0`.
+
+`MCDMA_TRACE_PROGRESS=shared` is a measurement-only comparison, accepted only with tracing enabled. One worker
+handles every lane's receive/CQ progress while condition-woken lane workers preserve parallel posting. Small
+whole messages do not wake those posters. Large-message results include their wake cost, exposed by the
+app-post/ready/go phases. Normal `lane` mode and production defaults retain per-lane workers; one-QP single
+device operation already has one worker in either mode. The tool reports receive-progress and post-only thread
+counts. This experiment does not select a new production scheduler.
+
 ## Several QPs per cable
 
 Unset `MCDMA_FABRIC_QPS` selects two per Thunderbolt device if all advertise support, otherwise a uniform one with

@@ -28,7 +28,7 @@ endif
 LINK := link_verbs.c link_tb.c link_xchg.c
 DAEMON := mcdma-rpcd.c rpcd_common.c rpcd_verbs.c rpcd_listen.c rpcd_connect.c $(LINK)
 # A checksum of the fabric's sources, which fabric-check prints so a qualification can refuse two different builds.
-BUILD_ID := $(shell cat libmcdma_fabric.c fabric_bond_n.h fabric_open_qps.h mcdma_fabric.h $(LINK) link.h fabric_check.c | cksum | cut -d' ' -f1)
+BUILD_ID := $(shell cat libmcdma_fabric.c fabric_bond_n.h fabric_open_qps.h fabric_trace.h fabric_trace_report.h mcdma_fabric.h $(LINK) link.h fabric_check.c | cksum | cut -d' ' -f1)
 
 all: $(OUT)/mcdma-rpcd $(OUT)/$(HELPER) $(OUT)/$(FABRIC) $(OUT)/rpc-echo $(OUT)/fabric-check $(OUT)/mesh-check \
      $(GPU_TOOLS)
@@ -43,7 +43,7 @@ $(OUT)/$(HELPER): libmcdma_rpc.c mcdma_rpc.h | $(OUT)
 	$(CC) $(CFLAGS) $(SHARED_HELPER) -o $@ libmcdma_rpc.c $(HELPER_EXTRA)
 
 # Only the mcdma_fabric_* functions are exported; the shared link code stays private to the library.
-$(OUT)/$(FABRIC): libmcdma_fabric.c fabric_bond_n.h fabric_open_qps.h mcdma_fabric.h $(LINK) link.h | $(OUT)
+$(OUT)/$(FABRIC): libmcdma_fabric.c fabric_bond_n.h fabric_open_qps.h fabric_trace.h fabric_trace_report.h mcdma_fabric.h $(LINK) link.h | $(OUT)
 	$(CC) $(CFLAGS) $(SHARED_FABRIC) -fvisibility=hidden -o $@ libmcdma_fabric.c $(LINK) $(VERBS) -lpthread $(FABRIC_EXTRA)
 
 # Hardware qualification tools: an echo service and client for a daemon link, and a two-rank check of the fabric.
@@ -51,12 +51,12 @@ $(OUT)/rpc-echo: rpc_echo.c rpcd_common.c rpcd.h link.h | $(OUT)
 	$(CC) $(CFLAGS) -o $@ rpc_echo.c rpcd_common.c link_verbs.c link_tb.c $(VERBS) -lpthread
 
 # fabric-check carries the library's code itself, so it runs from the build directory with nothing installed.
-$(OUT)/fabric-check: fabric_check.c libmcdma_fabric.c fabric_bond_n.h fabric_open_qps.h mcdma_fabric.h $(LINK) link.h | $(OUT)
+$(OUT)/fabric-check: fabric_check.c libmcdma_fabric.c fabric_bond_n.h fabric_open_qps.h fabric_trace.h fabric_trace_report.h mcdma_fabric.h $(LINK) link.h | $(OUT)
 	$(CC) $(CFLAGS) -DMCDMA_BUILD_ID='"$(BUILD_ID)"' -o $@ fabric_check.c libmcdma_fabric.c $(LINK) $(VERBS) -lpthread \
 		$(FABRIC_EXTRA)
 
 # Four-node mesh qualification, and on a Mac the GPU hand-off check (docs/fabric.md).
-$(OUT)/mesh-check: mesh_check.c libmcdma_fabric.c fabric_bond_n.h fabric_open_qps.h mcdma_fabric.h $(LINK) link.h | $(OUT)
+$(OUT)/mesh-check: mesh_check.c libmcdma_fabric.c fabric_bond_n.h fabric_open_qps.h fabric_trace.h fabric_trace_report.h mcdma_fabric.h $(LINK) link.h | $(OUT)
 	$(CC) $(CFLAGS) -o $@ mesh_check.c libmcdma_fabric.c $(LINK) $(VERBS) -lpthread $(FABRIC_EXTRA)
 
 $(OUT)/metal-poll: metal_poll.m $(LINK) link.h | $(OUT)

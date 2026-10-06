@@ -103,6 +103,7 @@ static uint64_t check_and_poison(unsigned char *p, uint64_t marker, int check) {
 }
 
 static int report(int status, const char *what);
+static _Thread_local int tracing;
 
 /* Wait for the word at `off` to reach `value`, in the library or, with `spin`, by reading only the window as an
  * engine does; a spinning wait asks the library about the peer every few thousand reads, so a peer that went down
@@ -121,6 +122,7 @@ static int await(struct mcdma_fabric *f, struct mcdma_fabric_peer *p, const unsi
         }
         if (clock_ns() > deadline) return MCDMA_FABRIC_TIMEOUT;
     }
+    if (tracing) mcdma_fabric_trace_poll_seen(p, off, __atomic_load_n(word, __ATOMIC_ACQUIRE));
     return MCDMA_FABRIC_OK;
 }
 
@@ -371,6 +373,9 @@ int fabric_check(int argc, char **argv) {
     }
     printf("fabric-check: rank %d connected over %s\n", rank,
            mcdma_fabric_link(p) == MCDMA_FABRIC_THUNDERBOLT ? "thunderbolt" : "roce");
+    tracing = mcdma_fabric_tracing(p);
+    printf("fabric-check: progress_threads=%u post_only_threads=%u trace=%d\n",
+           mcdma_fabric_progress_threads(p), mcdma_fabric_post_threads(p), tracing);
     printf("fabric-check: metadata abi=%u device=%s via=%s gid_index=%d links=%u devices=%u qps_per_device=%u mode=%s progress=%llu "
            "qos=%s wait_poll=%s wait=%s pattern=%s gap_us=%llu stream_seconds=%.3f verification=every_byte build=%s\n",
            mcdma_fabric_abi(), argv[1], argv[3], gid_index, mcdma_fabric_link_count(p),
@@ -409,6 +414,7 @@ int fabric_check(int argc, char **argv) {
     /* rank 1 lingers so rank 0's last flush is answered before the link goes away */
     if (rank == 1) mcdma_fabric_wait(f, DONE + 8, 1, SECOND);
 finished:
+    if (p && tracing) (void)mcdma_fabric_trace_report(p, stdout);
     mcdma_fabric_disconnect(&p);
     mcdma_fabric_close(&f);
     munmap(w, WINDOW);

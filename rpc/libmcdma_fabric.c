@@ -45,10 +45,13 @@
 #define ROCE_WINDOW 16
 #endif
 
+#include "fabric_trace.h"
+
 struct mcdma_fabric {
     struct ep dev;                  /* the device, protection domain and the window's registrations */
     struct region win;
     pthread_mutex_t lock;
+    pthread_cond_t work;
     pthread_t thread;
     int threaded, wanted;           /* callers waiting for the lock; the progress thread steps aside for them */
     volatile int stop;
@@ -56,7 +59,8 @@ struct mcdma_fabric {
     struct mcdma_fabric_peer *peers[MAX_PEERS];
     int npeers;
     struct mcdma_fabric *part[BOND_LINKS]; /* a bond owns N ordinary fabrics, each with its own progress lock */
-    int bonded, wait_poll, waiters, shared, devices, qps, reserved, admission_released;
+    int bonded, wait_poll, waiters, shared, devices, qps, reserved, admission_released, trace_enabled;
+    int post_only, shared_progress;
     struct mcdma_fabric *registration_owner;
     unsigned qp_limit[MCDMA_FABRIC_MAX_LINKS];
     /* A bond's sender hands a cut write's tail to its link's progress thread, so the two links' sends post at once;
@@ -104,6 +108,9 @@ struct mcdma_fabric_peer {
     struct ep e;                    /* Thunderbolt: exclusive context/PD/QP; RoCE borrows the fabric's context */
     struct region win;
     int owns_context;
+    struct trace_log *trace;
+    struct trace_arg trace_arg;
+    int owns_trace;
     struct xchg x;
     struct xmsg mine;               /* our offer, sent again whenever the peer offers again */
     struct table remote;
@@ -208,6 +215,7 @@ static void bond_drain(struct mcdma_fabric_peer *p) {
             ready = s->need[k] <= __atomic_load_n(&p->placed[k].count, __ATOMIC_SEQ_CST);
         if (!ready) break;
         __atomic_store_n((uint64_t *)(void *)(p->f->win.base + s->off), s->value, __ATOMIC_RELEASE);
+        trace_publish(p->trace, s->seq, s->off, s->value, s->need);
 #ifdef MCDMA_FABRIC_TESTING
         if (p->signal_observer) p->signal_observer(p->observer_arg, p->f->win.base, s->off, s->value);
 #endif
@@ -381,6 +389,7 @@ static void release_peer(struct mcdma_fabric_peer *p) {
     if (p->slots_mr) ibv_dereg_mr(p->slots_mr);
     free(p->slots);
     if (p->owns_context) ep_close(&p->e);
+    if (p->owns_trace) trace_free(p->trace);
     xchg_close(&p->x);
     free(p);
 }
@@ -450,6 +459,10 @@ static int post_ask(struct mcdma_fabric *f) {
     int r;
     if (f->batch) {
         struct bond_batch *b = f->batch;
+        if (lane->trace) {
+            tb_trace_group(&lane->e, b->seq);
+            trace_lane(&lane->trace_arg, TR_BATCH_READY, 0, b->seq, 0, 0, (uint32_t)f->ask_len);
+        }
         __atomic_add_fetch(&b->ready, 1, __ATOMIC_ACQ_REL);
         while (!__atomic_load_n(&b->go, __ATOMIC_ACQUIRE)) {}
         r = __atomic_load_n(&b->cancel, __ATOMIC_ACQUIRE) || peer_down(lane) ? -1
@@ -469,6 +482,18 @@ static void *progress_main(void *arg) {
 #endif
     uint64_t active = link_now_ns();
     while (!__atomic_load_n(&f->stop, __ATOMIC_ACQUIRE)) {
+        if (f->post_only) {
+            pthread_mutex_lock(&f->lock);
+            while (!__atomic_load_n(&f->stop, __ATOMIC_ACQUIRE) &&
+                   (__atomic_load_n(&f->ask, __ATOMIC_ACQUIRE) != ASK_OPEN || !ASKS_TAKEN()))
+                pthread_cond_wait(&f->work, &f->lock);
+            if (__atomic_load_n(&f->stop, __ATOMIC_ACQUIRE)) { pthread_mutex_unlock(&f->lock); break; }
+            int open = ASK_OPEN;
+            if (__atomic_compare_exchange_n(&f->ask, &open, ASK_TAKEN, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                __atomic_store_n(&f->ask, post_ask(f), __ATOMIC_RELEASE);
+            pthread_mutex_unlock(&f->lock);
+            continue;
+        }
         int open = ASK_OPEN, asked = __atomic_load_n(&f->ask, __ATOMIC_ACQUIRE) == ASK_OPEN && ASKS_TAKEN();
         if (asked && !pthread_mutex_trylock(&f->lock)) {
             if (__atomic_compare_exchange_n(&f->ask, &open, ASK_TAKEN, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
@@ -482,6 +507,29 @@ static void *progress_main(void *arg) {
         if (handled) active = link_now_ns();
         /* idle for a while: back off, as the daemons do */
         if (!__atomic_load_n(&f->waiters, __ATOMIC_ACQUIRE) && link_now_ns() - active > 50000000ull) usleep(50);
+    }
+    return NULL;
+}
+
+/* Measurement-only shared receive/CQ worker. Posting remains on condition-woken lane workers, preserving
+ * the parallel release barrier; its wake cost is reported separately by the trace. */
+static void *progress_shared(void *arg) {
+    struct mcdma_fabric *f = arg;
+#ifdef __APPLE__
+    if (getenv("MCDMA_FABRIC_QOS") && !strcmp(getenv("MCDMA_FABRIC_QOS"), "1"))
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+    uint64_t active = link_now_ns();
+    while (!__atomic_load_n(&f->stop, __ATOMIC_ACQUIRE)) {
+        int handled = 0, waiters = 0;
+        for (int k = 0; k < f->bonded; ++k) {
+            struct mcdma_fabric *lane = f->part[k];
+            waiters |= __atomic_load_n(&lane->waiters, __ATOMIC_ACQUIRE) != 0;
+            if (__atomic_load_n(&lane->wanted, __ATOMIC_ACQUIRE) || pthread_mutex_trylock(&lane->lock)) continue;
+            handled += progress_all(lane); pthread_mutex_unlock(&lane->lock);
+        }
+        if (handled || waiters) active = link_now_ns();
+        if (link_now_ns() - active > 50000000ull) usleep(50);
     }
     return NULL;
 }
@@ -589,6 +637,12 @@ static int connect_lane(struct mcdma_fabric *f, const char *via, int port, int p
     p->x.fd = -1;
     p->e = f->dev;
     p->win = f->win;
+    p->trace = bond ? bond->trace : NULL;
+    if (!bond && f->trace_enabled) {
+        p->trace = trace_new(1); p->owns_trace = 1;
+        if (!p->trace) { free(p); return MCDMA_FABRIC_NOMEM; }
+    }
+    p->trace_arg = (struct trace_arg){p->trace, lane};
     p->e.qp = NULL, p->e.cq = NULL, p->e.tb = NULL, p->e.nmr = 0, p->e.outstanding = 0;
     memset(p->e.mr, 0, sizeof(p->e.mr));
     const struct ep *meeting = &f->dev;
@@ -596,7 +650,7 @@ static int connect_lane(struct mcdma_fabric *f, const char *via, int port, int p
     if (f->dev.kind == LINK_TB && (!bond || bond->meeting)) {
 #if defined(__APPLE__) && !defined(MCDMA_LINK_TEST_INTERFACES)
         char iface[32]; struct in6_addr addr; int pin;
-        if (via_parse(via, iface, sizeof(iface), &addr, &pin)) { free(p); return MCDMA_FABRIC_INVALID; }
+        if (via_parse(via, iface, sizeof(iface), &addr, &pin)) { if (p->owns_trace) trace_free(p->trace); free(p); return MCDMA_FABRIC_INVALID; }
         char device[64]; snprintf(device, sizeof(device), "rdma_%s", iface);
         meeting = NULL;
         if (!strcmp(device, f->dev.device)) meeting = &f->dev;
@@ -606,7 +660,7 @@ static int connect_lane(struct mcdma_fabric *f, const char *via, int port, int p
             int bad = ep_open(&control, device, -1, 4096);
             if (bad || control.kind != LINK_TB) {
                 link_log("the meeting interface must expose an active Thunderbolt RDMA device");
-                ep_close(&control); free(p); return MCDMA_FABRIC_INVALID;
+                ep_close(&control); if (p->owns_trace) trace_free(p->trace); free(p); return MCDMA_FABRIC_INVALID;
             }
             opened_control = 1; meeting = &control;
         }
@@ -620,6 +674,7 @@ static int connect_lane(struct mcdma_fabric *f, const char *via, int port, int p
     if (!status && p->e.kind == LINK_TB) {
         tb_accept(&p->e, &p->win, 0, f->win.length);
         tb_watch(&p->e, p, peer_gone);
+        if (p->trace && tb_trace_hooks(&p->e, &p->trace_arg, trace_lane)) status = MCDMA_FABRIC_NOMEM;
         struct tb_bond hooks = {p, lane, bond_placed, bond_signal, bond_ready, bond_announce, bond_tail,
                                bond ? (unsigned)bond->bonded : 0, bond_ready_n};
         if (bond) tb_bond_hooks(&p->e, &hooks);
@@ -707,6 +762,7 @@ int mcdma_fabric_connect_links(struct mcdma_fabric *f, const char *via, const ui
     pthread_mutex_init(&p->rx_lock, NULL);
     p->pending = calloc(BOND_SIGNALS, sizeof(*p->pending));
     int status = p->pending ? MCDMA_FABRIC_OK : MCDMA_FABRIC_NOMEM;
+    if (f->trace_enabled) { p->trace = trace_new(lanes); if (!p->trace) status = MCDMA_FABRIC_NOMEM; }
     for (unsigned k = 0; k < lanes; ++k) {
         p->tails[k] = calloc(BOND_SIGNALS, sizeof(*p->tails[k]));
         if (!p->tails[k]) status = MCDMA_FABRIC_NOMEM;
@@ -737,7 +793,7 @@ int mcdma_fabric_connect_links(struct mcdma_fabric *f, const char *via, const ui
         free(p->pending);
         for (unsigned k = 0; k < lanes; ++k) free(p->tails[k]);
         pthread_mutex_destroy(&p->rx_lock);
-        free(p); unreserve_peer(f);
+        trace_free(p->trace); free(p); unreserve_peer(f);
         return status;
     }
     p->reserved = 1; *out = p;
@@ -1093,6 +1149,7 @@ static int bond_post(struct mcdma_fabric_peer *p, const struct bond_plan *plan, 
     struct mcdma_fabric_peer *head = p->part[h], *tail = p->part[t];
     int signal = 0, asked = 0, tail_locked = 0;
     enter(head->f);
+    if (p->trace) tb_trace_group(&head->e, p->tx_signal + 1);
     int r = peer_down(head) ? -1 : tb_can_bond_write_signal(&head->e, &head->win, off, first);
     r = r < 0 ? -1 : r == 1 ? 0 : r == 0 ? 1 : 2;
     if (r < 0) peer_fail(head, NULL, 1);
@@ -1109,6 +1166,7 @@ static int bond_post(struct mcdma_fabric_peer *p, const struct bond_plan *plan, 
             need[t]++;
             tail->f->ask_lane = tail, tail->f->ask_off = off + first, tail->f->ask_len = rest;
             __atomic_store_n(&tail->f->ask, ASK_OPEN, __ATOMIC_RELEASE);
+            if (tail->f->post_only) pthread_cond_signal(&tail->f->work);
             asked = 1;
         }
     }
@@ -1146,6 +1204,7 @@ static int bond_signal_locked(struct mcdma_fabric_peer *p, uint64_t off, uint64_
         for (unsigned i = 0; i < (unsigned)p->bonded; ++i, k = (k + 1) % (unsigned)p->bonded) {
             struct mcdma_fabric_peer *lane = p->part[k];
             enter(lane->f);
+            if (p->trace) tb_trace_group(&lane->e, p->tx_signal + 1);
             int can = peer_down(lane) ? -1 : tb_can_bond_signal(&lane->e);
             int bad = can < 0 || (can == 1 && tb_bond_signal_n(&lane->e, off, value, p->tx_signal + 1, need, (unsigned)p->bonded, OP_NS));
             if (bad) peer_fail(lane, NULL, 1);
@@ -1210,6 +1269,18 @@ unsigned mcdma_fabric_device_count(const struct mcdma_fabric_peer *p) {
 unsigned mcdma_fabric_qps_per_device(const struct mcdma_fabric_peer *p) {
     return p ? (unsigned)(p->bond ? p->bond : p)->f->qps : 0;
 }
+unsigned mcdma_fabric_progress_threads(const struct mcdma_fabric_peer *p) {
+    if (!p) return 0;
+    const struct mcdma_fabric *f = (p->bond ? p->bond : p)->f;
+    return f->shared_progress ? 1 : f->bonded ? (unsigned)f->bonded : (unsigned)f->threaded;
+}
+unsigned mcdma_fabric_post_threads(const struct mcdma_fabric_peer *p) {
+    if (!p) return 0;
+    const struct mcdma_fabric *f = (p->bond ? p->bond : p)->f;
+    return f->shared_progress ? (unsigned)f->bonded : 0;
+}
+
+#include "fabric_trace_report.h"
 
 int mcdma_fabric_link_stats(const struct mcdma_fabric_peer *p, unsigned index,
                             struct mcdma_fabric_link_stats *out) {
@@ -1247,6 +1318,8 @@ int mcdma_fabric_write_signal(struct mcdma_fabric_peer *p, uint64_t local_offset
     if (!length) return mcdma_fabric_signal(p, signal_offset, value);
     if (!p->bonded && p->e.kind != LINK_TB) return MCDMA_FABRIC_UNSUPPORTED;
     enter(p->f);
+    trace_main(p->trace, TR_APP_POST, p->bonded ? p->tx_signal + 1 : value, signal_offset, value, (uint32_t)length);
+    if (p->trace && !p->bonded) tb_trace_group(&p->e, value);
     if (p->bonded)
         return settle(p, peer_down(p) ||
                              bond_write_signal_locked(p, local_offset, remote_offset, length, signal_offset, value),
@@ -1351,6 +1424,16 @@ int mcdma_fabric_wait(struct mcdma_fabric *f, uint64_t offset, uint64_t value, u
         else if (f->wait_poll) wait_progress(f);
     }
     wait_active(f, -1);
+    if (!status && f->trace_enabled) {
+        enter(f);
+        uint64_t now = link_now_ns(), observed = __atomic_load_n(word, __ATOMIC_ACQUIRE);
+        for (int i = 0; i < f->npeers; ++i) if (f->peers[i]->trace) {
+            struct trace_log *log = f->peers[i]->trace;
+            log->main.events[log->main.count++ % TRACE_CAP] = (struct trace_event){now, 0, 0, offset, observed, 0,
+                                                                               (uint16_t)log->lanes, TR_PEER_POLL_SEEN};
+        }
+        pthread_mutex_unlock(&f->lock);
+    }
     return status;
 }
 
@@ -1367,6 +1450,7 @@ void mcdma_fabric_disconnect(struct mcdma_fabric_peer **pp) {
         mark_down(p);
         for (unsigned k = 0; k < (unsigned)p->bonded; ++k) mcdma_fabric_disconnect(&p->part[k]);
         free(p->pending);
+        trace_free(p->trace);
         for (unsigned k = 0; k < (unsigned)p->bonded; ++k) free(p->tails[k]);
         pthread_mutex_destroy(&p->rx_lock);
         free(p);
@@ -1377,18 +1461,26 @@ void mcdma_fabric_disconnect(struct mcdma_fabric_peer **pp) {
 void mcdma_fabric_close(struct mcdma_fabric **ff) {
     if (!ff || !*ff) return;
     struct mcdma_fabric *f = *ff;
-    if (f->threaded) {
+    if (f->threaded && !f->shared_progress) {
+        enter(f);
         __atomic_store_n(&f->stop, 1, __ATOMIC_RELEASE);
+        pthread_cond_broadcast(&f->work);
+        pthread_mutex_unlock(&f->lock);
         pthread_join(f->thread, NULL);
     }
     while (f->npeers) {
         struct mcdma_fabric_peer *p = f->peers[0];
         mcdma_fabric_disconnect(&p);
     }
+    if (f->shared_progress && f->threaded) {
+        __atomic_store_n(&f->stop, 1, __ATOMIC_RELEASE);
+        pthread_join(f->thread, NULL);
+    }
     if (f->bonded) {
         for (unsigned k = (unsigned)f->bonded; k > 0; --k) mcdma_fabric_close(&f->part[k - 1]);
     } else if (!f->shared) ep_close(&f->dev);
     pthread_mutex_destroy(&f->lock);
+    pthread_cond_destroy(&f->work);
     free(f);
     *ff = NULL;
 }

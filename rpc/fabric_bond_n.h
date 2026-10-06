@@ -33,6 +33,7 @@ static int bond_parallel(struct mcdma_fabric_peer *p, uint64_t off, uint64_t rof
         if (len <= TB_PACKET - (48 + n * 8)) {
             uint64_t need[BOND_LINKS] = {0}; bond_watermarks(p, need); need[k]++;
             enter(p->part[k]->f);
+            if (p->trace) tb_trace_group(&p->part[k]->e, p->tx_signal + 1);
             int bad = tb_bond_inline_n(&p->part[k]->e, &p->part[k]->win, off, roff, len,
                                         soff, value, p->tx_signal + 1, need, wait, n,
                                         signalled ? BOND_WAIT_SIGNALS : 0, OP_NS);
@@ -45,6 +46,7 @@ static int bond_parallel(struct mcdma_fabric_peer *p, uint64_t off, uint64_t rof
             return 0;
         }
         enter(p->part[k]->f);
+        if (p->trace) tb_trace_group(&p->part[k]->e, p->tx_signal + 1);
         int bad = tb_bond_write_n(&p->part[k]->e, &p->part[k]->win, off, roff, len,
                                    p->tx_signal + 1, wait, n, signalled ? BOND_WAIT_SIGNALS : 0, OP_NS);
         ordinal[k] = tb_writes_posted(&p->part[k]->e);
@@ -62,6 +64,7 @@ static int bond_parallel(struct mcdma_fabric_peer *p, uint64_t off, uint64_t rof
             f->ask_lane = p->part[k], f->ask_off = at, f->ask_roff = to, f->ask_len = sizes[k];
             f->batch = &batch;
             __atomic_store_n(&f->ask, ASK_OPEN, __ATOMIC_RELEASE);
+            if (f->post_only) pthread_cond_signal(&f->work);
             pthread_mutex_unlock(&f->lock);
             at += sizes[k], to += sizes[k];
         }
@@ -73,6 +76,7 @@ static int bond_parallel(struct mcdma_fabric_peer *p, uint64_t off, uint64_t rof
                     if (__atomic_compare_exchange_n(&p->part[k]->f->ask, &open, ASK_TAKEN, 0,
                                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
                         local[k] = 1;
+                        trace_main(p->trace, TR_BATCH_FALLBACK, batch.seq, 0, 0, k);
                         __atomic_add_fetch(&batch.ready, 1, __ATOMIC_ACQ_REL);
                         if (!p->fallback_logged) {
                             link_log("%s: bond worker wake exceeded 100 us; caller fallback may serialize parts", p->name);
@@ -91,6 +95,7 @@ static int bond_parallel(struct mcdma_fabric_peer *p, uint64_t off, uint64_t rof
                 break;
             }
         }
+        trace_main(p->trace, TR_BATCH_GO, batch.seq, 0, 0, (uint32_t)len);
         __atomic_store_n(&batch.go, 1, __ATOMIC_RELEASE);
         int bad = __atomic_load_n(&batch.cancel, __ATOMIC_ACQUIRE);
         for (unsigned k = 0; k < n; ++k) if (local[k]) {

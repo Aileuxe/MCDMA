@@ -296,6 +296,16 @@ int main(int argc, char **argv) {
     CHECK(!mcdma_fabric_wait(r[1].f, FLAG, 91, 5 * NS));
     CHECK(!memcmp(r[0].w + second, r[1].w, len));
     CHECK(!mcdma_fabric_flush(r[0].p, 5 * NS));
+    if (getenv("NBOND_TRACE_REPORT")) {
+        CHECK(mcdma_fabric_tracing(r[0].p) && mcdma_fabric_tracing(r[1].p));
+        CHECK(!mcdma_fabric_trace_report(r[0].p, stdout));
+        CHECK(!mcdma_fabric_trace_report(r[1].p, stdout));
+    } else if (!getenv("MCDMA_TRACE")) {
+        FILE *quiet = tmpfile(); CHECK(quiet);
+        CHECK(!mcdma_fabric_tracing(r[0].p));
+        CHECK(!mcdma_fabric_trace_report(r[0].p, quiet) && ftell(quiet) == 0);
+        fclose(quiet);
+    }
     /* One failed member poisons the whole peer; no automatic change to its negotiated lane count. */
     stub_tb_fail_qp(last, qps - 1);
     int status = 0;

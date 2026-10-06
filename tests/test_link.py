@@ -4,6 +4,7 @@ opens a real device except the verbs smoke test, which only lists devices and ru
 import os
 import pathlib
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -97,6 +98,21 @@ class LinkTests(unittest.TestCase):
     def test_each_connection_owns_its_provider_mapping_and_pd_keys(self):
         self.run_case('nbond', '4', '2', MCDMA_FABRIC_QPS='2', STUB_CONTEXT_MAP_ALIAS='1', STUB_SEED='4', STUB_STRICT='1', STUB_LAZY='1')
         self.run_case('nbond', '2', '3', MCDMA_FABRIC_QPS='3', STUB_CONTEXT_MAP_ALIAS='1', NBOND_CLOSE_ONLY='1', STUB_STRICT='1')
+
+    def test_trace_phases_and_shared_receive_measurement_mode(self):
+        for model in ('lane', 'shared'):
+            with self.subTest(model=model):
+                done = self.run_case('nbond', '4', '2', MCDMA_FABRIC_QPS='2', MCDMA_TRACE='1',
+                                     MCDMA_TRACE_PROGRESS=model, NBOND_TRACE_REPORT='1', STUB_STRICT='1', STUB_LAZY='1')
+                for phase in ('post', 'wire_complete_cq_observed', 'receive_complete', 'copy_done', 'signal_published', 'peer_poll_seen'):
+                    self.assertIn(f'event={phase} ', done.stdout)
+                self.assertIn('phase=post_to_wire_complete samples=', done.stdout)
+                self.assertIn('phase=signal_published_to_poll_seen samples=', done.stdout)
+                for phase in ('post_to_wire_complete', 'receive_to_copy_done', 'copy_done_to_signal_published',
+                              'signal_published_to_poll_seen', 'app_post_to_batch_go', 'batch_ready_to_go'):
+                    counts = [int(n) for n in re.findall(rf'phase={phase} samples=(\d+)', done.stdout)]
+                    self.assertTrue(counts and max(counts) > 0, (phase, counts))
+                self.assertIn('dropped_events=0', done.stdout)
 
     def test_the_exchange_admits_only_on_link_peers(self):
         self.run_case('link-xchg')
@@ -230,6 +246,8 @@ class LinkTests(unittest.TestCase):
         self.run_case('nbond-tsan', '4', '2', MCDMA_FABRIC_QPS='2', STUB_SEED='4', STUB_STRICT='1', STUB_LAZY='1')
         self.run_case('nbond-tsan', '4', '2', MCDMA_FABRIC_QPS='2', STUB_SEED='4', STUB_STRICT='1', STUB_LAZY='1', BOND_ASLEEP='1')
         self.run_case('nbond-tsan', '4', '2', MCDMA_FABRIC_QPS='2', STUB_CONTEXT_MAP_ALIAS='1', NBOND_CLOSE_ONLY='1', STUB_STRICT='1')
+        self.run_case('nbond-tsan', '4', '2', MCDMA_FABRIC_QPS='2', MCDMA_TRACE='1', MCDMA_TRACE_PROGRESS='shared',
+                      NBOND_TRACE_REPORT='1', STUB_STRICT='1', STUB_LAZY='1')
         for scenario in ('bond', 'bond-order', 'bond-overlap', 'bond-fail', 'bond-credit', 'bond-stripe',
                          'bond-pingpong', 'bond-later', 'bond-magic', 'bond-down', 'down', 'zero'):
             with self.subTest(scenario=scenario):

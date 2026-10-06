@@ -8,6 +8,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #define MCDMA_FABRIC_ABI 1u
 #define MCDMA_FABRIC_MAX_LINKS 8u
@@ -97,6 +98,12 @@ struct mcdma_fabric_link_stats { uint64_t posted_bytes, completed_bytes; };
 MCDMA_FABRIC_API unsigned mcdma_fabric_link_count(const struct mcdma_fabric_peer *p);
 MCDMA_FABRIC_API unsigned mcdma_fabric_device_count(const struct mcdma_fabric_peer *p);
 MCDMA_FABRIC_API unsigned mcdma_fabric_qps_per_device(const struct mcdma_fabric_peer *p);
+/* Opt-in MCDMA_TRACE=1 diagnostics. Timestamps are local monotonic observations, not synchronized wire clocks. */
+MCDMA_FABRIC_API int mcdma_fabric_tracing(const struct mcdma_fabric_peer *p);
+MCDMA_FABRIC_API void mcdma_fabric_trace_poll_seen(struct mcdma_fabric_peer *p, uint64_t offset, uint64_t value);
+MCDMA_FABRIC_API int mcdma_fabric_trace_report(struct mcdma_fabric_peer *p, FILE *out);
+MCDMA_FABRIC_API unsigned mcdma_fabric_progress_threads(const struct mcdma_fabric_peer *p);
+MCDMA_FABRIC_API unsigned mcdma_fabric_post_threads(const struct mcdma_fabric_peer *p);
 MCDMA_FABRIC_API int mcdma_fabric_link_stats(const struct mcdma_fabric_peer *p, unsigned index,
                                             struct mcdma_fabric_link_stats *out);
 

@@ -5,7 +5,9 @@ static int open_member(const char *device, int gid, int mtu, void *window, size_
     struct mcdma_fabric *f = calloc(1, sizeof(*f));
     if (!f) return MCDMA_FABRIC_NOMEM;
     pthread_mutex_init(&f->lock, NULL);
+    pthread_cond_init(&f->work, NULL);
     f->devices = f->qps = 1;
+    f->trace_enabled = getenv("MCDMA_TRACE") && !strcmp(getenv("MCDMA_TRACE"), "1");
     f->registration_owner = owner ? owner : f;
     f->wait_poll = !getenv("MCDMA_FABRIC_WAIT_POLL") || strcmp(getenv("MCDMA_FABRIC_WAIT_POLL"), "0");
     int status = MCDMA_FABRIC_OK;
@@ -18,7 +20,7 @@ static int open_member(const char *device, int gid, int mtu, void *window, size_
         f->threaded = !pthread_create(&f->thread, NULL, progress_main, f);
         if (!f->threaded) status = MCDMA_FABRIC_NOMEM;
     }
-    if (status) { if (!f->shared) ep_close(&f->dev); pthread_mutex_destroy(&f->lock); free(f); return status; }
+    if (status) { if (!f->shared) ep_close(&f->dev); pthread_mutex_destroy(&f->lock); pthread_cond_destroy(&f->work); free(f); return status; }
     *out = f; return MCDMA_FABRIC_OK;
 }
 
@@ -32,15 +34,22 @@ int mcdma_fabric_open_qps(const char *device, int gid, int mtu, void *window, si
     char names[BOND_LINKS][128];
     int n = split_links(device, names, 1);
     if (!n) return MCDMA_FABRIC_INVALID;
+    const char *model = getenv("MCDMA_TRACE_PROGRESS");
+    int shared = model && !strcmp(model, "shared");
+    int trace_on = getenv("MCDMA_TRACE") && !strcmp(getenv("MCDMA_TRACE"), "1");
+    if (model && (strcmp(model, "lane") && !shared)) return MCDMA_FABRIC_INVALID;
+    if (shared && !trace_on) { link_log("shared progress is a MCDMA_TRACE=1 measurement mode"); return MCDMA_FABRIC_INVALID; }
     struct mcdma_fabric *f = calloc(1, sizeof(*f));
     if (!f) return MCDMA_FABRIC_NOMEM;
     pthread_mutex_init(&f->lock, NULL);
+    pthread_cond_init(&f->work, NULL);
+    f->trace_enabled = getenv("MCDMA_TRACE") && !strcmp(getenv("MCDMA_TRACE"), "1");
     f->devices = n; f->qps = (int)(requested ? requested : 2); f->bonded = n;
     f->win.base = window; f->win.length = length;
     int status = MCDMA_FABRIC_OK, thunderbolt = 1;
     for (int d = 0; !status && d < n; ++d) {
         status = open_member(names[d], gid, mtu, window, length, fd, offset,
-                             flags | MCDMA_FABRIC_PROGRESS_THREAD, NULL, &f->part[d]);
+                             0, NULL, &f->part[d]);
         if (status) break;
         thunderbolt &= f->part[d]->dev.kind == LINK_TB;
         if (f->part[d]->dev.kind == LINK_TB) {
@@ -61,25 +70,36 @@ int mcdma_fabric_open_qps(const char *device, int gid, int mtu, void *window, si
     if (!status && n == 1 && f->qps == 1) {
         if (!requested && thunderbolt) link_log("%s: provider limit selects one QP", names[0]);
         struct mcdma_fabric *single = f->part[0];
-        if (!(flags & MCDMA_FABRIC_PROGRESS_THREAD)) {
-            __atomic_store_n(&single->stop, 1, __ATOMIC_RELEASE);
-            pthread_join(single->thread, NULL); single->threaded = 0; single->stop = 0;
+        if (flags & MCDMA_FABRIC_PROGRESS_THREAD) {
+            single->threaded = !pthread_create(&single->thread, NULL, progress_main, single);
+            if (!single->threaded) { mcdma_fabric_close(&single); pthread_mutex_destroy(&f->lock); pthread_cond_destroy(&f->work); free(f); return MCDMA_FABRIC_NOMEM; }
         }
-        pthread_mutex_destroy(&f->lock); free(f); *out = single; return MCDMA_FABRIC_OK;
+        pthread_mutex_destroy(&f->lock); pthread_cond_destroy(&f->work); free(f); *out = single; return MCDMA_FABRIC_OK;
     }
     if (!status) {
         f->bonded = n * f->qps;
         for (int q = 1; !status && q < f->qps; ++q)
             for (int d = 0; !status && d < n; ++d)
                 status = open_member(names[d], gid, mtu, window, length, fd, offset,
-                                     flags | MCDMA_FABRIC_PROGRESS_THREAD, f->part[d], &f->part[q * n + d]);
+                                     0, f->part[d], &f->part[q * n + d]);
+        for (int k = 0; !status && k < f->bonded; ++k) {
+            struct mcdma_fabric *lane = f->part[k]; lane->post_only = shared;
+            lane->threaded = !pthread_create(&lane->thread, NULL, progress_main, lane);
+            if (!lane->threaded) status = MCDMA_FABRIC_NOMEM;
+        }
+        if (!status && shared) {
+            f->shared_progress = 1;
+            f->threaded = !pthread_create(&f->thread, NULL, progress_shared, f);
+            if (!f->threaded) status = MCDMA_FABRIC_NOMEM;
+        }
     }
     if (status) {
         for (unsigned k = (unsigned)f->bonded; k > 0; --k) mcdma_fabric_close(&f->part[k - 1]);
-        pthread_mutex_destroy(&f->lock); free(f); return status;
+        pthread_mutex_destroy(&f->lock); pthread_cond_destroy(&f->work); free(f); return status;
     }
     if (f->qps > 1 || !requested)
-        link_log("bond: %d physical devices, %d QPs per device, %d progress threads", n, f->qps, f->bonded);
+        link_log("bond: %d physical devices, %d QPs per device, %d receive progress threads, %d post-only threads",
+                 n, f->qps, shared ? 1 : f->bonded, shared ? f->bonded : 0);
     *out = f; return MCDMA_FABRIC_OK;
 }
 

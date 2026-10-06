@@ -91,6 +91,9 @@ struct xchg {
 };
 
 struct tb;
+enum tb_trace_phase { TR_POST, TR_WIRE_COMPLETE, TR_RECEIVE_COMPLETE, TR_COPY_DONE, TR_SIGNAL_PUBLISHED,
+                      TR_PEER_POLL_SEEN, TR_APP_POST, TR_BATCH_READY, TR_BATCH_GO, TR_BATCH_FALLBACK };
+typedef void (*tb_trace_fn)(void *, unsigned, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t);
 
 struct ep {
     char device[64];
@@ -160,6 +163,8 @@ int tb_busy(const struct ep *e);
 const char *tb_failure(const struct ep *e); /* why the link failed, or NULL while it works */
 /* Waits for send room or a fence answer call `gone` about once a millisecond and give up when it returns nonzero. */
 void tb_watch(struct ep *e, void *arg, int (*gone)(void *arg));
+int tb_trace_hooks(struct ep *e, void *arg, tb_trace_fn trace);
+void tb_trace_group(struct ep *e, uint64_t group);
 /* A bond's receive hooks, run under this endpoint's lock with `arg`; none may reenter the endpoint. Ordinary wire
  * messages are unchanged; install the hooks before accepting bonded ones.
  *   placed    a write's bytes are in place; count is this link's writes placed so far

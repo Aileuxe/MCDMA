@@ -67,7 +67,18 @@ struct tb {
     char why[112];                /* the first reason, once poisoned */
     void *watch_arg;              /* asked every millisecond while a send waits: has the peer gone? */
     int (*watch)(void *arg);
+    void *trace_arg;
+    tb_trace_fn trace;
+    uint64_t *trace_groups, trace_group, trace_received, trace_taken, trace_bytes;
+    int trace_copied;
 };
+
+static inline void trace_copy(struct tb *t, uint64_t off, uint32_t len) {
+    if (t->trace) {
+        t->trace_copied = 1;
+        t->trace(t->trace_arg, TR_COPY_DONE, t->trace_taken, t->writes_placed + 1, off, 0, len);
+    }
+}
 
 static uint32_t packets(uint64_t len) { return (uint32_t)((len + TB_PACKET - 1) / TB_PACKET); }
 
@@ -132,6 +143,10 @@ static int post_send(struct ep *e, void *addr, uint32_t len, uint32_t lkey, int 
     wr.wr_id = TAG(T_SEND, i), wr.sg_list = &sge, wr.num_sge = 1;
     wr.opcode = IBV_WR_SEND;
     wr.send_flags = IBV_SEND_SIGNALED;
+    if (t->trace) {
+        t->trace_groups[i] = t->trace_group;
+        t->trace(t->trace_arg, TR_POST, t->tx_posted, t->trace_group, 0, 0, payload);
+    }
     if (!len || ibv_post_send(e->qp, &wr, &bad)) {
         poison(e, "posting a send failed");
         return -1;
@@ -241,7 +256,7 @@ void tb_destroy(struct ep *e) {
     if (failed || (t->ring_mr && ibv_dereg_mr(t->ring_mr)))
         link_log("%s: thunderbolt teardown failed; keeping its memory", e->device);
     else free(t->ring);
-    free(t);
+    free(t->trace_groups); free(t);
     e->qp = NULL, e->cq = NULL, e->tb = NULL;
 }
 
@@ -255,6 +270,17 @@ void tb_bond_hooks(struct ep *e, const struct tb_bond *hooks) {
     static const struct tb_bond none;
     e->tb->bond = hooks ? *hooks : none;
 }
+
+int tb_trace_hooks(struct ep *e, void *arg, tb_trace_fn trace) {
+    struct tb *t = e->tb;
+    if (!t) return -1;
+    if (trace && !t->trace_groups) {
+        t->trace_groups = calloc(TB_SEND_WR, sizeof(uint64_t));
+        if (!t->trace_groups) return -1;
+    }
+    t->trace_arg = arg; t->trace = trace; return 0;
+}
+void tb_trace_group(struct ep *e, uint64_t group) { if (e->tb && e->tb->trace) e->tb->trace_group = group; }
 
 uint64_t tb_writes_posted(const struct ep *e) { return e->tb ? e->tb->writes_posted : 0; }
 uint64_t tb_writes_placed(const struct ep *e) { return e->tb ? e->tb->writes_placed : 0; }
@@ -603,7 +629,7 @@ int tb_fence(struct ep *e, uint64_t timeout_ns) {
 }
 
 /* Copy `len` bytes of ring starting at slot counter `first` to `dst`; a message may wrap the ring once. */
-static void copy_out(const struct tb *t, uint64_t first, unsigned char *dst, uint64_t len) {
+static void copy_out(struct tb *t, uint64_t first, unsigned char *dst, uint64_t len) {
     uint64_t at = (first % t->slots) * TB_PACKET, room = (uint64_t)t->slots * TB_PACKET - at;
     uint64_t head = len < room ? len : room;
     memcpy(dst, t->ring + at, head);
@@ -611,7 +637,7 @@ static void copy_out(const struct tb *t, uint64_t first, unsigned char *dst, uin
 }
 
 /* Copy `len` bytes from `skip` bytes into the message at slot counter `first`; the ring may wrap once. */
-static void copy_skip(const struct tb *t, uint64_t first, uint64_t skip, unsigned char *dst, uint64_t len) {
+static void copy_skip(struct tb *t, uint64_t first, uint64_t skip, unsigned char *dst, uint64_t len) {
     uint64_t ring = (uint64_t)t->slots * TB_PACKET, at = ((first % t->slots) * TB_PACKET + skip) % ring;
     uint64_t head = len < ring - at ? len : ring - at;
     memcpy(dst, t->ring + at, head);
@@ -648,6 +674,7 @@ static int take_tail(struct ep *e, uint64_t first, uint64_t bytes) {
     }
     t->rx_seq++;
     copy_out(t, first, t->rx->base + off, bytes);
+    trace_copy(t, off, (uint32_t)bytes);
     placed(t);
     return 1;
 }
@@ -685,6 +712,7 @@ static int take_joined(struct ep *e, uint64_t first, uint64_t bytes, const struc
         return stall(e, "a joined write waited 10 s to announce its tail");
     t->rx_seq++;
     copy_skip(t, first, BOND_WS_HEAD, t->rx->base + h->off, h->len);
+    trace_copy(t, h->off, h->len);
     placed(t);
     if (t->bond.signal(t->bond.arg, seq, need, soff, h->value)) {
         poison(e, "the bonded signal was refused");
@@ -703,6 +731,7 @@ static int take(struct ep *e, uint64_t first, uint64_t count, uint64_t bytes) {
             return -1;
         }
         copy_out(t, first, t->rx->base + t->want_off, bytes);
+        trace_copy(t, t->want_off, (uint32_t)bytes);
         t->want_len = 0;
         placed(t);
         return 1;
@@ -728,8 +757,10 @@ static int take(struct ep *e, uint64_t first, uint64_t count, uint64_t bytes) {
         }
         t->rx_seq++;
         copy_skip(t, first, WS_HEAD, t->rx->base + h.off, h.len);
+        trace_copy(t, h.off, h.len);
         placed(t);
         __atomic_store_n((uint64_t *)(void *)(t->rx->base + soff), h.value, __ATOMIC_RELEASE);
+        if (t->trace) t->trace(t->trace_arg, TR_SIGNAL_PUBLISHED, t->trace_taken, t->writes_placed, soff, h.value, 0);
         return 1;
     }
     if (h.magic == MAGIC && (h.kind == C_BOND_SIGNAL || h.kind == C_BOND_SIGNAL_N) && h.seq == t->rx_seq && t->rx) {
@@ -772,7 +803,7 @@ static int take(struct ep *e, uint64_t first, uint64_t count, uint64_t bytes) {
         int ready = t->bond.ready_n(t->bond.arg, seq, flags, wait);
         if (ready < 0) { poison(e, "an N-link inline message is out of sequence"); return -1; }
         if (!ready) return stall(e, "an N-link inline message waited for prior placements");
-        memcpy(t->rx->base + h.off, m + size, h.len); placed(t); t->rx_seq++;
+        memcpy(t->rx->base + h.off, m + size, h.len); trace_copy(t, h.off, h.len); placed(t); t->rx_seq++;
         if (t->bond.signal(t->bond.arg, seq, need, soff, h.value)) { poison(e, "an N-link inline signal was refused"); return -1; }
         return 1;
     }
@@ -817,10 +848,14 @@ static int take(struct ep *e, uint64_t first, uint64_t count, uint64_t bytes) {
     t->rx_seq++;
     if (h.kind == C_INLINE) {
         memcpy(t->rx->base + h.off, t->ring + (first % t->slots) * TB_PACKET + HEAD, h.len);
+        trace_copy(t, h.off, h.len);
         placed(t);
     }
     if (h.kind == C_WRITE) t->want_off = h.off, t->want_len = h.len;
-    if (h.kind == C_SIGNAL) __atomic_store_n((uint64_t *)(void *)(t->rx->base + h.off), h.value, __ATOMIC_RELEASE);
+    if (h.kind == C_SIGNAL) {
+        __atomic_store_n((uint64_t *)(void *)(t->rx->base + h.off), h.value, __ATOMIC_RELEASE);
+        if (t->trace) t->trace(t->trace_arg, TR_SIGNAL_PUBLISHED, t->trace_taken, t->writes_placed, h.off, h.value, 0);
+    }
     if (h.kind == C_FENCE_ACK) t->fence_acked = (uint32_t)h.value;
     return 1;
 }
@@ -863,7 +898,12 @@ static void drain(struct ep *e, const int *wanted) {
             break;
         }
         uint64_t count = end - t->used + 1, bytes = (count - 1) * TB_PACKET + t->rx_len[end % t->slots];
+        if (t->trace) t->trace_copied = 0;
         if (take(e, t->used, count, bytes) <= 0) break;
+        if (t->trace) {
+            if (!t->trace_copied) t->trace(t->trace_arg, TR_COPY_DONE, t->trace_taken, 0, 0, 0, 0);
+            t->trace_taken++;
+        }
         t->used = end + 1;
         t->stalled = 0;
         t->taken_ns = link_now_ns();
@@ -882,8 +922,16 @@ static void complete(struct ep *e, const struct ibv_wc *wc, uint64_t now) {
         t->rx_len[index] = (uint16_t)wc->byte_len;
         t->rx_last[index] = wc->status == IBV_WC_SUCCESS;
         t->filled++;
+        if (t->trace) {
+            t->trace_bytes += wc->byte_len;
+            if (wc->status == IBV_WC_SUCCESS) {
+                t->trace(t->trace_arg, TR_RECEIVE_COMPLETE, t->trace_received++, 0, 0, 0, (uint32_t)t->trace_bytes);
+                t->trace_bytes = 0;
+            }
+        }
     } else if (kind == T_SEND && wc->status == IBV_WC_SUCCESS && index == t->tx_done % TB_SEND_WR &&
                t->tx_done < t->tx_posted) {
+        if (t->trace) t->trace(t->trace_arg, TR_WIRE_COMPLETE, t->tx_done, t->trace_groups[index], 0, 0, t->tx_payload[index]);
         t->packets -= t->tx_packets[index];
         t->unstaged += t->tx_staged[index];
         __atomic_store_n(&t->completed_bytes, t->completed_bytes + t->tx_bytes[index], __ATOMIC_RELAXED);
