@@ -5,9 +5,9 @@ is the base for collectives an engine runs itself: barriers, plan broadcasts, al
 and bulk copies. Unlike `mcdma-rpcd`, the library opens the verbs device inside the application, so an engine posts
 writes with no daemon hop. Peers meet through the same Thunderbolt-only exchange as the daemons; there is no TCP.
 
-Status: ABI 1. The single-port Thunderbolt path has hardware measurements; the bonded path needs the owner-run
-qualification below before its throughput or latency is established. Offline tests use a stub verbs library that
-enforces RoCE keys and models Thunderbolt RDMA as two Studios on macOS 27.0 measured it.
+Status: ABI 1. Both Thunderbolt paths have hardware measurements: the single port, and the bond of two ports, qualified
+between two M5 Ultra Mac Studios on 6 October 2026 (the README has the numbers). Offline tests use a stub verbs library
+that enforces RoCE keys and models Thunderbolt RDMA as two Studios on macOS 27.0 measured it.
 
 ## The calls
 

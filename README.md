@@ -6,6 +6,27 @@
 
 MCDMA now includes **AMD Strix Halo Linux hosts** alongside Mac Studio and NVIDIA DGX Spark. Strix/Spark bidirectional RDMA is hardware-verified; the Strix/Mac setup workflow is available and still needs physical validation.
 
+## New: dual-pipe RDMA between two Macs
+
+Two Macs joined by two Thunderbolt 5 cables now run one RDMA link over both cables. Open the two devices together
+(`rdma_en4+rdma_en3`) and connect the matching interfaces in the same order, and each transfer is striped across both
+cables and placed at the receiver. Thunderbolt RDMA offers only two-sided SEND and RECV, so the receiving library places
+each stripe in the window. Setup and guarantees: [two Thunderbolt links as one peer](docs/fabric.md#two-thunderbolt-links-as-one-peer).
+
+Measured on 6 October 2026 between two Mac Studios with M5 Ultra, macOS 27.0, with `fabric-check`:
+
+| Each direction | One cable | Both cables |
+| --- | ---: | ---: |
+| Streaming, Mac A to Mac B | 6.67 GB/s | 12.06 GB/s (1.81x) |
+| Streaming, Mac B to Mac A | 6.42 GB/s | 11.72 GB/s (1.83x) |
+| One 1 MiB message, median | 626–653 µs | 521–552 µs |
+| One 64-byte message, median | 6.9–9.0 µs | 8.1–10.2 µs |
+
+[TensorFold](https://github.com/ashhart/TensorFold)'s two-Mac speed-up mode runs over MCDMA: two M5 Ultras serve one
+Qwen3.8 Flash Next request together, with time to first token 1.6–1.74x faster than one Mac and decode 1.12–1.34x,
+measured over one cable. The bond takes a further 1.5–2% off time to first token at 8k and 32k tokens and adds 0.5–1%
+to decode: decode exchanges are small messages, so they depend on the link's latency more than its bandwidth.
+
 ## New in CLI 1.2.0: Strix Halo and Linux endpoints
 
 Register Strix and other Linux RDMA hosts in the same MCDMA fabric, build the peer tool natively on x86-64 or ARM64, discover the connected RDMA port and GIDs, and verify READ and WRITE from both endpoints. Linux/Linux links use stock libibverbs; Mac/Linux links use the Mac's MCDMA driver and the Linux stock provider. The CPU submits work and observes NIC completions.
