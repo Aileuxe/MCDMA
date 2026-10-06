@@ -154,17 +154,35 @@ int tb_busy(const struct ep *e);
 const char *tb_failure(const struct ep *e); /* why the link failed, or NULL while it works */
 /* Waits for send room or a fence answer call `gone` about once a millisecond and give up when it returns nonzero. */
 void tb_watch(struct ep *e, void *arg, int (*gone)(void *arg));
-/* Bond hooks run under the endpoint's lock, after copying a complete write. The signal hook must copy `need`
- * if retaining it, return 0 on success/-1 on failure, and arrange the final release-store itself. No hook may
- * reenter this endpoint. Install both hooks before accepting bonded messages; ordinary wire messages are unchanged. */
-void tb_bond_hooks(struct ep *e, void *arg, void (*placed)(void *arg, uint64_t count),
-                   int (*signal)(void *arg, uint64_t seq, const uint64_t need[2], uint64_t off, uint64_t value));
+/* A bond's receive hooks, run under this endpoint's lock with `arg`; none may reenter the endpoint. Ordinary wire
+ * messages are unchanged; install the hooks before accepting bonded ones.
+ *   placed    a write's bytes are in place; count is this link's writes placed so far
+ *   signal    queue a bonded signal for the bond to publish; need holds each link's write count (low 32 bits) that
+ *             must be placed first. 0 queued, -1 refused (the link fails)
+ *   ready     may a joined write's part land now? flags BOND_WAIT_*, wait the other link's write count (low 32 bits).
+ *             1 yes, 0 not yet, -1 never (out of sequence)
+ *   announce  the other link's next tail is `len` bytes for `off`, its `ordinal`th write (low 32 bits). 0 or 1 full
+ *   tail      take the announcement for this link's next tail. 1 taken, 0 none yet */
+#define BOND_WAIT_LINK 1u           /* the other link has placed `wait` writes */
+#define BOND_WAIT_SIGNALS 2u        /* every earlier bonded signal is published: the part covers a word one stores */
+struct tb_bond {
+    void *arg;
+    unsigned lane;              /* this link's index in the bond, 0 or 1 */
+    void (*placed)(void *arg, uint64_t count);
+    int (*signal)(void *arg, uint64_t seq, const uint32_t need[2], uint64_t off, uint64_t value);
+    int (*ready)(void *arg, uint64_t seq, unsigned flags, uint32_t wait);
+    int (*announce)(void *arg, uint64_t off, uint32_t len, uint32_t ordinal);
+    int (*tail)(void *arg, uint64_t *off, uint32_t *len, uint32_t *ordinal);
+};
+void tb_bond_hooks(struct ep *e, const struct tb_bond *hooks);
 uint64_t tb_writes_posted(const struct ep *e);
 uint64_t tb_writes_placed(const struct ep *e);
 uint64_t tb_posted_bytes(const struct ep *e);
 uint64_t tb_completed_bytes(const struct ep *e);
 uint64_t tb_posted_payload(const struct ep *e);
 uint64_t tb_completed_payload(const struct ep *e);
+uint64_t tb_rate(const struct ep *e);        /* recent send rate in bytes per microsecond; 0 before a large send */
+uint64_t tb_message_max(const struct ep *e); /* the largest message the peer's ring takes whole */
 uint64_t tb_write_limit(const struct ep *e); /* cap a scheduler's piece by this and its source-registration room */
 /* Caller serializes with progress. can_write: 1 room, 0 no room, -1 invalid/failed. write_try: 0 posted,
  * 1 no room, -1 invalid/failed; no progress, waits or partial posting on insufficient room. len <= TB_TRY_MAX. */
@@ -175,10 +193,19 @@ int tb_bond_signal(struct ep *e, uint64_t soff, uint64_t value, uint64_t seq, co
 int tb_can_bond_signal(const struct ep *e); /* -1 invalid/failed, 0 no staged-header room, 1 ready */
 /* -1 invalid/failed, 0 no room, 1 fused ready, 2 not representable; no progress or source changes. */
 int tb_can_bond_write_signal(const struct ep *e, const struct region *src, uint64_t off, uint64_t len);
-/* Fused only: 1 means not representable (nothing posted), 0 posted, -1 invalid/failed. need includes this write
- * on the selected lane, whose posted count increases by exactly one. The source reserves 64 bytes before off. */
+/* A joined write's part as one message, its 64-byte head in the source before off: 0 posted, 1 not representable
+ * (nothing posted), -1 invalid/failed. need holds both links' write counts including this part and any tail; the
+ * other link carries `tail` more bytes for roff + len, posted first with tb_bond_tail. flags/wait as the ready hook. */
 int tb_bond_write_signal(struct ep *e, const struct region *src, uint64_t off, uint64_t roff, uint64_t len,
-                          uint64_t soff, uint64_t value, uint64_t seq, const uint64_t need[2], uint64_t timeout_ns);
+                          uint64_t soff, uint64_t value, uint64_t seq, const uint64_t need[2], uint32_t tail,
+                          unsigned flags, uint64_t wait, uint64_t timeout_ns);
+/* A joined write's tail: len bytes from the source as one message with no head, which the other link's part
+ * announces at the receiver. can: -1 invalid/failed, 0 no room, 1 ready, 2 not representable (it crosses a
+ * registration, outgrows the peer's ring or starts with a head's magic). tail: 0 posted, 1 no room, 2 not
+ * representable, -1 failed. tb_tail_clean: whether bytes at off can start a tail. */
+int tb_can_bond_tail(const struct ep *e, const struct region *src, uint64_t off, uint64_t len);
+int tb_bond_tail(struct ep *e, const struct region *src, uint64_t off, uint64_t len);
+int tb_tail_clean(const struct region *src, uint64_t off);
 
 /* link_xchg.c */
 int xchg_open(struct xchg *x, const char *via, int port, int peer_port, const char *name);

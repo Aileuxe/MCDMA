@@ -96,26 +96,53 @@ Both endpoints must open two Thunderbolt devices and give two matching interface
 consecutive UDP ports: physical link zero uses `port`/`peer_port`, and physical link one uses each port plus one.
 A zero `peer_port` still means the local base port. Reserve both ports on both endpoints.
 
-One bonded peer owns both physical links. Large writes are split into chunks and assigned using each link's posted
-but not yet completed wire bytes; small writes stay whole on the least-loaded link, except that an outstanding
-overlapping write retains its link affinity. Each link's bulk backlog is bounded to roughly 1 MiB, so posting a
-large burst cannot leave half its bytes queued behind a degraded link. The links need not run at the
-same speed. Each link has its own receive-placement thread, including when the caller did not request a progress
-thread. A caller can still explicitly request progress threads for a single-link fabric.
+One bonded peer owns both physical links, and each link has its own receive-placement thread, including when the
+caller did not request a progress thread. A caller can still explicitly request progress threads for a single-link
+fabric. Both ends need a library with tails, described next; an end without them refuses the bond at connect.
+
+`mcdma_fabric_write_signal` of 16 KiB or more is cut into one message on each link, so a write and its flag still cost
+one send per link. The library cuts the source so both links finish together, from what each has queued and the
+rate each measured on its own recent sends of 16 KiB and up: equal links each carry about half, and a link running
+at half the other's rate carries about a third. Link one's part goes as a joined message, its 64-byte head written
+into the room before the source as on one link. Link two's part, the bytes after it, goes as a tail: a message with
+no head, sent straight from the window. At the receiver the joined part announces the tail to the other link's
+placement thread, both copy at once, and the signal publishes when both parts are in place. The joined part names
+the tail's write count on its link, so a lost or reordered tail fails the link. The receiver tells a tail from a
+head by its first four bytes, so the sender moves the cut one byte when the bytes there begin with a head's magic.
+The head's message is a whole number of 4 KiB packets where it can be, the links take turns carrying it, each part
+stays inside one source registration (a source that crosses one is cut at the boundary), and each fits the peer's
+ring. A write either link would carry almost all of goes whole on the link that finishes it first; one too large
+for one message a link, at most about 8 MiB, goes as writes and then a signal.
+
+A write_signal under 16 KiB goes whole on the link that would finish it first. Links whose finish times are within a
+quarter of each other take turns, so traffic that leaves both idle between messages, such as a ping-pong, uses both;
+a link measured at half the other's rate gets small messages only when the other has a queue. A link that has not
+measured itself yet is taken to run like the other. Signals pick their link the same way.
+
+Plain writes are split into chunks of up to 256 KiB, assigned by each link's posted but not yet completed wire bytes;
+equal backlogs alternate. Small writes stay whole on one link. Each link's bulk backlog is bounded to roughly 1 MiB,
+so posting a large burst cannot leave half its bytes queued behind a degraded link.
 
 A signal covers earlier writes on both links, not only the link carrying the signal. The receiver waits for the
 signal's per-link placement counts before publishing its word, and publishes later signals in order. A write with
 its signal has the same rule. Placement counters publish only after the payload copy; acquire/release word
 publication makes both links' earlier bytes visible to the waiting caller. The bounded signal reorder queue also
 has sender credit: after 4,096 signals without a fence, the sender fences both links before posting another, so a
-slow link cannot overflow that queue. Overlapping writes retain posting order across the bond. The library records the
-remote ranges and physical links of outstanding writes: an overwrite of a range confined to one link stays on that
-link and uses its own message order. Overwriting a range spread across both links first fences both, as does writing
-over a word whose earlier signal is still deferred. That prevents a late earlier write or signal from overwriting
-the later call without adding a cross-link fence to every repeated small fused write. `flush` completes both links
-and waits for the receiving side's placement fence; send completion alone is not proof of remote placement on
-Thunderbolt. A failed physical link fails the entire peer, so later writes, signals and flushes report failure rather
-than silently using only the surviving link. Disconnect and reconnect the peer after resolving the failed link.
+slow link cannot overflow that queue.
+
+Overlapping writes retain posting order across the bond. The sender records the remote ranges of writes and
+signalled words the receiver may not have placed yet, with the latest write on each link into each range;
+overlapping ranges merge, and a full table folds into one range that every later call treats as overlapping until a
+flush empties it. A joined write_signal that overlaps earlier writes on the other link carries that link's write
+count, and its receiver places it only once that many are placed; one that covers a word an earlier signal stores
+also waits for every earlier signal to publish. That wait happens at the receiver, beside data already arriving, so
+a tensor-parallel exchange that rewrites the same slots every other step pays no fence. A plain write cannot wait that
+way: one over bytes only one link carried stays on that link's ordered queue, and one over bytes both links carried,
+or over a signalled word, first fences both links. `flush` completes both links and waits for the receiving side's
+placement fence; send completion alone is not proof of remote placement on Thunderbolt. A bonded message that waits
+10 s on the other link fails its link, since only a lost message keeps it waiting that long. A failed physical link
+fails the entire peer, so later writes, signals and flushes report failure rather than silently using only the
+surviving link. Disconnect and reconnect the peer after resolving the failed link.
 
 `mcdma_fabric_link_count(peer)` returns one or two. `mcdma_fabric_link_stats(peer, index, &stats)` reports payload
 bytes posted and completed on that physical link, excluding protocol headers and control signals. On RoCE the
@@ -151,12 +178,14 @@ How a write lands:
 2. A write of up to 4,064 bytes travels inside one header message, a single packet.
 3. A larger write is a header message with its offset and length, then its bytes as a message of their own, sent
    straight from the window with no copy, in pieces of at most 4 MiB that never cross a registration.
-4. On one physical link, `mcdma_fabric_write_signal` sends the head, the signal's offset and the bytes as one message from the window, its
-   head written into the 64 bytes before the source, so a write and its flag cost one send instead of three. One that
-   would span two registrations or outgrow the peer's ring goes as a write, then a signal.
+4. On one physical link, `mcdma_fabric_write_signal` sends the head, the signal's offset and the bytes as one message
+   from the window, its head written into the 64 bytes before the source, so a write and its flag cost one send
+   instead of three. One that would span two registrations or outgrow the peer's ring goes as a write, then a signal.
+   A bond cuts one of 16 KiB or more into such a message on one link and a tail with no head on the other.
 5. Each link's receiver takes whole messages from the ring in arrival order and copies each write's bytes into place.
    A single-link signal is applied when its header is taken; a bonded signal waits for placement counts from both
-   links. Overlapping writes retain later-write-wins order, as RC ordering gives on RoCE.
+   links, and a tail for its announcement from the other link. Overlapping writes retain later-write-wins order, as
+   RC ordering gives on RoCE.
 6. Every header carries a sequence number. A lost or reordered message, bytes whose length differs from their header,
    a write outside the window or any unexpected completion fails the link instead of landing anywhere else.
 

@@ -17,17 +17,22 @@ STUB = ['tests/stub_link_verbs.c']
 SKIP = 77
 # a failing sanitizer or stub exits with a status instead of aborting, so no crash report is raised
 QUIET = {'ASAN_OPTIONS': 'abort_on_error=0:detect_leaks=0', 'UBSAN_OPTIONS': 'halt_on_error=1:abort_on_error=0',
-         'MCDMA_FABRIC_LOG': '0'}
+         'TSAN_OPTIONS': 'halt_on_error=1:abort_on_error=0:exitcode=66', 'MCDMA_FABRIC_LOG': '0'}
+BASE = ['cc', '-std=c11', '-O1', '-g', '-Wall', '-Wextra', '-Werror', '-DMCDMA_LINK_TEST_INTERFACES']
+FABRIC = ['-DMCDMA_FABRIC_TEST_DMABUF', '-DMCDMA_FABRIC_TESTING', 'rpc/libmcdma_fabric.c', *LINK, *STUB,
+          'tests/test_fabric.c']
+
+
+def sanitizer(work, kinds):
+    probe = pathlib.Path(work) / 'probe.c'
+    probe.write_text('int main(void) { return 0; }\n')
+    flags = [*BASE, f'-fsanitize={kinds}']
+    built = subprocess.run([*flags, str(probe), '-o', str(probe.with_suffix(''))], capture_output=True)
+    return flags if built.returncode == 0 else None
 
 
 def compiler_flags(work):
-    flags = ['cc', '-std=c11', '-O1', '-g', '-Wall', '-Wextra', '-Werror', '-DMCDMA_LINK_TEST_INTERFACES']
-    probe = pathlib.Path(work) / 'probe.c'
-    probe.write_text('int main(void) { return 0; }\n')
-    sanitized = [*flags, '-fsanitize=address,undefined']
-    if subprocess.run([*sanitized, str(probe), '-o', str(probe.with_suffix(''))], capture_output=True).returncode == 0:
-        return sanitized
-    return flags
+    return sanitizer(work, 'address,undefined') or BASE
 
 
 @unittest.skipUnless(shutil.which('cc'), 'C compiler required')
@@ -43,7 +48,7 @@ class LinkTests(unittest.TestCase):
             'link-tb': [*LINK, *STUB, 'tests/test_link_tb.c'],
             'link-xchg': [*LINK, *STUB, 'tests/test_link_xchg.c'],
             'rpcd-tb': [*dirs, '-DRPC_ECHO_NO_MAIN', *DAEMON, *LINK, *STUB, 'rpc/rpc_echo.c', 'tests/test_rpcd_tb.c'],
-            'fabric': ['-DMCDMA_FABRIC_TEST_DMABUF', 'rpc/libmcdma_fabric.c', *LINK, *STUB, 'tests/test_fabric.c'],
+            'fabric': FABRIC,
             'fabric-check': ['-DFABRIC_CHECK_NO_MAIN', 'rpc/fabric_check.c', 'rpc/libmcdma_fabric.c', *LINK, *STUB,
                              'tests/test_fabric_check.c'],
             'mesh-check': ['-DMESH_CHECK_NO_MAIN', 'rpc/mesh_check.c', 'rpc/libmcdma_fabric.c', *LINK, *STUB,
@@ -51,6 +56,11 @@ class LinkTests(unittest.TestCase):
         }
         for name, sources in builds.items():
             subprocess.run([*flags, *sources, '-lpthread', '-o', os.path.join(cls.work, name)], cwd=ROOT, check=True)
+        # the bond's progress threads, signal queue and tail queues under ThreadSanitizer, where the compiler has it
+        cls.threads = sanitizer(cls.work, 'thread')
+        if cls.threads:
+            subprocess.run([*cls.threads, *FABRIC, '-lpthread', '-o', os.path.join(cls.work, 'fabric-tsan')], cwd=ROOT,
+                           check=True)
 
     @classmethod
     def tearDownClass(cls):
@@ -159,6 +169,38 @@ class LinkTests(unittest.TestCase):
 
     def test_public_maximum_names_fit_bond_lane_suffixes(self):
         self.run_case('fabric', 'bond-names', STUB_STRICT='1')
+
+    def test_bond_write_signals_are_cut_one_message_a_link(self):
+        self.run_case('link-tb', 'tail', STUB_SEED='2', STUB_LAZY='1')
+        self.run_case('fabric', 'bond-plan')
+        for seed, depth in (('1', None), ('4', None), ('2', '8')):
+            with self.subTest(seed=seed, depth=depth):
+                depth_env = {'STUB_TB_DEPTH': depth} if depth else {}
+                self.run_case('fabric', 'bond-stripe', STUB_SEED=seed, STUB_STRICT='1', STUB_LAZY='1', **depth_env)
+
+    def test_bond_carries_tensor_parallel_exchanges_on_both_links(self):
+        for seed, lazy in (('1', {'STUB_LAZY': '1'}), ('3', {'STUB_LAZY': '1'}), ('5', {})):
+            with self.subTest(seed=seed, lazy=bool(lazy)):
+                self.run_case('fabric', 'bond-pingpong', STUB_SEED=seed, STUB_STRICT='1', **lazy)
+
+    def test_bond_later_cut_writes_win(self):
+        for seed in ('2', '7'):
+            with self.subTest(seed=seed):
+                self.run_case('fabric', 'bond-later', STUB_SEED=seed, STUB_STRICT='1', STUB_LAZY='1')
+
+    def test_bond_tails_never_start_with_a_head(self):
+        self.run_case('fabric', 'bond-magic', STUB_SEED='3', STUB_STRICT='1', STUB_LAZY='1')
+
+    def test_bond_gives_a_slower_link_less(self):
+        self.run_case('fabric', 'bond-uneven', STUB_SEED='6', STUB_STRICT='1', STUB_LAZY='1')
+
+    def test_bond_threads_are_race_free(self):
+        if not self.threads:
+            self.skipTest('the compiler has no ThreadSanitizer')
+        for scenario in ('bond', 'bond-order', 'bond-overlap', 'bond-fail', 'bond-credit', 'bond-stripe',
+                         'bond-pingpong', 'bond-later', 'bond-magic', 'bond-down', 'down', 'zero'):
+            with self.subTest(scenario=scenario):
+                self.run_case('fabric-tsan', scenario, STUB_SEED='4', STUB_STRICT='1', STUB_LAZY='1', timeout=300)
 
     def test_a_zero_length_write_signal_is_a_signal(self):
         done = self.run_case('fabric', 'zero', STUB_SEED='5', STUB_STRICT='1', STUB_LAZY='1', MCDMA_FABRIC_LOG='1')

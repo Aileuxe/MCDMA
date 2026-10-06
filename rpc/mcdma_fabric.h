@@ -87,8 +87,9 @@ MCDMA_FABRIC_API int mcdma_fabric_write(struct mcdma_fabric_peer *p, uint64_t lo
 /* Store `value` at the peer's 8-byte-aligned remote_offset, after every earlier write to that peer has landed. */
 MCDMA_FABRIC_API int mcdma_fabric_signal(struct mcdma_fabric_peer *p, uint64_t remote_offset, uint64_t value);
 
-/* mcdma_fabric_write, then mcdma_fabric_signal, fused when representable on one Thunderbolt link. A large bonded
- * write spreads across links before its ordered signal. The library may overwrite the MCDMA_FABRIC_WS_ROOM bytes
+/* mcdma_fabric_write, then mcdma_fabric_signal, fused when representable on one Thunderbolt link. A bond sends 16 KiB
+ * or more as one message on each link, cut so both finish together, and the peer publishes the signal once both parts
+ * are placed; less goes whole on one link. The library may overwrite the MCDMA_FABRIC_WS_ROOM bytes
  * before local_offset; both ends need a library that has this call. A length of 0 is mcdma_fabric_signal, on any
  * link and with no room needed before local_offset. */
 #define MCDMA_FABRIC_WS_ROOM 64u

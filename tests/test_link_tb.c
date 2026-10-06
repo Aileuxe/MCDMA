@@ -5,7 +5,9 @@
  *   random    thousands of random writes and signals both ways at once match a replayed mirror
  *   bounds    a write outside what the receiver accepts fails the link instead of landing
  *   teardown  queue pairs with sends still waiting for credit are torn down without misuse
- *   bond      transport hooks see complete writes and exact 64-bit signal metadata; nonblocking credit is bounded
+ *   bond      transport hooks see complete writes and exact signal metadata; nonblocking credit is bounded
+ *   tail      a headless tail waits for its announcement, lands where it says and counts as its write; a joined part
+ *             waits for the bond's go-ahead, announces its tail, and a mismatched tail fails the link
  * Exit 0 means pass; STUB_SEED changes the delivery order across queue pairs. */
 #include "../rpc/link.h"
 
@@ -272,7 +274,11 @@ struct bond_watch {
     struct side *rx;
     const unsigned char *src;
     uint64_t dst, len, count, signals, seq, need[2], soff, value;
-    int wrong;
+    int wrong, ready;
+    /* announcements: what this link's tails should be, as the other link's parts would announce them */
+    uint64_t tail_off[8], heard_off;
+    uint32_t tail_len[8], tail_ordinal[8], heard_len, heard_ordinal;
+    unsigned tails, taken, heard;
 };
 
 static void bond_placed(void *arg, uint64_t count) {
@@ -281,13 +287,39 @@ static void bond_placed(void *arg, uint64_t count) {
     w->count = count;
 }
 
-static int bond_signal(void *arg, uint64_t seq, const uint64_t need[2], uint64_t off, uint64_t value) {
+static int bond_signal(void *arg, uint64_t seq, const uint32_t need[2], uint64_t off, uint64_t value) {
     struct bond_watch *w = arg;
-    if (seq != w->seq || need[0] != w->need[0] || need[1] != w->need[1] || off != w->soff || value != w->value ||
-        w->count != tb_writes_placed(&w->rx->e)) w->wrong = 1;
+    if (seq != w->seq || need[0] != (uint32_t)w->need[0] || need[1] != (uint32_t)w->need[1] || off != w->soff ||
+        value != w->value || w->count != tb_writes_placed(&w->rx->e)) w->wrong = 1;
     w->signals++;
     /* The callback queues the signal rather than releasing it: the transport must never store the flag itself. */
     return 0;
+}
+
+static int bond_ready(void *arg, uint64_t seq, unsigned flags, uint32_t wait) {
+    struct bond_watch *w = arg;
+    (void)seq, (void)flags, (void)wait;
+    return __atomic_load_n(&w->ready, __ATOMIC_ACQUIRE);
+}
+
+static int bond_announce(void *arg, uint64_t off, uint32_t len, uint32_t ordinal) {
+    struct bond_watch *w = arg;
+    w->heard_off = off, w->heard_len = len, w->heard_ordinal = ordinal;
+    w->heard++;
+    return 0;
+}
+
+static int bond_tail(void *arg, uint64_t *off, uint32_t *len, uint32_t *ordinal) {
+    struct bond_watch *w = arg;
+    if (w->taken == __atomic_load_n(&w->tails, __ATOMIC_ACQUIRE)) return 0;
+    *off = w->tail_off[w->taken % 8], *len = w->tail_len[w->taken % 8], *ordinal = w->tail_ordinal[w->taken % 8];
+    w->taken++;
+    return 1;
+}
+
+static void install(struct side *b, struct bond_watch *w) {
+    struct tb_bond hooks = {w, 0, bond_placed, bond_signal, bond_ready, bond_announce, bond_tail};
+    tb_bond_hooks(&b->e, &hooks);
 }
 
 static void bond_poll(struct side *a, struct side *b, struct bond_watch *w, uint64_t writes, uint64_t signals) {
@@ -301,11 +333,12 @@ static void bond_poll(struct side *a, struct side *b, struct bond_watch *w, uint
 
 static void scenario_bond(struct side *a, struct side *b) {
     stop(b);
-    struct bond_watch w = {.rx = b, .count = tb_writes_placed(&b->e), .soff = WINDOW - 128};
-    tb_bond_hooks(&b->e, &w, bond_placed, bond_signal);
+    struct bond_watch w = {.rx = b, .count = tb_writes_placed(&b->e), .soff = WINDOW - 128, .ready = 1};
+    install(b, &w);
     const uint64_t sizes[] = {7, 4064, 65537, 4032, 4033, 100003};
     uint64_t chunk = tb_write_limit(&a->e);
     CHECK(chunk > 64 && chunk <= TB_TRY_MAX, "scheduler chunk limit follows granted depth");
+    CHECK(tb_message_max(&a->e) >= chunk, "a whole message is at least a scheduler chunk");
     uint64_t payload = tb_posted_payload(&a->e), initial_wire = tb_posted_bytes(&a->e);
     for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
         uint64_t src = (1ull << 20) + i * (256ull << 10), before = tb_writes_posted(&a->e), signals = w.signals;
@@ -318,8 +351,8 @@ static void scenario_bond(struct side *a, struct side *b) {
             CHECK(!tb_write_signal(&a->e, &a->r, src, w.dst, w.len, w.soff, 17, TIMEOUT), "ordinary fused wire remains accepted");
         else if (i >= 3) {
             CHECK(tb_can_bond_write_signal(&a->e, &a->r, src, w.len) == 1, "fused preflight reserves its actual packet count");
-            CHECK(!tb_bond_write_signal(&a->e, &a->r, src, w.dst, w.len, w.soff, w.value, w.seq, w.need, TIMEOUT),
-                  "a 64-byte bonded fused head posts");
+            CHECK(!tb_bond_write_signal(&a->e, &a->r, src, w.dst, w.len, w.soff, w.value, w.seq, w.need, 0, 0, 0,
+                                        TIMEOUT), "a 64-byte bonded fused head posts");
         }
         else {
             CHECK(tb_can_write(&a->e, &a->r, src, w.len) == 1, "nonblocking write has room");
@@ -338,16 +371,19 @@ static void scenario_bond(struct side *a, struct side *b) {
         CHECK(tb_progress(&a->e) >= 0 && tb_progress(&b->e) >= 0, "earlier SENDs reap before reservation checks");
         CHECK(link_now_ns() < deadline, "earlier SENDs timed out");
     }
+    CHECK(tb_rate(&a->e) > 0, "sends of 64 KiB and more measure the link's rate");
     /* An unrepresentable fused header must leave both source bytes and counters untouched for the caller's fallback. */
     uint64_t before = tb_writes_posted(&a->e), wire = tb_posted_bytes(&a->e);
     unsigned char saved[64];
     memcpy(saved, a->mem + TB_SEG - 48, sizeof(saved));
     CHECK(tb_can_bond_write_signal(&a->e, &a->r, TB_SEG + 16, 128) == 2 &&
           tb_can_bond_write_signal(&a->e, &a->r, 64, 0) < 0, "fused preflight distinguishes fallback from invalid input");
-    CHECK(tb_bond_write_signal(&a->e, &a->r, TB_SEG + 16, 0, 128, w.soff, 7, w.seq, w.need, TIMEOUT) == 1,
+    CHECK(tb_bond_write_signal(&a->e, &a->r, TB_SEG + 16, 0, 128, w.soff, 7, w.seq, w.need, 0, 0, 0, TIMEOUT) == 1,
           "bonded fusion across a registration requests fallback");
     CHECK(!memcmp(saved, a->mem + TB_SEG - 48, sizeof(saved)) && tb_writes_posted(&a->e) == before &&
           tb_posted_bytes(&a->e) == wire, "fallback posts and changes nothing");
+    CHECK(tb_bond_write_signal(&a->e, &a->r, 4096, 0, 128, w.soff, 7, w.seq, w.need, 0, 4, 0, TIMEOUT) < 0,
+          "unknown wait flags are refused");
     CHECK(tb_write_try(&a->e, &a->r, 0, 0, TB_TRY_MAX + 1) < 0, "oversized nonblocking chunks are refused");
     /* Reserve all headers before a source-registration split, then publish both complete placements. */
     w.len = 0;
@@ -374,9 +410,65 @@ static void scenario_bond(struct side *a, struct side *b) {
         CHECK(link_now_ns() < deadline, "SEND completion counters timed out");
     }
     CHECK(tb_completed_payload(&a->e) == tb_posted_payload(&a->e), "completion payload matches every posted byte");
-    tb_bond_hooks(&b->e, NULL, NULL, NULL);
+    tb_bond_hooks(&b->e, NULL);
     start(b);
     CHECK(!tb_fence(&a->e, TIMEOUT), "bond transport leaves the ordinary fence operational");
+}
+
+/* Run both ends for a while without expecting anything new to land. */
+static void idle(struct side *a, struct side *b, unsigned rounds) {
+    for (unsigned i = 0; i < rounds; ++i)
+        CHECK(tb_progress(&a->e) >= 0 && tb_progress(&b->e) >= 0, "the links stay up while a message waits");
+}
+
+static void scenario_tail(struct side *a, struct side *b) {
+    stop(b);
+    struct bond_watch w = {.rx = b, .count = tb_writes_placed(&b->e), .soff = WINDOW - 128, .ready = 1};
+    install(b, &w);
+    const uint64_t src = 3ull << 20, len = 20000;
+    uint32_t magic = 0x4254434du;
+    memcpy(a->mem + src + 100, &magic, 4);
+    CHECK(!tb_tail_clean(&a->r, src + 100) && tb_can_bond_tail(&a->e, &a->r, src + 100, len) == 2 &&
+          tb_bond_tail(&a->e, &a->r, src + 100, len) == 2, "a tail never starts with a head's magic");
+    CHECK(tb_tail_clean(&a->r, src + 101) && tb_can_bond_tail(&a->e, &a->r, src, len) == 1,
+          "other bytes can start one");
+    CHECK(tb_can_bond_tail(&a->e, &a->r, TB_SEG - 8, 64) == 2, "a tail stays inside one source registration");
+    /* A tail that arrives before its announcement waits, unplaced and unpoisoned. */
+    uint64_t before = tb_writes_posted(&a->e);
+    w.src = a->mem + src, w.dst = 5ull << 20, w.len = len;
+    CHECK(!tb_bond_tail(&a->e, &a->r, src, len) && tb_writes_posted(&a->e) == before + 1, "a tail posts as one write");
+    idle(a, b, 2000);
+    CHECK(w.count == tb_writes_placed(&b->e) && w.count == before, "an unannounced tail does not land");
+    w.tail_off[0] = w.dst, w.tail_len[0] = (uint32_t)len, w.tail_ordinal[0] = (uint32_t)(before + 1);
+    __atomic_store_n(&w.tails, 1, __ATOMIC_RELEASE);
+    bond_poll(a, b, &w, before + 1, w.signals);
+    CHECK(!memcmp(b->mem + w.dst, a->mem + src, len), "an announced tail lands where its head said");
+    /* A joined part waits for the bond's go-ahead, then announces its tail and queues its signal. */
+    uint64_t part = (4ull << 20) + 64, plen = 30000;
+    w.ready = 0;
+    w.src = a->mem + part, w.dst = 6ull << 20, w.len = plen;
+    w.seq = 9, w.need[0] = before + 2, w.need[1] = 77, w.value = 1234;
+    CHECK(!tb_bond_write_signal(&a->e, &a->r, part, w.dst, plen, w.soff, w.value, w.seq, w.need, 5000, BOND_WAIT_LINK,
+                                76, TIMEOUT), "a joined part with a tail posts");
+    idle(a, b, 2000);
+    CHECK(!w.heard && w.count == before + 1, "a joined part waits until the bond says it may land");
+    __atomic_store_n(&w.ready, 1, __ATOMIC_RELEASE);
+    bond_poll(a, b, &w, before + 2, w.signals + 1);
+    CHECK(w.heard == 1 && w.heard_off == w.dst + plen && w.heard_len == 5000 && w.heard_ordinal == 77,
+          "it announces its tail: right after its bytes, with the other link's write count");
+    /* A tail whose length differs from its announcement fails the link instead of landing. */
+    w.len = 0;
+    w.tail_off[1] = 7ull << 20, w.tail_len[1] = 999, w.tail_ordinal[1] = (uint32_t)(before + 3);
+    __atomic_store_n(&w.tails, 2, __ATOMIC_RELEASE);
+    g_quiet = 1;
+    CHECK(!tb_bond_tail(&a->e, &a->r, src, 1000), "a mismatched tail posts");
+    uint64_t deadline = link_now_ns() + TIMEOUT;
+    while (tb_progress(&b->e) >= 0) {
+        CHECK(tb_progress(&a->e) >= 0, "the sender stays up");
+        CHECK(link_now_ns() < deadline, "a mismatched tail did not fail the link");
+    }
+    CHECK(tb_failure(&b->e) && strstr(tb_failure(&b->e), "tail"), "the receiver says the tail did not match");
+    b->failed = 1;
 }
 
 int main(int argc, char **argv) {
@@ -398,12 +490,13 @@ int main(int argc, char **argv) {
         scenario_bond(&a, &b);
     }
     else if (!strcmp(g_mode, "bond")) scenario_bond(&a, &b);
+    else if (!strcmp(g_mode, "tail")) scenario_tail(&a, &b);
     else if (!strcmp(g_mode, "random")) scenario_random(&a, &b);
     else if (bounds) g_quiet = 1, scenario_bounds(&a, &b);
     else if (!strcmp(g_mode, "teardown")) scenario_teardown(&a, &b);
     else return 2;
     stop(&b);
-    CHECK(bounds || !b.failed, "the receiver's link failed");
+    CHECK(bounds || !strcmp(g_mode, "tail") || !b.failed, "the receiver's link failed");
     ep_close(&a.e);
     ep_close(&b.e);
     printf("test_link_tb %s: ok\n", g_mode);

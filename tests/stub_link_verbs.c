@@ -42,7 +42,8 @@ static struct sqp *g_qp[MAXQP];
 static int g_nmr, g_nqp, g_mrs[NDEV], g_uc[NDEV];
 static uint64_t g_rand;
 static int g_hold[NDEV], g_hold_completions[NDEV], g_failed[NDEV];
-static uint64_t g_sent_bytes[NDEV], g_received_bytes[NDEV];
+static unsigned g_pace[NDEV], g_pumps;
+static uint64_t g_sent_bytes[NDEV], g_received_bytes[NDEV], g_sends[NDEV];
 
 static void die(const char *what) {
     fprintf(stderr, "STUB-VIOLATION: %s\n", what);
@@ -78,6 +79,20 @@ uint64_t stub_tb_sent_bytes(const char *name) {
     uint64_t n = g_sent_bytes[device_index(name)];
     pthread_mutex_unlock(&g_mu);
     return n;
+}
+
+uint64_t stub_tb_sends(const char *name) {
+    pthread_mutex_lock(&g_mu);
+    uint64_t n = g_sends[device_index(name)];
+    pthread_mutex_unlock(&g_mu);
+    return n;
+}
+
+/* A slower link: a device's queue pairs send only on every `every`th delivery pass. */
+void stub_tb_pace(const char *name, unsigned every) {
+    pthread_mutex_lock(&g_mu);
+    g_pace[device_index(name)] = every;
+    pthread_mutex_unlock(&g_mu);
 }
 
 uint64_t stub_tb_received_bytes(const char *name) {
@@ -168,8 +183,10 @@ static void pump(int polling) {
     if (lazy < 0) lazy = getenv("STUB_LAZY") != NULL;
     if (lazy && !polling) return;
     int order[MAXQP], n = 0;
+    g_pumps++;
     for (int i = 0; i < g_nqp; ++i)
-        if (!g_qp[i]->destroyed && is_tb(g_qp[i]->dev) && g_qp[i]->qp.state == IBV_QPS_RTS && g_qp[i]->send.count)
+        if (!g_qp[i]->destroyed && is_tb(g_qp[i]->dev) && g_qp[i]->qp.state == IBV_QPS_RTS && g_qp[i]->send.count &&
+            (g_pace[g_qp[i]->dev] < 2 || g_pumps % g_pace[g_qp[i]->dev] == 0))
             order[n++] = i;
     for (int i = n - 1; i > 0; --i) {
         int j = (int)(rnd() % (unsigned)(i + 1)), t = order[i];
@@ -238,6 +255,7 @@ static int stub_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_
             }
             enqueue(&q->send, wr->wr_id, s->addr, s->length);
             g_sent_bytes[q->dev] += s->length;
+            g_sends[q->dev]++;
         } else if (wr->opcode == IBV_WR_RDMA_WRITE) {
             if (check_remote(wr->wr.rdma.rkey, wr->wr.rdma.remote_addr, s->length, IBV_ACCESS_REMOTE_WRITE))
                 memcpy(remote, local, s->length);
