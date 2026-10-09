@@ -40,8 +40,39 @@ records an export of its pages from `export_from` on, rounded down to a page row
 allocated. The rank's serving thread then answers the decoder over its link. Blocks are released when the decoder
 closes the handoff, or after `export_ttl_s`.
 
-Supported caches: full attention and MLA layers in bf16, fp16 or fp32. Sliding-window, Mamba and fp8 caches are
-refused with an explanation the decoder receives.
+Supported caches: full attention and MLA layers in bf16, fp16 or fp32, and the hybrid layers of Qwen3.8 Flash Next
+(below). Sliding-window, other Mamba-type and fp8 caches are refused with an explanation the decoder receives.
+
+## Hybrid models
+
+Qwen3.8 Flash Next mixes 36 Gated DeltaNet layers with 12 QSA sparse-attention layers, and carries a PLE short-conv
+state on one layer. A recurrent state exists only for a whole prefix, so a hybrid handoff always covers prompt tokens
+`[0, T)`: ask with `export_from` 0. The manifest's `layers` are then named entries rather than page arrays, each with
+`kind`, the model `layer`, a `name`, and a fixed layout that does not depend on vLLM's own:
+
+| kind | name | shape | dims | contents |
+| --- | --- | --- | --- | --- |
+| `qsa` | `k`, `v` | `[T, kv_heads, head_dim]` | `block, head, head_dim` | keys post-RoPE and values, as cached |
+| `qsa` | `index_keys` | `[T, indexer_head_dim]` | `block, index_dim` | raw index keys, pre-norm and pre-RoPE |
+| `gdn` | `conv` | `[conv_kernel - 1, conv_dim]` | `block, channel` | conv state, oldest tap first, channels q, k, v |
+| `gdn` | `ssm` | `[v_heads, v_dim, k_dim]` | `block, v_dim, k_dim` | recurrent state, float32 |
+| `ple` | `conv` | `[(kernel - 1) * dilation, hc_dim]` | `block, channel` | PLE short-conv state, oldest tap first |
+
+`first_token` is 0 and `block_size` 1. A DATA frame's `layer` field is the entry's `index`, and its rows run along the
+entry's first dimension. Text-only prompts index positions `0 .. T-1`, and the PLE layer's n-gram context is the
+prompt's last tokens, so the decoder rebuilds both.
+
+vLLM keeps raw index keys only for a QSA layer's last four tokens, so the connector wraps the layer's run and copies
+each prefill chunk's keys out by position. That needs one request in flight at a time, and the hybrid KV cache
+manager. Run the producer on a vLLM build with Flash Next support (the b12x Spark build was used) with:
+
+```bash
+--max-num-seqs 1 --no-enable-prefix-caching --kv-cache-dtype auto
+```
+
+and without speculative decoding. With `--no-enable-prefix-caching` each request keeps one private recurrent-state
+block, which the connector holds until the decoder closes the handoff. Every entry is copied into private tensors on
+the step that finishes the prefill, about 115 MB of fixed state plus 27 KB per prompt token.
 
 ## Protocol 1
 

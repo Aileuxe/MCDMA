@@ -25,6 +25,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
 )
 
+try:  # vLLM builds with the hybrid KV cache manager; hybrid models need it.
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA
+except ImportError:  # pragma: no cover - older vLLM
+    class SupportsHMA:  # type: ignore[no-redef]
+        pass
+
+from . import hybrid
 from .export import DTYPES, Export, LayerPages, geometry
 from .mailbox import MailboxError, ServiceMailbox
 from .responder import ExportTable, Responder
@@ -63,7 +70,7 @@ def _tensor_parallel() -> tuple[int, int]:
         return 0, 1
 
 
-class MCDMAKVConnector(KVConnectorBase_V1):
+class MCDMAKVConnector(KVConnectorBase_V1, SupportsHMA):
     """Producer side of the MCDMA KV handoff."""
 
     def __init__(self, vllm_config: Any, role: KVConnectorRole, kv_cache_config: Any = None) -> None:
@@ -81,6 +88,10 @@ class MCDMAKVConnector(KVConnectorBase_V1):
                         for name in group.layer_names}
         self._specs = [group.kv_cache_spec for group in kv_cache_config.kv_cache_groups]
         self._num_blocks = int(kv_cache_config.num_blocks)
+        # Hybrid models (Gated DeltaNet + QSA, Qwen3.8 Flash Next) export whole-prefix state.
+        self._hybrid = hybrid.is_hybrid(self._specs)
+        self._text_config = model_config.hf_text_config
+        self._recorder = hybrid.IndexKeyRecorder(int(model_config.max_model_len)) if self._hybrid else None
         # Scheduler side: requests being prefilled, and requests whose blocks the handoff holds.
         self._tracked: dict[str, HandoffRequest] = {}
         self._holding: set[str] = set()
@@ -153,6 +164,10 @@ class MCDMAKVConnector(KVConnectorBase_V1):
         # A handoff's blocks stay allocated until the worker reports it closed.
         return request.request_id in self._holding, None
 
+    def request_finished_all_groups(self, request: Any,
+                                    block_ids: tuple[list[int], ...]) -> tuple[bool, dict[str, Any] | None]:
+        return self.request_finished(request, [])
+
     def update_connector_output(self, connector_output: Any) -> None:
         for request_id in getattr(connector_output, "finished_sending", None) or ():
             self._holding.discard(request_id)
@@ -164,6 +179,13 @@ class MCDMAKVConnector(KVConnectorBase_V1):
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         self._caches = kv_caches
+        if self._hybrid:
+            self._recorder.bind(kv_caches)
+            hybrid.install_index_key_hook(self._recorder)
+            for name, tensor in kv_caches.items():
+                group = self._groups.get(name)
+                spec = type(self._specs[group]).__name__ if group is not None else "-"
+                logger.debug("MCDMA handoff cache %s %s %s %s", name, spec, tuple(tensor.shape), tensor.dtype)
         rank, _ = _tensor_parallel()
         if rank >= len(self._links):
             logger.warning("MCDMA handoff: no link for tensor-parallel rank %d", rank)
@@ -209,6 +231,15 @@ class MCDMAKVConnector(KVConnectorBase_V1):
             self._thread.join(timeout=5)
 
     def _export(self, request: HandoffRequest, ready: Any) -> Export:
+        if self._hybrid:
+            if request.export_from:
+                raise ValueError("hybrid handoffs export the whole prefix; ask with export_from 0")
+            entries = hybrid.export_entries(self._caches, self._groups, self._specs, request.block_ids,
+                                            len(request.tokens), self._recorder, self._text_config)
+            # The snapshots were taken on this stream; serving waits for them.
+            done = torch.cuda.Event()
+            done.record()
+            return Export(request.request_id, request.handoff, request.tokens, 0, 1, entries, ready=done)
         layers, per_row = [], None
         for name, tensor in self._caches.items():
             found = _LAYER.search(name)
