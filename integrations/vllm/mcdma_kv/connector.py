@@ -102,6 +102,17 @@ class MCDMAKVConnector(KVConnectorBase_V1, SupportsHMA):
         self._thread: threading.Thread | None = None
         self._stream: torch.cuda.Stream | None = None
 
+    @classmethod
+    def supports_aligned_hybrid_transfer(cls, config: Any) -> bool:
+        """vLLM builds that guard QSA models accept export-only producers under aligned retention.
+
+        That guard protects connectors that import recurrent state into vLLM. This one never
+        imports: it copies each handoff's state out at the end of its prefill, so the retention
+        policy (and, with prefix caching off, no retention at all) cannot affect what it exports.
+        """
+        transfer = getattr(config, "kv_transfer_config", None)
+        return getattr(transfer, "kv_role", None) == "kv_producer"
+
     # Scheduler side -------------------------------------------------------
 
     def on_new_request(self, request: Any) -> None:
