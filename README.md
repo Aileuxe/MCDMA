@@ -6,26 +6,37 @@
 
 MCDMA now includes **AMD Strix Halo Linux hosts** alongside Mac Studio and NVIDIA DGX Spark. Strix/Spark bidirectional RDMA is hardware-verified; the Strix/Mac setup workflow is available and still needs physical validation.
 
-## New: dual-pipe RDMA between two Macs
+## New: up to eight Thunderbolt cables between two Macs
 
-Two Macs joined by two Thunderbolt 5 cables now run one RDMA link over both cables. Open the two devices together
-(`rdma_en4+rdma_en3`) and connect the matching interfaces in the same order, and each transfer is striped across both
-cables and placed at the receiver. Thunderbolt RDMA offers only two-sided SEND and RECV, so the receiving library places
-each stripe in the window. Setup and guarantees: [two Thunderbolt links as one peer](docs/fabric.md#two-thunderbolt-links-as-one-peer).
+Two Macs joined by several Thunderbolt 5 cables now run one RDMA link over all of them. Open the devices together
+(`rdma_en4+rdma_en3+rdma_en2+rdma_en13`), list them in the same cable order on both Macs, and meet over one cable's
+interface. Every write of 40 KiB or more is cut into one part per cable, the parts post at the same time, and the
+receiver places each part in the window and publishes the signal once all of them have landed. Cables after the first
+need no IP address: with GID index `auto`, each one uses its own IPv6 link-local GID. Setup and guarantees:
+[N Thunderbolt links as one peer](docs/fabric.md#n-thunderbolt-links-as-one-peer).
 
-Measured on 6 October 2026 between two Mac Studios with M5 Ultra, macOS 27.0, with `fabric-check`:
+Measured between two Mac Studios with M5 Ultra, macOS 27.0, with `fabric-check`, every byte checked:
 
-| Each direction | One cable | Both cables |
-| --- | ---: | ---: |
-| Streaming, Mac A to Mac B | 6.67 GB/s | 12.06 GB/s (1.81x) |
-| Streaming, Mac B to Mac A | 6.42 GB/s | 11.72 GB/s (1.83x) |
-| One 1 MiB message, median | 626–653 µs | 521–552 µs |
-| One 64-byte message, median | 6.9–9.0 µs | 8.1–10.2 µs |
+| Measured | One cable | Two cables | Four cables |
+| --- | ---: | ---: | ---: |
+| Streaming, one direction | 6.4–6.9 GB/s | 11.7–12.1 GB/s | 23.9 GB/s |
+| One 1 MiB message, median round trip | 626–653 µs | 521–552 µs | 94 µs |
+| One 160 KiB message, median round trip | 115–117 µs | 108 µs | 32 µs |
+| One 64-byte message, median round trip | 6.9–9.0 µs | 8.1–10.2 µs | 7.7 µs |
+
+The two-cable column is the earlier bond, which posted the two parts of one message in turn. Four cables were measured
+on this build, which posts every part at once, so one large message gets most of the gain too. Messages under 40 KiB
+travel whole on one cable, so small round trips stay where one cable puts them. A Thunderbolt 5 cable carries up to
+about 75 Gbit/s of RDMA payload with two or three queue pairs, and one or two cables get two queue pairs each by
+default. Three or more cables default to one each: four cables with two each still streamed 191 Gbit/s, with higher
+latency, so at four cables the hosts are the limit.
 
 [TensorFold](https://github.com/ashhart/TensorFold)'s two-Mac speed-up mode runs over MCDMA: two M5 Ultras serve one
 Qwen3.8 Flash Next request together, with time to first token 1.6–1.74x faster than one Mac and decode 1.12–1.34x,
-measured over one cable. The bond takes a further 1.5–2% off time to first token at 8k and 32k tokens and adds 0.5–1%
-to decode: decode exchanges are small messages, so they depend on the link's latency more than its bandwidth.
+measured over one cable. The two-cable bond took a further 1.5–2% off time to first token at 8k and 32k tokens and added
+0.5–1% to decode: decode exchanges are small messages, so they depend on the link's latency more than its bandwidth.
+TensorFold's speed-up settings take up to eight devices per link; see its
+[N-link settings](https://github.com/ashhart/TensorFold/blob/main/docs/n-link-speed-up.md).
 
 ## New in CLI 1.2.0: Strix Halo and Linux endpoints
 
