@@ -3,8 +3,8 @@
 Build `26B5101f` (macOS 27.2 beta, Darwin 27.2.0, `xnu-13432.40.177.0.3~56`) was compared
 with the validated build `26A428` for every Apple interface the native driver and the verbs
 provider use. No change to those interfaces was found, so `26B5101f` joins the build
-allowlist. This is a static comparison of Apple's binaries, not hardware acceptance: run the
-byte-verifying transfer tests in [install.md](install.md) on 26B5101f before relying on it.
+allowlist. The four-way byte-verifying transfer check then passed on 26B5101f hardware in all
+three posting modes (see [Hardware check](#hardware-check)).
 
 ## How it was compared
 
@@ -67,6 +67,29 @@ one by one:
 - **`IORDMAInterface::start`, `rdma_restrack_add`, `rdma_resolve_addr`,
   `roce_resolve_route_from_path`.** Only relocated globals differ (offsets move by a common
   delta through `adrp` bases).
+
+## Hardware check
+
+On 2026-10-09: a Mac Studio M3 Ultra (256 GB) on 26B5101f, OWC Helios 5S over Thunderbolt 5,
+and a ConnectX-5 Ex (`15b3:1019`). The peer was a DGX Spark-class GB10 (ConnectX-7, firmware
+28.45.4028, Ubuntu 24.04). Driver 0.1.18 was built from this branch, ad-hoc signed with the
+three personality flags. The kext loaded with the candidate's UUID and reported
+`MCDMANativeBuild = "26B5101f"`. Ethernet MTU 9000, RDMA path MTU 4096, payload 4096 bytes.
+The link negotiated 40GBASE-CR4 (QSFP+ cable).
+
+`cx5-native-check --require-gid` passed (one active CX5 port, MAC-derived link-local RoCE v2
+GID, `errors=0`). `tools/native_cross_host.py` then passed in each mode, with every operation
+verifying 4096 bytes:
+
+| Mode (`--mac-cq-map/--mac-user-post/--mac-user-bf`) | Mac WRITE | Mac READ | Spark WRITE | Spark READ | Markers confirmed |
+|---|---|---|---|---|---|
+| kernel (0/0/0) | pass | pass | pass | pass | — |
+| direct (2/1/0) | pass | pass | pass | pass | CQ mapping, user post |
+| BlueFlame-64 (2/1/64) | pass | pass | pass | pass | CQ mapping, user post, BF64 |
+
+Afterwards the driver showed no quarantine, no outbound PCIe stalls and no CRC errors. Its
+PCIe TX error count was 2 on each function, the same as before any traffic. These are
+correctness results only; no latency or bandwidth was measured on this build.
 
 ## Not covered
 
