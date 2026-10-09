@@ -185,7 +185,7 @@ class MCDMAKVConnector(KVConnectorBase_V1, SupportsHMA):
             for name, tensor in kv_caches.items():
                 group = self._groups.get(name)
                 spec = type(self._specs[group]).__name__ if group is not None else "-"
-                logger.debug("MCDMA handoff cache %s %s %s %s", name, spec, tuple(tensor.shape), tensor.dtype)
+                logger.info("MCDMA handoff cache %s %s %s %s", name, spec, tuple(tensor.shape), tensor.dtype)
         rank, _ = _tensor_parallel()
         if rank >= len(self._links):
             logger.warning("MCDMA handoff: no link for tensor-parallel rank %d", rank)
