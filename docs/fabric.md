@@ -171,7 +171,7 @@ peer creation. Multi-QP handshake checks N, Q, lane, window and session and reje
 
 `device_count` and `qps_per_device` report physical geometry. `link_stats` index q*N+d belongs to device d, QP q;
 sum all q for a cable's traffic. Completion, signal watermarks and overlap dependencies cover every lane.
-Four cables with default Q=2 cost eight progress threads per rank, four more than Q=1; Q=3 costs twelve.
+Four cables at Q=2 cost eight progress threads per rank, four more than their default Q=1; Q=3 costs twelve.
 Idle backoff remains, but CPU scheduling and provider/context contention can limit scaling. Host tests establish
 correctness, not new throughput.
 
