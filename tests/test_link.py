@@ -4,6 +4,7 @@ opens a real device except the verbs smoke test, which only lists devices and ru
 import os
 import pathlib
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -18,7 +19,7 @@ STUB = ['tests/stub_link_verbs.c']
 SKIP = 77
 # a failing sanitizer or stub exits with a status instead of aborting, so no crash report is raised
 QUIET = {'ASAN_OPTIONS': 'abort_on_error=0:detect_leaks=0', 'UBSAN_OPTIONS': 'halt_on_error=1:abort_on_error=0',
-         'TSAN_OPTIONS': 'halt_on_error=1:abort_on_error=0:exitcode=66', 'MCDMA_FABRIC_LOG': '0'}
+         'TSAN_OPTIONS': 'halt_on_error=1:abort_on_error=0:exitcode=66', 'MCDMA_FABRIC_LOG': '0', 'MCDMA_FABRIC_QPS': '1'}
 BASE = ['cc', '-std=c11', '-O1', '-g', '-Wall', '-Wextra', '-Werror', '-DMCDMA_LINK_TEST_INTERFACES']
 FABRIC = ['-DMCDMA_FABRIC_TEST_DMABUF', '-DMCDMA_FABRIC_TESTING', 'rpc/libmcdma_fabric.c', *LINK, *STUB,
           'tests/test_fabric.c']
@@ -50,6 +51,7 @@ class LinkTests(unittest.TestCase):
             'link-xchg': [*LINK, *STUB, 'tests/test_link_xchg.c'],
             'rpcd-tb': [*dirs, '-DRPC_ECHO_NO_MAIN', *DAEMON, *LINK, *STUB, 'rpc/rpc_echo.c', 'tests/test_rpcd_tb.c'],
             'fabric': FABRIC,
+            'nbond': ['-DMCDMA_FABRIC_TEST_DMABUF', '-DMCDMA_FABRIC_TESTING', 'rpc/libmcdma_fabric.c', *LINK, *STUB, 'tests/test_nbond.c'],
             'fabric-check': ['-DFABRIC_CHECK_NO_MAIN', 'rpc/fabric_check.c', 'rpc/libmcdma_fabric.c', *LINK, *STUB,
                              'tests/test_fabric_check.c'],
             'mesh-check': ['-DMESH_CHECK_NO_MAIN', 'rpc/mesh_check.c', 'rpc/libmcdma_fabric.c', *LINK, *STUB,
@@ -62,6 +64,8 @@ class LinkTests(unittest.TestCase):
         if cls.threads:
             subprocess.run([*cls.threads, *FABRIC, '-lpthread', '-o', os.path.join(cls.work, 'fabric-tsan')], cwd=ROOT,
                            check=True)
+            subprocess.run([*cls.threads, *builds['nbond'], '-lpthread', '-o', os.path.join(cls.work, 'nbond-tsan')],
+                           cwd=ROOT, check=True)
 
     @classmethod
     def tearDownClass(cls):
@@ -77,6 +81,41 @@ class LinkTests(unittest.TestCase):
 
     def library_lines(self, done):
         return [line for line in done.stderr.splitlines() if line.startswith('mcdma-fabric: ')]
+
+    def test_n_link_completion_and_fail_closed(self):
+        for n in ('3', '4', '8'):
+            with self.subTest(links=n):
+                self.run_case('nbond', n, STUB_SEED='7', STUB_STRICT='1', STUB_LAZY='1')
+
+    def test_multiple_qps_own_their_registrations_and_complete_every_lane(self):
+        for n, q in (('1', '2'), ('1', '3'), ('2', '2'), ('4', '2'), ('4', '3'), ('8', '3')):
+            with self.subTest(devices=n, qps=q):
+                self.run_case('nbond', n, q, MCDMA_FABRIC_QPS=q, STUB_SEED='7', STUB_STRICT='1', STUB_LAZY='1')
+        self.run_case('nbond', '1', '2', NBOND_DEFAULT_QPS='1', STUB_SEED='7', STUB_STRICT='1', STUB_LAZY='1')
+        self.run_case('nbond', '2', '2', NBOND_DEFAULT_QPS='1', STUB_SEED='7', STUB_STRICT='1', STUB_LAZY='1')
+        self.run_case('nbond', '3', '1', NBOND_DEFAULT_QPS='1', STUB_SEED='7', STUB_STRICT='1', STUB_LAZY='1')
+        self.run_case('nbond', '4', '1', NBOND_DEFAULT_QPS='1', STUB_SEED='7', STUB_STRICT='1', STUB_LAZY='1')
+        self.run_case('nbond', '1', '1', NBOND_DEFAULT_QPS='1', NBOND_CAP_ONE='1', STUB_SEED='7', STUB_STRICT='1', STUB_LAZY='1')
+        self.run_case('nbond', '4', '2', NBOND_MISMATCH='1', MCDMA_FABRIC_QPS='2', STUB_SEED='7', STUB_STRICT='1', STUB_LAZY='1')
+
+    def test_each_connection_owns_its_provider_mapping_and_pd_keys(self):
+        self.run_case('nbond', '4', '2', MCDMA_FABRIC_QPS='2', STUB_CONTEXT_MAP_ALIAS='1', STUB_SEED='4', STUB_STRICT='1', STUB_LAZY='1')
+        self.run_case('nbond', '2', '3', MCDMA_FABRIC_QPS='3', STUB_CONTEXT_MAP_ALIAS='1', NBOND_CLOSE_ONLY='1', STUB_STRICT='1')
+
+    def test_trace_phases_and_shared_receive_measurement_mode(self):
+        for model in ('lane', 'shared'):
+            with self.subTest(model=model):
+                done = self.run_case('nbond', '4', '2', MCDMA_FABRIC_QPS='2', MCDMA_TRACE='1',
+                                     MCDMA_TRACE_PROGRESS=model, NBOND_TRACE_REPORT='1', STUB_STRICT='1', STUB_LAZY='1')
+                for phase in ('post', 'wire_complete_cq_observed', 'receive_complete', 'copy_done', 'signal_published', 'peer_poll_seen'):
+                    self.assertIn(f'event={phase} ', done.stdout)
+                self.assertIn('phase=post_to_wire_complete samples=', done.stdout)
+                self.assertIn('phase=signal_published_to_poll_seen samples=', done.stdout)
+                for phase in ('post_to_wire_complete', 'receive_to_copy_done', 'copy_done_to_signal_published',
+                              'signal_published_to_poll_seen', 'app_post_to_batch_go', 'batch_ready_to_go'):
+                    counts = [int(n) for n in re.findall(rf'phase={phase} samples=(\d+)', done.stdout)]
+                    self.assertTrue(counts and max(counts) > 0, (phase, counts))
+                self.assertIn('dropped_events=0', done.stdout)
 
     def test_the_exchange_admits_only_on_link_peers(self):
         self.run_case('link-xchg')
@@ -205,6 +244,13 @@ class LinkTests(unittest.TestCase):
     def test_bond_threads_are_race_free(self):
         if not self.threads:
             self.skipTest('the compiler has no ThreadSanitizer')
+        self.run_case('nbond-tsan', '4', STUB_SEED='4', STUB_STRICT='1', STUB_LAZY='1')
+        self.run_case('nbond-tsan', '4', STUB_SEED='4', STUB_STRICT='1', STUB_LAZY='1', BOND_ASLEEP='1')
+        self.run_case('nbond-tsan', '4', '2', MCDMA_FABRIC_QPS='2', STUB_SEED='4', STUB_STRICT='1', STUB_LAZY='1')
+        self.run_case('nbond-tsan', '4', '2', MCDMA_FABRIC_QPS='2', STUB_SEED='4', STUB_STRICT='1', STUB_LAZY='1', BOND_ASLEEP='1')
+        self.run_case('nbond-tsan', '4', '2', MCDMA_FABRIC_QPS='2', STUB_CONTEXT_MAP_ALIAS='1', NBOND_CLOSE_ONLY='1', STUB_STRICT='1')
+        self.run_case('nbond-tsan', '4', '2', MCDMA_FABRIC_QPS='2', MCDMA_TRACE='1', MCDMA_TRACE_PROGRESS='shared',
+                      NBOND_TRACE_REPORT='1', STUB_STRICT='1', STUB_LAZY='1')
         for scenario in ('bond', 'bond-order', 'bond-overlap', 'bond-fail', 'bond-credit', 'bond-stripe',
                          'bond-pingpong', 'bond-later', 'bond-magic', 'bond-down', 'down', 'zero'):
             with self.subTest(scenario=scenario):

@@ -13,6 +13,8 @@
 #define _DEFAULT_SOURCE 1
 #endif
 #include "mcdma_fabric.h"
+#include "link.h"
+#include <arpa/inet.h>
 
 #include <errno.h>
 #include <limits.h>
@@ -101,6 +103,7 @@ static uint64_t check_and_poison(unsigned char *p, uint64_t marker, int check) {
 }
 
 static int report(int status, const char *what);
+static _Thread_local int tracing;
 
 /* Wait for the word at `off` to reach `value`, in the library or, with `spin`, by reading only the window as an
  * engine does; a spinning wait asks the library about the peer every few thousand reads, so a peer that went down
@@ -119,6 +122,7 @@ static int await(struct mcdma_fabric *f, struct mcdma_fabric_peer *p, const unsi
         }
         if (clock_ns() > deadline) return MCDMA_FABRIC_TIMEOUT;
     }
+    if (tracing) mcdma_fabric_trace_poll_seen(p, off, __atomic_load_n(word, __ATOMIC_ACQUIRE));
     return MCDMA_FABRIC_OK;
 }
 
@@ -298,20 +302,40 @@ static int valid_sizes(const char *s) {
 }
 
 int fabric_check(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "--gids")) {
+        struct ep e;
+        if (ep_open(&e, argv[2], -1, 4096)) { ep_close(&e); return 1; }
+        struct ibv_device_attr d; struct ibv_port_attr p;
+        memset(&d, 0, sizeof(d)); memset(&p, 0, sizeof(p));
+        int bad = ibv_query_device(e.ctx, &d) || ibv_query_port(e.ctx, 1, &p);
+        if (!bad) {
+            printf("%s: port state %d, MTU %d, GID entries %d, max QPs %d, max WRs %d\n",
+                   e.device, p.state, p.active_mtu, p.gid_tbl_len, d.max_qp, d.max_qp_wr);
+            for (int i = 0; i < p.gid_tbl_len && i < 256; ++i) {
+                union ibv_gid g; char text[INET6_ADDRSTRLEN];
+                if (!ibv_query_gid(e.ctx, 1, i, &g) && inet_ntop(AF_INET6, g.raw, text, sizeof(text)))
+                    printf("  GID %d: %s%s\n", i, text, i == e.gid_index ? " selected" : "");
+            }
+        }
+        ep_close(&e); return bad ? 1 : 0;
+    }
     if (argc < 7 || argc > 16) {
         fprintf(stderr, "usage: fabric-check DEVICE GID_INDEX VIA PORT NAME RANK "
                         "[ROUNDS [SIZES [SECONDS [PEER_PORT [MODE [PROGRESS [WAIT [PATTERN [GAP_US]]]]]]]]]\n"
+                        "GID_INDEX is auto or a nonnegative index; fabric-check --gids DEVICE inspects the table.\n"
                         "MODE is split or combined; PROGRESS is 0 or 1; SECONDS defaults to 60, 0 skips streaming.\n"
                         "WAIT is library or spin; spin needs PROGRESS 1, which a bond always has.\n"
                         "PATTERN is pingpong or swap; GAP_US is the work each rank does before each swap.\n");
         return 2;
     }
-    uint64_t rank_arg, gid, port, peer_port = 0, rounds_arg = 10000, progress = 0, gap_us = 0, gaps[2] = {0, 0};
-    if (!number(argv[6], 1, &rank_arg) || !number(argv[2], INT_MAX, &gid) ||
+    uint64_t rank_arg, gid = 0, port, peer_port = 0, rounds_arg = 10000, progress = 0, gap_us = 0, gaps[2] = {0, 0};
+    int auto_gid = !strcmp(argv[2], "auto");
+    if (!number(argv[6], 1, &rank_arg) || (!auto_gid && !number(argv[2], INT_MAX, &gid)) ||
         !number(argv[4], 65535, &port) || !port ||
         (argc > 7 && !number(argv[7], UINT32_MAX, &rounds_arg)) ||
         (argc > 10 && !number(argv[10], 65535, &peer_port)) ||
         (argc > 12 && !number(argv[12], 1, &progress))) return 2;
+    int gid_index = auto_gid ? -1 : (int)gid;
     int rank = (int)rank_arg, combined = argc > 11 && !strcmp(argv[11], "combined");
     if (argc > 11 && !combined && strcmp(argv[11], "split")) return 2;
     int spin = argc > 13 && !strcmp(argv[13], "spin");
@@ -341,7 +365,7 @@ int fabric_check(int argc, char **argv) {
         free(times);
         return 2;
     }
-    if (report(mcdma_fabric_open(argv[1], (int)gid, 4096, w, WINDOW, -1, 0,
+    if (report(mcdma_fabric_open(argv[1], gid_index, 4096, w, WINDOW, -1, 0,
                                  progress ? MCDMA_FABRIC_PROGRESS_THREAD : 0, &f), "open") ||
         report(mcdma_fabric_connect(f, argv[3], (int)port, (int)peer_port, argv[5], 120 * SECOND, &p), "connect")) {
         bad = ~0ull;
@@ -349,9 +373,13 @@ int fabric_check(int argc, char **argv) {
     }
     printf("fabric-check: rank %d connected over %s\n", rank,
            mcdma_fabric_link(p) == MCDMA_FABRIC_THUNDERBOLT ? "thunderbolt" : "roce");
-    printf("fabric-check: metadata abi=%u device=%s via=%s gid_index=%llu links=%u mode=%s progress=%llu "
+    tracing = mcdma_fabric_tracing(p);
+    printf("fabric-check: progress_threads=%u post_only_threads=%u trace=%d\n",
+           mcdma_fabric_progress_threads(p), mcdma_fabric_post_threads(p), tracing);
+    printf("fabric-check: metadata abi=%u device=%s via=%s gid_index=%d links=%u devices=%u qps_per_device=%u mode=%s progress=%llu "
            "qos=%s wait_poll=%s wait=%s pattern=%s gap_us=%llu stream_seconds=%.3f verification=every_byte build=%s\n",
-           mcdma_fabric_abi(), argv[1], argv[3], (unsigned long long)gid, mcdma_fabric_link_count(p),
+           mcdma_fabric_abi(), argv[1], argv[3], gid_index, mcdma_fabric_link_count(p),
+           mcdma_fabric_device_count(p), mcdma_fabric_qps_per_device(p),
            combined ? "combined" : "split", (unsigned long long)progress,
            getenv("MCDMA_FABRIC_QOS") ? getenv("MCDMA_FABRIC_QOS") : "0",
            getenv("MCDMA_FABRIC_WAIT_POLL") ? getenv("MCDMA_FABRIC_WAIT_POLL") : "1", spin ? "spin" : "library",
@@ -386,6 +414,7 @@ int fabric_check(int argc, char **argv) {
     /* rank 1 lingers so rank 0's last flush is answered before the link goes away */
     if (rank == 1) mcdma_fabric_wait(f, DONE + 8, 1, SECOND);
 finished:
+    if (p && tracing) (void)mcdma_fabric_trace_report(p, stdout);
     mcdma_fabric_disconnect(&p);
     mcdma_fabric_close(&f);
     munmap(w, WINDOW);

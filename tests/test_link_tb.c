@@ -320,7 +320,7 @@ static int bond_tail(void *arg, uint64_t *off, uint32_t *len, uint32_t *ordinal)
 }
 
 static void install(struct side *b, struct bond_watch *w) {
-    struct tb_bond hooks = {w, 0, bond_placed, bond_signal, bond_ready, bond_announce, bond_tail};
+    struct tb_bond hooks = {w, 0, bond_placed, bond_signal, bond_ready, bond_announce, bond_tail, 2, NULL};
     tb_bond_hooks(&b->e, &hooks);
 }
 

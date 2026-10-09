@@ -27,6 +27,7 @@
 #define TB_RING 2048                /* one-packet receives each link keeps posted: 8 MiB */
 #define TB_STAGE 64                 /* header messages in flight */
 #define TB_SEND_WR 1024             /* sends in flight */
+#define TB_BOND_MAX 24u
 #define TB_MSG (4ull << 20)         /* largest message */
 #define TB_DEPTH 4095               /* send queue depth in packets that Thunderbolt allows */
 #define TB_TRY_MAX (256ull << 10)    /* largest bounded, nonblocking bonded write chunk */
@@ -90,6 +91,9 @@ struct xchg {
 };
 
 struct tb;
+enum tb_trace_phase { TR_POST, TR_WIRE_COMPLETE, TR_RECEIVE_COMPLETE, TR_COPY_DONE, TR_SIGNAL_PUBLISHED,
+                      TR_PEER_POLL_SEEN, TR_APP_POST, TR_BATCH_READY, TR_BATCH_GO, TR_BATCH_FALLBACK };
+typedef void (*tb_trace_fn)(void *, unsigned, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t);
 
 struct ep {
     char device[64];
@@ -159,6 +163,8 @@ int tb_busy(const struct ep *e);
 const char *tb_failure(const struct ep *e); /* why the link failed, or NULL while it works */
 /* Waits for send room or a fence answer call `gone` about once a millisecond and give up when it returns nonzero. */
 void tb_watch(struct ep *e, void *arg, int (*gone)(void *arg));
+int tb_trace_hooks(struct ep *e, void *arg, tb_trace_fn trace);
+void tb_trace_group(struct ep *e, uint64_t group);
 /* A bond's receive hooks, run under this endpoint's lock with `arg`; none may reenter the endpoint. Ordinary wire
  * messages are unchanged; install the hooks before accepting bonded ones.
  *   placed    a write's bytes are in place; count is this link's writes placed so far
@@ -178,6 +184,8 @@ struct tb_bond {
     int (*ready)(void *arg, uint64_t seq, unsigned flags, uint32_t wait);
     int (*announce)(void *arg, uint64_t off, uint32_t len, uint32_t ordinal);
     int (*tail)(void *arg, uint64_t *off, uint32_t *len, uint32_t *ordinal);
+    unsigned links;             /* 0 is the legacy two-link hook; otherwise the negotiated count */
+    int (*ready_n)(void *arg, uint64_t seq, unsigned flags, const uint32_t *wait);
 };
 void tb_bond_hooks(struct ep *e, const struct tb_bond *hooks);
 uint64_t tb_writes_posted(const struct ep *e);
@@ -195,6 +203,13 @@ int tb_can_write(const struct ep *e, const struct region *src, uint64_t off, uin
 int tb_write_try(struct ep *e, const struct region *src, uint64_t off, uint64_t roff, uint64_t len);
 int tb_bond_signal(struct ep *e, uint64_t soff, uint64_t value, uint64_t seq, const uint64_t need[2],
                     uint64_t timeout_ns);
+int tb_bond_signal_n(struct ep *e, uint64_t soff, uint64_t value, uint64_t seq, const uint64_t *need,
+                      unsigned links, uint64_t timeout_ns);
+int tb_bond_write_n(struct ep *e, const struct region *src, uint64_t off, uint64_t roff, uint64_t len,
+                     uint64_t seq, const uint64_t *wait, unsigned links, unsigned flags, uint64_t timeout_ns);
+int tb_bond_inline_n(struct ep *e, const struct region *src, uint64_t off, uint64_t roff, uint64_t len,
+                      uint64_t soff, uint64_t value, uint64_t seq, const uint64_t *need, const uint64_t *wait,
+                      unsigned links, unsigned flags, uint64_t timeout_ns);
 int tb_can_bond_signal(const struct ep *e); /* -1 invalid/failed, 0 no staged-header room, 1 ready */
 /* -1 invalid/failed, 0 no room, 1 fused ready, 2 not representable; no progress or source changes. */
 int tb_can_bond_write_signal(const struct ep *e, const struct region *src, uint64_t off, uint64_t len);
