@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import logging
 import re
-import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,7 +27,8 @@ import torch
 
 from .export import LayerPages
 
-logger = logging.getLogger(__name__)
+# Under vLLM's logger, so the server's log configuration shows these lines.
+logger = logging.getLogger("vllm.mcdma_kv.hybrid")
 _QSA = re.compile(r"layers\.(\d+)\.self_attn\.attn$")
 _GDN = re.compile(r"layers\.(\d+)\.linear_attn$")
 _PLE = re.compile(r"layers\.(\d+)\.ple$")
@@ -65,27 +65,26 @@ class IndexKeyRecorder:
     def __init__(self, max_tokens: int) -> None:
         self.max_tokens = max_tokens
         self._buffers: dict[int, torch.Tensor] = {}
-        self._layers: dict[int, int] = {}  # data_ptr of a layer's KV cache -> model layer
-        self._lock = threading.Lock()
-
-    def bind(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        for name, tensor in kv_caches.items():
-            found = _QSA.search(name)
-            if found:
-                self._layers[tensor.data_ptr()] = int(found.group(1))
+        self._unknown: set[str] = set()
 
     def record(self, module: Any, positions: torch.Tensor, raw_keys: torch.Tensor, rows: int) -> None:
         if rows <= 0 or torch.cuda.is_current_stream_capturing():
             return
-        cache = module.kv_cache[0] if isinstance(module.kv_cache, (list, tuple)) else module.kv_cache
-        layer = self._layers.get(cache.data_ptr()) if cache is not None and cache.numel() else None
-        if layer is None:
+        name = str(getattr(module, "layer_name", ""))
+        found = _QSA.search(name)
+        if found is None:
+            if name not in self._unknown:
+                self._unknown.add(name)
+                logger.warning("MCDMA handoff: QSA layer %r has no layer index; its index keys are not recorded", name)
             return
+        layer = int(found.group(1))
         buffer = self._buffers.get(layer)
         if buffer is None:
             buffer = torch.zeros(self.max_tokens, raw_keys.shape[-1], dtype=raw_keys.dtype,
                                  device=raw_keys.device)
             self._buffers[layer] = buffer
+            logger.info("MCDMA handoff: recording raw index keys of layer %d (%s, positions %s, keys %s %s)",
+                        layer, name, tuple(positions.shape), tuple(raw_keys.shape), raw_keys.dtype)
         logical = positions[:rows] if positions.dim() == 1 else positions[0, :rows]
         buffer.index_copy_(0, logical.to(torch.long), raw_keys[:rows])
 

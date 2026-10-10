@@ -36,7 +36,7 @@ from .export import DTYPES, Export, LayerPages, geometry
 from .mailbox import MailboxError, ServiceMailbox
 from .responder import ExportTable, Responder
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("vllm.mcdma_kv.connector")
 _LAYER = re.compile(r"layers\.(\d+)\.")
 # How long the serving thread waits before attaching again to a daemon that is not up.
 _REATTACH_S = 5.0
@@ -191,7 +191,6 @@ class MCDMAKVConnector(KVConnectorBase_V1, SupportsHMA):
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         self._caches = kv_caches
         if self._hybrid:
-            self._recorder.bind(kv_caches)
             hybrid.install_index_key_hook(self._recorder)
             for name, tensor in kv_caches.items():
                 group = self._groups.get(name)
