@@ -211,7 +211,7 @@ def _channel_major(state: torch.Tensor, taps: int, spec: int = 0) -> torch.Tenso
 
 def export_entries(caches: dict[str, torch.Tensor], groups: dict[str, int], specs: list[Any],
                    block_ids: tuple[tuple[int, ...], ...], tokens: int, recorder: IndexKeyRecorder,
-                   config: Any, hidden: HiddenRecorder | None = None, spec: int = 0) -> list[HybridPages]:
+                   config: Any, hidden: HiddenRecorder | None = None, spec_tokens: int = 0) -> list[HybridPages]:
     """Snapshot every canonical entry of one request's prefix [0, tokens)."""
     conv_taps = int(config.linear_conv_kernel_dim) - 1
     ple_taps = (int(config.ple_conv_kernel_size) - 1) * int(config.ngram_size)
@@ -240,11 +240,11 @@ def export_entries(caches: dict[str, torch.Tensor], groups: dict[str, int], spec
             into.append((layer, kind, "index_keys", recorder.keys(layer, tokens)[:rows_kept]))
         elif (match := _GDN.search(name)) is not None:
             conv, ssm = _state_parts(tensor, ids[0], spec)[:2]
-            found.append((int(match.group(1)), "gdn", "conv", _channel_major(conv, conv_taps, spec).clone()))
+            found.append((int(match.group(1)), "gdn", "conv", _channel_major(conv, conv_taps, spec_tokens).clone()))
             found.append((int(match.group(1)), "gdn", "ssm", ssm.to(torch.float32).clone()))
         elif (match := _PLE.search(name)) is not None:
             conv = _state_parts(tensor, ids[0], spec)[0]
-            found.append((int(match.group(1)), "ple", "conv", _channel_major(conv, ple_taps, spec).clone()))
+            found.append((int(match.group(1)), "ple", "conv", _channel_major(conv, ple_taps, spec_tokens).clone()))
     if mtp:
         row = hidden.hidden(tokens - 1) if hidden is not None and tokens > 1 else None
         if row is None:
