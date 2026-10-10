@@ -92,6 +92,12 @@ class MCDMAKVConnector(KVConnectorBase_V1, SupportsHMA):
         self._hybrid = hybrid.is_hybrid(self._specs)
         self._text_config = model_config.hf_text_config
         self._recorder = hybrid.IndexKeyRecorder(int(model_config.max_model_len)) if self._hybrid else None
+        # With MTP speculative decoding the drafter's cache is prompt history the decoder's head can reuse.
+        speculative = getattr(vllm_config, "speculative_config", None)
+        self._hidden = (hybrid.HiddenRecorder()
+                        if self._hybrid and speculative is not None and "mtp" in str(speculative.method) else None)
+        # Exports that wait for the step's MTP drafter, which runs after wait_for_save.
+        self._deferred: list[HandoffRequest] = []
         # Scheduler side: requests being prefilled, and requests whose blocks the handoff holds.
         self._tracked: dict[str, HandoffRequest] = {}
         self._holding: set[str] = set()
@@ -192,6 +198,8 @@ class MCDMAKVConnector(KVConnectorBase_V1, SupportsHMA):
         self._caches = kv_caches
         if self._hybrid:
             hybrid.install_index_key_hook(self._recorder)
+            if self._hidden is not None:
+                hybrid.install_hidden_hook(self._hidden)
             for name, tensor in kv_caches.items():
                 group = self._groups.get(name)
                 spec = type(self._specs[group]).__name__ if group is not None else "-"
@@ -218,10 +226,17 @@ class MCDMAKVConnector(KVConnectorBase_V1, SupportsHMA):
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, MCDMAHandoffMetadata) or not metadata.ready:
             return
+        if self._hidden is not None:
+            # V1's runner calls wait_for_save before the MTP drafter runs; get_finished follows it in V1 and V2.
+            self._deferred.extend(metadata.ready)
+            return
+        self._serve_ready(metadata.ready)
+
+    def _serve_ready(self, requests: list[HandoffRequest]) -> None:
         # Serving reads wait on this event, so they see the pages this step wrote.
         ready = torch.cuda.Event()
         ready.record()
-        for request in metadata.ready:
+        for request in requests:
             try:
                 if request.failed:
                     raise ValueError(request.failed)
@@ -233,6 +248,9 @@ class MCDMAKVConnector(KVConnectorBase_V1, SupportsHMA):
                 self._table.add(request.handoff, request.request_id, export)
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
+        if self._deferred:
+            requests, self._deferred = self._deferred, []
+            self._serve_ready(requests)
         return self._table.take_finished() or None, None
 
     def shutdown(self) -> None:
@@ -245,7 +263,7 @@ class MCDMAKVConnector(KVConnectorBase_V1, SupportsHMA):
             if request.export_from:
                 raise ValueError("hybrid handoffs export the whole prefix; ask with export_from 0")
             entries = hybrid.export_entries(self._caches, self._groups, self._specs, request.block_ids,
-                                            len(request.tokens), self._recorder, self._text_config)
+                                            len(request.tokens), self._recorder, self._text_config, self._hidden)
             # The snapshots were taken on this stream; serving waits for them.
             done = torch.cuda.Event()
             done.record()
