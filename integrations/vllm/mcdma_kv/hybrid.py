@@ -80,7 +80,7 @@ class IndexKeyRecorder:
         self._unknown: set[str] = set()
 
     def record(self, module: Any, positions: torch.Tensor, raw_keys: torch.Tensor, rows: int) -> None:
-        if rows <= 0 or torch.cuda.is_current_stream_capturing():
+        if rows <= 0 or (raw_keys.is_cuda and torch.cuda.is_current_stream_capturing()):
             return
         name = str(getattr(module, "layer_name", ""))
         found = _QSA.search(name)
@@ -119,7 +119,7 @@ class HiddenRecorder:
         self._rows: list[tuple[torch.Tensor, torch.Tensor]] = []
 
     def record(self, positions: torch.Tensor, hidden: torch.Tensor, tokens: int) -> None:
-        if tokens <= 0 or torch.cuda.is_current_stream_capturing():
+        if tokens <= 0 or (hidden.is_cuda and torch.cuda.is_current_stream_capturing()):
             return
         if not self._rows:
             logger.info("MCDMA handoff: MTP target hidden states %s %s, positions %s",
@@ -195,13 +195,13 @@ def _state_parts(tensor: torch.Tensor, slot: int, spec: Any) -> list[torch.Tenso
     return parts
 
 
-def _channel_major(state: torch.Tensor, taps: int, spec: int = 0) -> torch.Tensor:
+def _channel_major(state: torch.Tensor, taps: int, spec_tokens: int = 0) -> torch.Tensor:
     """A conv state as [taps, channels], whichever of vLLM's two layouts holds it.
 
     With speculative decoding vLLM widens each window by one slot per speculative token. Prefill
     (causal_conv1d_fn for Gated DeltaNet, ple_conv's writeback for PLE) fills the first `taps`
     slots, oldest first; the rest only hold speculative tokens."""
-    width = taps + spec
+    width = taps + spec_tokens
     if state.shape[-1] == width and state.shape[0] != width:
         state = state.transpose(0, 1)
     if state.shape[0] != width:

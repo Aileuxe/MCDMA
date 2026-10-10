@@ -97,7 +97,7 @@ class MCDMAKVConnector(KVConnectorBase_V1, SupportsHMA):
         self._hidden = (hybrid.HiddenRecorder()
                         if self._hybrid and speculative is not None and "mtp" in str(speculative.method) else None)
         self._spec = int(getattr(speculative, "num_speculative_tokens", 0) or 0) if speculative is not None else 0
-        # Exports that wait for the step's MTP drafter, which runs after wait_for_save.
+        # Exports held until get_finished, by when the step's MTP drafter has written its cache.
         self._deferred: list[HandoffRequest] = []
         # Scheduler side: requests being prefilled, and requests whose blocks the handoff holds.
         self._tracked: dict[str, HandoffRequest] = {}
@@ -204,7 +204,7 @@ class MCDMAKVConnector(KVConnectorBase_V1, SupportsHMA):
             for name, tensor in kv_caches.items():
                 group = self._groups.get(name)
                 spec = type(self._specs[group]).__name__ if group is not None else "-"
-                logger.info("MCDMA handoff cache %s %s %s %s", name, spec, tuple(tensor.shape), tensor.dtype)
+                logger.debug("MCDMA handoff cache %s %s %s %s", name, spec, tuple(tensor.shape), tensor.dtype)
         rank, _ = _tensor_parallel()
         if rank >= len(self._links):
             logger.warning("MCDMA handoff: no link for tensor-parallel rank %d", rank)
