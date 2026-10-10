@@ -96,6 +96,7 @@ class MCDMAKVConnector(KVConnectorBase_V1, SupportsHMA):
         speculative = getattr(vllm_config, "speculative_config", None)
         self._hidden = (hybrid.HiddenRecorder()
                         if self._hybrid and speculative is not None and "mtp" in str(speculative.method) else None)
+        self._spec = int(getattr(speculative, "num_speculative_tokens", 0) or 0) if speculative is not None else 0
         # Exports that wait for the step's MTP drafter, which runs after wait_for_save.
         self._deferred: list[HandoffRequest] = []
         # Scheduler side: requests being prefilled, and requests whose blocks the handoff holds.
@@ -263,7 +264,8 @@ class MCDMAKVConnector(KVConnectorBase_V1, SupportsHMA):
             if request.export_from:
                 raise ValueError("hybrid handoffs export the whole prefix; ask with export_from 0")
             entries = hybrid.export_entries(self._caches, self._groups, self._specs, request.block_ids,
-                                            len(request.tokens), self._recorder, self._text_config, self._hidden)
+                                            len(request.tokens), self._recorder, self._text_config, self._hidden,
+                                            self._spec)
             # The snapshots were taken on this stream; serving waits for them.
             done = torch.cuda.Event()
             done.record()

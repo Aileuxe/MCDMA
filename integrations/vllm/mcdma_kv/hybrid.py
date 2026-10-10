@@ -195,16 +195,23 @@ def _state_parts(tensor: torch.Tensor, slot: int, spec: Any) -> list[torch.Tenso
     return parts
 
 
-def _channel_major(state: torch.Tensor, taps: int) -> torch.Tensor:
-    """A conv state as [taps, channels], whichever of vLLM's two layouts holds it."""
-    if state.shape[-1] == taps and state.shape[0] != taps:
-        return state.transpose(0, 1)
-    return state
+def _channel_major(state: torch.Tensor, taps: int, spec: int = 0) -> torch.Tensor:
+    """A conv state as [taps, channels], whichever of vLLM's two layouts holds it.
+
+    With speculative decoding vLLM widens each window by one slot per speculative token. Prefill
+    (causal_conv1d_fn for Gated DeltaNet, ple_conv's writeback for PLE) fills the first `taps`
+    slots, oldest first; the rest only hold speculative tokens."""
+    width = taps + spec
+    if state.shape[-1] == width and state.shape[0] != width:
+        state = state.transpose(0, 1)
+    if state.shape[0] != width:
+        raise ValueError(f"conv state {tuple(state.shape)} has no {width}-slot window")
+    return state[:taps]
 
 
 def export_entries(caches: dict[str, torch.Tensor], groups: dict[str, int], specs: list[Any],
                    block_ids: tuple[tuple[int, ...], ...], tokens: int, recorder: IndexKeyRecorder,
-                   config: Any, hidden: HiddenRecorder | None = None) -> list[HybridPages]:
+                   config: Any, hidden: HiddenRecorder | None = None, spec: int = 0) -> list[HybridPages]:
     """Snapshot every canonical entry of one request's prefix [0, tokens)."""
     conv_taps = int(config.linear_conv_kernel_dim) - 1
     ple_taps = (int(config.ple_conv_kernel_size) - 1) * int(config.ngram_size)
@@ -233,11 +240,11 @@ def export_entries(caches: dict[str, torch.Tensor], groups: dict[str, int], spec
             into.append((layer, kind, "index_keys", recorder.keys(layer, tokens)[:rows_kept]))
         elif (match := _GDN.search(name)) is not None:
             conv, ssm = _state_parts(tensor, ids[0], spec)[:2]
-            found.append((int(match.group(1)), "gdn", "conv", _channel_major(conv, conv_taps).clone()))
+            found.append((int(match.group(1)), "gdn", "conv", _channel_major(conv, conv_taps, spec).clone()))
             found.append((int(match.group(1)), "gdn", "ssm", ssm.to(torch.float32).clone()))
         elif (match := _PLE.search(name)) is not None:
             conv = _state_parts(tensor, ids[0], spec)[0]
-            found.append((int(match.group(1)), "ple", "conv", _channel_major(conv, ple_taps).clone()))
+            found.append((int(match.group(1)), "ple", "conv", _channel_major(conv, ple_taps, spec).clone()))
     if mtp:
         row = hidden.hidden(tokens - 1) if hidden is not None and tokens > 1 else None
         if row is None:
